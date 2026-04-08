@@ -248,21 +248,32 @@ When copying transfer functions from the old file, make these changes:
 - `changes = {}` → `forward_changed = false; backward_changed = false;`
 - `return changes;` → `return;`
 
-**Profiling removal** (in all functions):
-- Remove all lines containing `active_infer_profile`
-- Remove all `InferScopedTimer` declarations and their multi-line initializers
-- Remove all `InferStmtScope` declarations
-- Remove all `note_infer_transfer_change()` calls — but KEEP the surrounding
-  `if` statement body if it has other statements. The old pattern is often:
+**Profiling adaptation** (in transfer functions and helpers):
+
+Most profiling infrastructure can be KEPT. The `InferScopedTimer` calls in
+transfer functions and `InferStmtScope` categorization are still useful.
+
+What must be REMOVED or ADAPTED:
+- `InferProcessScope`: manages per-function profiling lifetime — the concept
+  of "per-function processing" goes away in the global worklist. Replace with
+  a simpler scope that manages `active_method_cache`.
+- `note_infer_transfer_change()` and `active_infer_transfer_epoch`: these
+  implemented a skip optimization based on transfer epochs. They can be
+  removed — the direction-aware worklist handles skip logic differently.
+  When `note_infer_transfer_change()` is the sole body of an `if`, fix the
+  `if`:
   ```cpp
+  // Old:
   if (typevar_aliases.insert({dst, src}).second)
       note_infer_transfer_change();
-  ```
-  This becomes just:
-  ```cpp
+  // New:
   typevar_aliases.insert({dst, src});
   ```
-  NOT a bare `if` with no body (which is a syntax error).
+- `prior_transfer_epochs`: no longer needed (was per-label epoch tracking
+  for the old skip optimization).
+- Profile counters specific to the old per-function loop (`labels_processed`,
+  `labels_skipped`, `worklist_iterations`, etc.) need updating for the global
+  loop structure.
 
 **CRITICAL**: Do NOT use regex-based Python scripts to strip profiling code.
 This was attempted and destroyed brace structure, mixed code from different
@@ -402,14 +413,23 @@ The worklist loop must distinguish between "this direction was *requested*"
 trigger requeueing of neighbors. Using the requested direction for
 requeueing causes infinite cycling because Both always has `run_fwd=true`.
 
-### Profiling Code Removal
+### Profiling Infrastructure
 
 The old code has ~300 lines of profiling infrastructure
 (`InferProfileStats`, `InferScopedTimer`, `InferStmtScope`,
-`active_infer_profile`, etc.). This must be removed during the rewrite.
-The profiling code is interspersed throughout every function.
+`active_infer_profile`, etc.). Most of this can be KEPT — the timers and
+statement categorization are still useful for profiling the new global
+worklist.
 
-**WARNING**: The profiling patterns often use multi-line constructs:
+What must change:
+- `InferProcessScope`: remove (per-function concept gone)
+- `note_infer_transfer_change()` / `active_infer_transfer_epoch`: remove
+  (old skip optimization, replaced by direction-aware worklist)
+- `prior_transfer_epochs`: remove (same)
+- Profile counters: adapt for global loop (the per-function counters like
+  `worklist_iterations`, `labels_processed` move from per-function to global)
+
+**WARNING**: profiling patterns often use multi-line constructs:
 ```cpp
 InferScopedTimer timer(
     (active_infer_profile != nullptr) ?
