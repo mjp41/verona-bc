@@ -3226,29 +3226,42 @@ namespace vc
           std::string(method_ident->location().view()))};
     }
 
-    // ----- Per-statement transfer functions -----
+    // ----- Forward transfer functions -----
 
     void infer_const(const Node& stmt);
-    void infer_copy_move(const Node& stmt);
+    void infer_copy_move_fwd(const Node& stmt);
     void infer_register_ref(const Node& stmt);
     void infer_field_ref(const Node& stmt);
-    void infer_load(const Node& stmt);
-    void infer_store(const Node& stmt);
+    void infer_load_fwd(const Node& stmt);
+    void infer_store_fwd(const Node& stmt);
     void infer_array_ref(const Node& stmt);
     void infer_array_ref_from_end(const Node& stmt);
     void infer_splat(const Node& stmt);
     void infer_new_array(const Node& stmt);
     void infer_type_assertion(const Node& stmt);
-    void infer_new(const Node& stmt);
-    void infer_binop(const Node& stmt);
-    void infer_unop(const Node& stmt);
-    void infer_call(const Node& stmt);
+    void infer_new_fwd(const Node& stmt);
+    void infer_binop_fwd(const Node& stmt);
+    void infer_unop_fwd(const Node& stmt);
+    void infer_call_fwd(const Node& stmt);
     void infer_lookup(const Node& stmt);
-    void infer_calldyn(const Node& stmt);
-    void infer_ffi(const Node& stmt, const Node& body);
-    void infer_when(const Node& stmt);
+    void infer_calldyn_fwd(const Node& stmt);
+    void infer_ffi_fwd(const Node& stmt, const Node& body);
+    void infer_when_fwd(const Node& stmt);
     void infer_fixed_result(const Node& stmt, const Token& result_type);
     void infer_fixed_ffi_result(const Node& stmt, const Token& result_type);
+
+    // ----- Backward transfer functions -----
+
+    void infer_copy_move_bwd(const Node& stmt);
+    void infer_load_bwd(const Node& stmt);
+    void infer_store_bwd(const Node& stmt);
+    void infer_new_bwd(const Node& stmt);
+    void infer_binop_bwd(const Node& stmt);
+    void infer_unop_bwd(const Node& stmt);
+    void infer_call_bwd(const Node& stmt);
+    void infer_calldyn_bwd(const Node& stmt);
+    void infer_ffi_bwd(const Node& stmt, const Node& body);
+    void infer_when_bwd(const Node& stmt);
 
     // ----- Tuple/array finalization -----
 
@@ -3256,6 +3269,8 @@ namespace vc
 
     // ----- Main body processing -----
 
+    void forward_pass(const Node& body);
+    void backward_pass(const Node& body);
     LabelChanges process_body(const Node& body);
   };
 
@@ -3275,6 +3290,17 @@ namespace vc
         const_defs[(stmt / LocalId)->location()] = stmt;
     }
 
+    forward_pass(body);
+    backward_pass(body);
+    finalize_tuples();
+
+    return changes;
+  }
+
+  // ===== Forward pass: top-to-bottom =====
+
+  void InferContext::forward_pass(const Node& body)
+  {
     for (auto& stmt : *body)
     {
       if (stmt == Const)
@@ -3290,15 +3316,15 @@ namespace vc
         merge((stmt / LocalId)->location(), clone(stmt / Type));
       }
       else if (stmt->in({Copy, Move}))
-        infer_copy_move(stmt);
+        infer_copy_move_fwd(stmt);
       else if (stmt == RegisterRef)
         infer_register_ref(stmt);
       else if (stmt == FieldRef)
         infer_field_ref(stmt);
       else if (stmt == Load)
-        infer_load(stmt);
+        infer_load_fwd(stmt);
       else if (stmt == Store)
-        infer_store(stmt);
+        infer_store_fwd(stmt);
       else if (stmt->in({ArrayRef, ArrayRefConst}))
         infer_array_ref(stmt);
       else if (stmt == ArrayRefFromEnd)
@@ -3310,11 +3336,11 @@ namespace vc
       else if (stmt == TypeAssertion)
         infer_type_assertion(stmt);
       else if (stmt->in({New, Stack}))
-        infer_new(stmt);
+        infer_new_fwd(stmt);
       else if (stmt->in(propagate_lhs_ops))
-        infer_binop(stmt);
+        infer_binop_fwd(stmt);
       else if (stmt->in(propagate_rhs_ops))
-        infer_unop(stmt);
+        infer_unop_fwd(stmt);
       else if (auto frt = fixed_result_type.find(stmt->type());
                frt != fixed_result_type.end())
         infer_fixed_result(stmt, frt->second);
@@ -3333,6 +3359,48 @@ namespace vc
       }
       else if (stmt == FFIStore)
       {
+        // FFIStore is forward-only (no dst to produce).
+      }
+      else if (stmt == Call)
+        infer_call_fwd(stmt);
+      else if (stmt == Lookup)
+        infer_lookup(stmt);
+      else if (stmt->in({CallDyn, TryCallDyn}))
+        infer_calldyn_fwd(stmt);
+      else if (stmt == FFI)
+        infer_ffi_fwd(stmt, body);
+      else if (stmt == When)
+        infer_when_fwd(stmt);
+      else if (stmt == Typetest)
+      {
+        InferStmtScope stmt_scope(InferStmtFamily::TypetestOps);
+        merge((stmt / LocalId)->location(), primitive_type(Bool));
+      }
+    }
+  }
+
+  // ===== Backward pass: bottom-to-top =====
+
+  void InferContext::backward_pass(const Node& body)
+  {
+    for (auto it = body->rbegin(); it != body->rend(); ++it)
+    {
+      auto& stmt = *it;
+
+      if (stmt->in({Copy, Move}))
+        infer_copy_move_bwd(stmt);
+      else if (stmt == Load)
+        infer_load_bwd(stmt);
+      else if (stmt == Store)
+        infer_store_bwd(stmt);
+      else if (stmt->in({New, Stack}))
+        infer_new_bwd(stmt);
+      else if (stmt->in(propagate_lhs_ops))
+        infer_binop_bwd(stmt);
+      else if (stmt->in(propagate_rhs_ops))
+        infer_unop_bwd(stmt);
+      else if (stmt == FFIStore)
+      {
         InferStmtScope stmt_scope(InferStmtFamily::CallOps);
         auto value_loc = (stmt / ValueSrc)->location();
         auto expected = clone(stmt / Type);
@@ -3341,25 +3409,14 @@ namespace vc
           propagate_backward(value_loc, expected);
       }
       else if (stmt == Call)
-        infer_call(stmt);
-      else if (stmt == Lookup)
-        infer_lookup(stmt);
+        infer_call_bwd(stmt);
       else if (stmt->in({CallDyn, TryCallDyn}))
-        infer_calldyn(stmt);
+        infer_calldyn_bwd(stmt);
       else if (stmt == FFI)
-        infer_ffi(stmt, body);
+        infer_ffi_bwd(stmt, body);
       else if (stmt == When)
-        infer_when(stmt);
-      else if (stmt == Typetest)
-      {
-        InferStmtScope stmt_scope(InferStmtFamily::TypetestOps);
-        merge((stmt / LocalId)->location(), primitive_type(Bool));
-      }
+        infer_when_bwd(stmt);
     }
-
-    finalize_tuples();
-
-    return changes;
   }
   // ===== Extracted per-statement transfer functions =====
 
@@ -3395,7 +3452,7 @@ namespace vc
 
     merge(dst->location(), type);
   }
-  void InferContext::infer_copy_move(const Node& stmt)
+  void InferContext::infer_copy_move_fwd(const Node& stmt)
   {
     InferStmtScope stmt_scope(InferStmtFamily::CopyLike);
     auto dst_loc = (stmt / LocalId)->location();
@@ -3421,9 +3478,16 @@ namespace vc
     if (tuple_ref != ref_to_tuple.end())
       snmalloc::UNUSED(
         upsert_ref_to_tuple(ref_to_tuple, dst_loc, tuple_ref->second));
+  }
+
+  void InferContext::infer_copy_move_bwd(const Node& stmt)
+  {
+    InferStmtScope stmt_scope(InferStmtFamily::CopyLike);
+    auto dst_loc = (stmt / LocalId)->location();
+    auto src_loc = (stmt / Rhs)->location();
 
     // Backward: src = merge(src, dst).
-    dst_it = env.find(dst_loc);
+    auto dst_it = env.find(dst_loc);
     if (dst_it != env.end())
     {
       Node expected = dst_it->second.type;
@@ -3537,7 +3601,7 @@ namespace vc
     }
   }
 
-  void InferContext::infer_load(const Node& stmt)
+  void InferContext::infer_load_fwd(const Node& stmt)
   {
     InferStmtScope stmt_scope(InferStmtFamily::RefOps);
     auto src_loc = (stmt / Rhs)->location();
@@ -3549,7 +3613,13 @@ namespace vc
       if (inner)
         merge(dst_loc, inner);
     }
+  }
 
+  void InferContext::infer_load_bwd(const Node& stmt)
+  {
+    InferStmtScope stmt_scope(InferStmtFamily::RefOps);
+    auto src_loc = (stmt / Rhs)->location();
+    auto dst_loc = (stmt / LocalId)->location();
     auto dst_it = env.find(dst_loc);
     if (dst_it != env.end() && !is_default_type(dst_it->second.type))
     {
@@ -3558,10 +3628,9 @@ namespace vc
     }
   }
 
-  void InferContext::infer_store(const Node& stmt)
+  void InferContext::infer_store_fwd(const Node& stmt)
   {
     InferStmtScope stmt_scope(InferStmtFamily::RefOps);
-    // WF: wfDst * wfSrc * Arg → LocalId(dst), Rhs(ref), Arg(val)
     auto dst_loc = (stmt / LocalId)->location();
     auto ref_loc = (stmt / Rhs)->location();
     auto val_loc = ((stmt / Arg) / Rhs)->location();
@@ -3572,12 +3641,8 @@ namespace vc
       auto inner = extract_ref_inner(ref_it->second.type);
       if (inner)
       {
-        auto expected = clone(inner);
         // Forward: dst = inner type.
-        merge(dst_loc, expected);
-        // Backward: refine stored value.
-        if (!is_any_type(inner) && merge_bwd(val_loc, clone(inner)))
-          propagate_backward(val_loc, expected);
+        merge(dst_loc, clone(inner));
 
         // Track tuple element types.
         auto rtt = ref_to_tuple.find(ref_loc);
@@ -3609,6 +3674,24 @@ namespace vc
             }
           }
         }
+      }
+    }
+  }
+
+  void InferContext::infer_store_bwd(const Node& stmt)
+  {
+    InferStmtScope stmt_scope(InferStmtFamily::RefOps);
+    auto ref_loc = (stmt / Rhs)->location();
+    auto val_loc = ((stmt / Arg) / Rhs)->location();
+
+    auto ref_it = env.find(ref_loc);
+    if (ref_it != env.end())
+    {
+      auto inner = extract_ref_inner(ref_it->second.type);
+      if (inner && !is_any_type(inner))
+      {
+        if (merge_bwd(val_loc, clone(inner)))
+          propagate_backward(val_loc, inner);
       }
     }
   }
@@ -3744,12 +3827,18 @@ namespace vc
       it->second.is_fixed = true;
   }
 
-  void InferContext::infer_new(const Node& stmt)
+  void InferContext::infer_new_fwd(const Node& stmt)
   {
     InferStmtScope stmt_scope(InferStmtFamily::NewOps);
     auto dst_loc = (stmt / LocalId)->location();
     auto new_type = stmt / Type;
     merge(dst_loc, clone(new_type));
+  }
+
+  void InferContext::infer_new_bwd(const Node& stmt)
+  {
+    InferStmtScope stmt_scope(InferStmtFamily::NewOps);
+    auto new_type = stmt / Type;
 
     // Backward: constrain args from field types.
     auto inner = new_type->front();
@@ -3791,7 +3880,7 @@ namespace vc
     }
   }
 
-  void InferContext::infer_binop(const Node& stmt)
+  void InferContext::infer_binop_fwd(const Node& stmt)
   {
     InferStmtScope stmt_scope(InferStmtFamily::CallOps);
     auto dst_loc = (stmt / LocalId)->location();
@@ -3828,13 +3917,26 @@ namespace vc
     {
       // Forward: result = lhs type.
       merge(dst_loc, clone(lhs_it->second.type));
-      // Backward: refine rhs from lhs.
+    }
+  }
+
+  void InferContext::infer_binop_bwd(const Node& stmt)
+  {
+    InferStmtScope stmt_scope(InferStmtFamily::CallOps);
+    auto dst_loc = (stmt / LocalId)->location();
+    auto lhs_loc = (stmt / Lhs)->location();
+    auto rhs_loc = (stmt / Rhs)->location();
+
+    auto lhs_it = env.find(lhs_loc);
+
+    // Backward: refine rhs from lhs.
+    if (lhs_it != env.end())
+    {
       if (merge_bwd(rhs_loc, clone(lhs_it->second.type)))
         propagate_backward(rhs_loc, lhs_it->second.type);
     }
 
-    // Backward from dst: refine lhs and rhs from dst (from prior
-    // iteration's backward flow, e.g., Call backward refined dst).
+    // Backward from dst: refine lhs and rhs from dst.
     auto dst_it = env.find(dst_loc);
     if (dst_it != env.end() && !is_default_type(dst_it->second.type))
     {
@@ -3845,7 +3947,7 @@ namespace vc
     }
   }
 
-  void InferContext::infer_unop(const Node& stmt)
+  void InferContext::infer_unop_fwd(const Node& stmt)
   {
     InferStmtScope stmt_scope(InferStmtFamily::CallOps);
     auto dst_loc = (stmt / LocalId)->location();
@@ -3854,6 +3956,13 @@ namespace vc
     auto src_it = env.find(src_loc);
     if (src_it != env.end())
       merge(dst_loc, clone(src_it->second.type));
+  }
+
+  void InferContext::infer_unop_bwd(const Node& stmt)
+  {
+    InferStmtScope stmt_scope(InferStmtFamily::CallOps);
+    auto dst_loc = (stmt / LocalId)->location();
+    auto src_loc = (stmt / Rhs)->location();
 
     // Backward from dst.
     auto dst_it = env.find(dst_loc);
@@ -3864,7 +3973,7 @@ namespace vc
     }
   }
 
-  void InferContext::infer_call(const Node& stmt)
+  void InferContext::infer_call_fwd(const Node& stmt)
   {
     InferStmtScope stmt_scope(InferStmtFamily::CallOps);
     std::vector<ScopeInfo> scopes;
@@ -3907,6 +4016,32 @@ namespace vc
       }
     }
 
+    // Forward into callee: push arg types into TypeVar params.
+    push_arg_types_to_params(func_def, args, env, top);
+  }
+
+  void InferContext::infer_call_bwd(const Node& stmt)
+  {
+    InferStmtScope stmt_scope(InferStmtFamily::CallOps);
+    std::vector<ScopeInfo> scopes;
+    auto func_def = navigate_call(stmt, top, scopes);
+    if (!func_def)
+      return;
+
+    auto args = stmt / Args;
+    auto params = func_def / Params;
+
+    // Build substitution.
+    NodeMap<Node> subst;
+    for (auto& scope : scopes)
+    {
+      auto ta = scope.name_elem / TypeArgs;
+      auto tps = scope.def / TypeParams;
+      if (!ta->empty() && ta->size() == tps->size())
+        for (size_t i = 0; i < tps->size(); i++)
+          subst[tps->at(i)] = ta->at(i);
+    }
+
     // Backward: param types into args.
     for (size_t i = 0; i < params->size() && i < args->size(); i++)
     {
@@ -3937,9 +4072,6 @@ namespace vc
         }
       }
     }
-
-    // Forward into callee: push arg types into TypeVar params.
-    push_arg_types_to_params(func_def, args, env, top);
   }
 
   void InferContext::infer_lookup(const Node& stmt)
@@ -3971,14 +4103,12 @@ namespace vc
     snmalloc::UNUSED(upsert_lookup_stmt(lookup_stmts, dst_loc, stmt));
   }
 
-  void InferContext::infer_calldyn(const Node& stmt)
+  void InferContext::infer_calldyn_fwd(const Node& stmt)
   {
     InferStmtScope stmt_scope(InferStmtFamily::CallOps);
     auto dst_loc = (stmt / LocalId)->location();
     auto src_loc = (stmt / Rhs)->location();
     auto args = stmt / Args;
-    bool refined = false;
-    bool resolved_callable = false;
 
     // Forward: result from Lookup.
     auto src_it = env.find(src_loc);
@@ -3991,11 +4121,54 @@ namespace vc
     if (dst_it != env.end() && !dst_it->second.call_node)
       dst_it->second.call_node = stmt;
 
+    // Forward: shape-to-lambda + push arg types into callee TypeVar params.
+    auto lookup_it = lookup_stmts.find(src_loc);
+    if (lookup_it != lookup_stmts.end())
+    {
+      auto lookup_node = lookup_it->second;
+      auto recv_it = env.find((lookup_node / Rhs)->location());
+      if (recv_it != env.end() && !is_default_type(recv_it->second.type))
+      {
+        auto hand = (lookup_node / Lhs)->type();
+        auto method_ident = lookup_method_name(lookup_node);
+        auto method_ta = lookup_node / TypeArgs;
+        auto arity = from_chars_sep_v<size_t>(lookup_node / Int);
+        auto info = resolve_callable_method(
+          top, recv_it->second.type, method_ident, hand, arity, method_ta);
+        if (info.func)
+        {
+          auto params = info.func / Params;
+
+          // Shape-to-lambda propagation.
+          for (size_t i = 0; i < params->size() && i < args->size(); i++)
+          {
+            auto pt = apply_subst(top, params->at(i) / Type, info.subst);
+            if (pt && pt->front() != TypeVar)
+            {
+              auto arg_it = env.find((args->at(i) / Rhs)->location());
+              if (arg_it != env.end())
+                changes.forward |=
+                  propagate_shape_to_lambda(top, pt, arg_it->second.type);
+            }
+          }
+
+          // Forward into callee: TypeVar params.
+          push_arg_types_to_params(info.func, args, env, top);
+        }
+      }
+    }
+  }
+
+  void InferContext::infer_calldyn_bwd(const Node& stmt)
+  {
+    InferStmtScope stmt_scope(InferStmtFamily::CallOps);
+    auto dst_loc = (stmt / LocalId)->location();
+    auto src_loc = (stmt / Rhs)->location();
+    auto args = stmt / Args;
+    bool refined = false;
+    bool resolved_callable = false;
+
     // Resolve method for backward refinement.
-    // Skip when receiver is default-typed — the method resolution
-    // would use the fallback type (u64/f64), pushing wrong types
-    // into args. The correct type will be determined by backward
-    // refinement from downstream constraints.
     auto lookup_it = lookup_stmts.find(src_loc);
     if (lookup_it != lookup_stmts.end())
     {
@@ -4013,19 +4186,6 @@ namespace vc
         {
           resolved_callable = true;
           auto params = info.func / Params;
-
-          // Shape-to-lambda propagation.
-          for (size_t i = 0; i < params->size() && i < args->size(); i++)
-          {
-            auto pt = apply_subst(top, params->at(i) / Type, info.subst);
-            if (pt && pt->front() != TypeVar)
-            {
-              auto arg_it = env.find((args->at(i) / Rhs)->location());
-              if (arg_it != env.end())
-                refined |=
-                  propagate_shape_to_lambda(top, pt, arg_it->second.type);
-            }
-          }
 
           // Backward: param types into args.
           for (size_t i = 0; i < params->size() && i < args->size(); i++)
@@ -4045,9 +4205,6 @@ namespace vc
               }
             }
           }
-
-          // Forward into callee: TypeVar params.
-          push_arg_types_to_params(info.func, args, env, top);
         }
       }
     }
@@ -4162,7 +4319,7 @@ namespace vc
     }
   }
 
-  void InferContext::infer_ffi(const Node& stmt, const Node& body)
+  void InferContext::infer_ffi_fwd(const Node& stmt, const Node& body)
   {
     InferStmtScope stmt_scope(InferStmtFamily::FFIWhenOps);
     auto dst_loc = (stmt / LocalId)->location();
@@ -4187,6 +4344,38 @@ namespace vc
           auto ret_type = sym / Type;
           if (!ret_type->empty())
             merge(dst_loc, clone(ret_type));
+
+          found = true;
+          break;
+        }
+        if (found)
+          break;
+      }
+      if (found)
+        break;
+      cls = cls->parent(ClassDef);
+    }
+  }
+
+  void InferContext::infer_ffi_bwd(const Node& stmt, const Node& body)
+  {
+    InferStmtScope stmt_scope(InferStmtFamily::FFIWhenOps);
+    auto sym_name = (stmt / SymbolId)->location();
+    auto cls = body->parent(Function)->parent(ClassDef);
+
+    while (cls)
+    {
+      bool found = false;
+      for (auto& child : *(cls / ClassBody))
+      {
+        if (child != Lib)
+          continue;
+        for (auto& sym : *(child / Symbols))
+        {
+          if (sym != Symbol)
+            continue;
+          if ((sym / SymbolId)->location() != sym_name)
+            continue;
 
           // Backward: param types into args.
           auto ffi_params = sym / FFIParams;
@@ -4214,7 +4403,7 @@ namespace vc
     }
   }
 
-  void InferContext::infer_when(const Node& stmt)
+  void InferContext::infer_when_fwd(const Node& stmt)
   {
     InferStmtScope stmt_scope(InferStmtFamily::FFIWhenOps);
     auto dst_loc = (stmt / LocalId)->location();
@@ -4306,6 +4495,13 @@ namespace vc
         }
       }
     }
+  }
+
+  void InferContext::infer_when_bwd(const Node& stmt)
+  {
+    // When backward is a no-op: all type propagation is forward
+    // (setting lambda params from cown types).
+    snmalloc::UNUSED(stmt);
   }
 
   void InferContext::finalize_tuples()
