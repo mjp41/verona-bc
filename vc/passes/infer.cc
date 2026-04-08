@@ -3114,7 +3114,7 @@ namespace vc
       return changed;
     }
 
-    // ----- Backward notification: merge expected type and record constraint -----
+    // ----- Backward notification: merge expected type, record, and propagate -----
     bool
     merge_bwd(const Location& loc, const Node& type, bool is_fixed = false)
     {
@@ -3150,11 +3150,17 @@ namespace vc
             }
             bit->second.is_fixed = true;
             changes.backward = true;
+            // Propagate and return early.
+            propagate_backward(loc, type);
             return true;
           }
 
           if (bit->second.is_fixed)
+          {
+            if (changed)
+              propagate_backward(loc, type);
             return changed;
+          }
 
           auto m = merge_type(bit->second.type, type, top);
           if (m)
@@ -3165,6 +3171,9 @@ namespace vc
           }
         }
       }
+
+      if (changed)
+        propagate_backward(loc, type);
 
       return changed;
     }
@@ -3182,8 +3191,7 @@ namespace vc
     refine_and_propagate(const Location& loc, const Node& expected)
     {
       snmalloc::UNUSED(refine_local_const(loc, expected));
-      if (merge_bwd(loc, expected))
-        propagate_backward(loc, expected);
+      snmalloc::UNUSED(merge_bwd(loc, expected));
     }
 
     PendingError pending_when_lookup_error(const Node& when_arg)
@@ -3405,8 +3413,7 @@ namespace vc
         auto value_loc = (stmt / ValueSrc)->location();
         auto expected = clone(stmt / Type);
         snmalloc::UNUSED(refine_local_const(value_loc, expected));
-        if (merge_bwd(value_loc, expected))
-          propagate_backward(value_loc, expected);
+        snmalloc::UNUSED(merge_bwd(value_loc, expected));
       }
       else if (stmt == Call)
         infer_call_bwd(stmt);
@@ -3518,11 +3525,9 @@ namespace vc
         (bwd_it != bwd.end() && bwd_it->second.is_fixed);
       if (is_default_type(dst_it->second.type))
       {
-        if (merge_bwd(dst_loc, expected, expected_fixed))
-          propagate_backward(dst_loc, expected);
+        snmalloc::UNUSED(merge_bwd(dst_loc, expected, expected_fixed));
       }
-      if (merge_bwd(src_loc, expected, expected_fixed))
-        propagate_backward(src_loc, expected);
+      snmalloc::UNUSED(merge_bwd(src_loc, expected, expected_fixed));
     }
   }
 
@@ -3690,8 +3695,7 @@ namespace vc
       auto inner = extract_ref_inner(ref_it->second.type);
       if (inner && !is_any_type(inner))
       {
-        if (merge_bwd(val_loc, clone(inner)))
-          propagate_backward(val_loc, inner);
+        snmalloc::UNUSED(merge_bwd(val_loc, clone(inner)));
       }
     }
   }
@@ -3862,8 +3866,7 @@ namespace vc
             if (ft && !contains_typevar(ft))
             {
               snmalloc::UNUSED(refine_local_const(arg_loc, ft));
-              if (merge_bwd(arg_loc, ft))
-                propagate_backward(arg_loc, ft);
+              snmalloc::UNUSED(merge_bwd(arg_loc, ft));
             }
             // Reverse: push concrete arg into TypeVar FieldDef.
             auto arg_it = env.find(arg_loc);
@@ -3906,8 +3909,7 @@ namespace vc
       {
         auto refined = primitive_or_ffi_type(rhs_prim->type());
         snmalloc::UNUSED(refine_local_const(lhs_loc, refined));
-        if (merge_bwd(lhs_loc, clone(refined)))
-          propagate_backward(lhs_loc, refined);
+        snmalloc::UNUSED(merge_bwd(lhs_loc, clone(refined)));
         merge(dst_loc, clone(refined));
         lhs_it = env.find(lhs_loc);
       }
@@ -3932,18 +3934,15 @@ namespace vc
     // Backward: refine rhs from lhs.
     if (lhs_it != env.end())
     {
-      if (merge_bwd(rhs_loc, clone(lhs_it->second.type)))
-        propagate_backward(rhs_loc, lhs_it->second.type);
+      snmalloc::UNUSED(merge_bwd(rhs_loc, clone(lhs_it->second.type)));
     }
 
     // Backward from dst: refine lhs and rhs from dst.
     auto dst_it = env.find(dst_loc);
     if (dst_it != env.end() && !is_default_type(dst_it->second.type))
     {
-      if (merge_bwd(lhs_loc, clone(dst_it->second.type)))
-        propagate_backward(lhs_loc, dst_it->second.type);
-      if (merge_bwd(rhs_loc, clone(dst_it->second.type)))
-        propagate_backward(rhs_loc, dst_it->second.type);
+      snmalloc::UNUSED(merge_bwd(lhs_loc, clone(dst_it->second.type)));
+      snmalloc::UNUSED(merge_bwd(rhs_loc, clone(dst_it->second.type)));
     }
   }
 
@@ -3968,8 +3967,7 @@ namespace vc
     auto dst_it = env.find(dst_loc);
     if (dst_it != env.end() && !is_default_type(dst_it->second.type))
     {
-      if (merge_bwd(src_loc, clone(dst_it->second.type)))
-        propagate_backward(src_loc, dst_it->second.type);
+      snmalloc::UNUSED(merge_bwd(src_loc, clone(dst_it->second.type)));
     }
   }
 
@@ -4052,8 +4050,7 @@ namespace vc
       {
         auto arg_loc = (args->at(i) / Rhs)->location();
         snmalloc::UNUSED(refine_local_const(arg_loc, expected));
-        if (merge_bwd(arg_loc, expected))
-          propagate_backward(arg_loc, expected);
+        snmalloc::UNUSED(merge_bwd(arg_loc, expected));
 
         auto expected_prim = extract_backward_primitive(expected);
         auto def_it = def_stmts.find(arg_loc);
@@ -4199,10 +4196,7 @@ namespace vc
               auto arg_loc = (args->at(i) / Rhs)->location();
               snmalloc::UNUSED(refine_local_const(arg_loc, expected));
               if (merge_bwd(arg_loc, expected))
-              {
                 refined = true;
-                propagate_backward(arg_loc, expected);
-              }
             }
           }
         }
@@ -4273,8 +4267,6 @@ namespace vc
           auto recv_loc = (lookup_it->second / Rhs)->location();
           bool local_refined = refine_local_const(recv_loc, target_type);
           bool bwd_refined = merge_bwd(recv_loc, target_type);
-          if (bwd_refined)
-            propagate_backward(recv_loc, target_type);
           refined = refined || local_refined || bwd_refined;
         }
 
@@ -4283,8 +4275,6 @@ namespace vc
           auto arg_loc = (arg_node / Rhs)->location();
           bool local_refined = refine_local_const(arg_loc, target_type);
           bool bwd_refined = merge_bwd(arg_loc, target_type);
-          if (bwd_refined)
-            propagate_backward(arg_loc, target_type);
           refined = refined || local_refined || bwd_refined;
         }
 
@@ -4386,8 +4376,7 @@ namespace vc
           {
             snmalloc::UNUSED(
               refine_local_const((*fa)->location(), clone(*fp)));
-            if (merge_bwd((*fa)->location(), clone(*fp)))
-              propagate_backward((*fa)->location(), *fp);
+            snmalloc::UNUSED(merge_bwd((*fa)->location(), clone(*fp)));
             ++fp;
             ++fa;
           }
