@@ -5670,6 +5670,588 @@ namespace vc
     return false;
   }
 
+  // ===== Global worklist inference =====
+
+  static bool use_global_infer()
+  {
+    static const bool enabled = (std::getenv("VC_INFER_GLOBAL") != nullptr);
+    return enabled;
+  }
+
+  struct GlobalLabel
+  {
+    Node function; // owning Function node
+    Node label;    // Label AST node
+  };
+
+  static void infer_global(Node top)
+  {
+    // Phase 1: Collect all functions and their labels.
+    std::vector<Node> functions;
+    top->traverse([&](auto node) {
+      if (node != Function)
+        return node == Top || node == ClassDef || node == ClassBody ||
+          node == Lib || node == Symbols;
+      functions.push_back(node);
+      return false;
+    });
+
+    // Build global label array.
+    std::vector<GlobalLabel> labels;
+    // Map: function → [first_label_idx, last_label_idx)
+    std::map<Node, std::pair<size_t, size_t>> func_label_range;
+
+    for (auto& func : functions)
+    {
+      auto func_labels = func / Labels;
+      size_t first = labels.size();
+      for (auto& lbl : *func_labels)
+        labels.push_back({func, lbl});
+      func_label_range[func] = {first, labels.size()};
+    }
+
+    size_t n = labels.size();
+    if (n == 0)
+      return;
+
+    // Build global label index: label_id string → global index.
+    // Label IDs are unique within a function but not globally,
+    // so we scope the lookup by function.
+    struct FuncLabelIdx
+    {
+      std::map<std::string, size_t> idx;
+    };
+    std::map<Node, FuncLabelIdx> func_label_idx;
+    for (size_t i = 0; i < n; i++)
+    {
+      auto& gl = labels[i];
+      auto key = std::string((gl.label / LabelId)->location().view());
+      func_label_idx[gl.function].idx[key] = i;
+    }
+
+    // Build CFG edges (intra-function only for now).
+    std::vector<std::vector<size_t>> succ(n), pred(n);
+    for (size_t i = 0; i < n; i++)
+    {
+      auto& gl = labels[i];
+      auto term = gl.label / Return;
+      auto& idx = func_label_idx[gl.function].idx;
+
+      if (term == Cond)
+      {
+        auto t = idx.find(std::string((term / Lhs)->location().view()));
+        auto f = idx.find(std::string((term / Rhs)->location().view()));
+        if (t != idx.end())
+          succ[i].push_back(t->second);
+        if (f != idx.end())
+          succ[i].push_back(f->second);
+      }
+      else if (term == Jump)
+      {
+        auto t = idx.find(std::string((term / LabelId)->location().view()));
+        if (t != idx.end())
+          succ[i].push_back(t->second);
+      }
+    }
+    for (size_t i = 0; i < n; i++)
+      for (auto s : succ[i])
+        pred[s].push_back(i);
+
+    // Per-label state.
+    std::vector<TypeEnv> exit_envs(n);
+    std::map<std::pair<size_t, size_t>, TypeEnv> branch_exits;
+    std::vector<TypeEnv> bwd_envs(n);
+    std::vector<TypeEnv> prior_entry_envs(n);
+    std::vector<bool> prior_entry_valid(n, false);
+
+    // Liveness.
+    std::vector<std::set<Location>> label_defs(n), label_uses(n),
+      label_kills(n), label_live_in(n), label_live_out(n);
+
+    for (size_t j = 0; j < n; j++)
+    {
+      label_defs[j] = collect_label_defs(labels[j].label / Body);
+      label_uses[j] = collect_label_uses(
+        labels[j].label / Body, labels[j].label / Return, label_defs[j]);
+      label_kills[j] = collect_label_kills(labels[j].label / Body);
+    }
+
+    bool live_changed = true;
+    while (live_changed)
+    {
+      live_changed = false;
+      for (size_t j = n; j-- > 0;)
+      {
+        std::set<Location> next_out;
+        for (auto s : succ[j])
+          next_out.insert(label_live_in[s].begin(), label_live_in[s].end());
+        std::set<Location> next_in = label_uses[j];
+        for (auto& loc : next_out)
+          if (label_kills[j].count(loc) == 0)
+            next_in.insert(loc);
+        if (next_out != label_live_out[j] || next_in != label_live_in[j])
+        {
+          label_live_out[j] = std::move(next_out);
+          label_live_in[j] = std::move(next_in);
+          live_changed = true;
+        }
+      }
+    }
+
+    // Initialize: seed entry envs with param types, bwd envs with return types.
+    for (auto& func : functions)
+    {
+      auto [first, last] = func_label_range[func];
+      if (first == last)
+        continue;
+
+      // Entry label gets params.
+      for (auto& pd : *(func / Params))
+      {
+        auto type = pd / Type;
+        bool fixed = type->front() != TypeVar;
+        exit_envs[first][(pd / Ident)->location()] = {
+          clone(type), fixed, {}};
+      }
+
+      // Return labels get declared return type.
+      auto func_ret = func / Type;
+      if (!contains_typevar(func_ret) && !is_default_type(func_ret))
+      {
+        for (size_t j = first; j < last; j++)
+        {
+          auto term = labels[j].label / Return;
+          if (term == Return)
+          {
+            auto ret_loc = (term / LocalId)->location();
+            bwd_envs[j][ret_loc] = {clone(func_ret), true, {}};
+          }
+        }
+      }
+    }
+
+    // Shared state across all labels.
+    std::map<Location, Node> all_def_stmts;
+    for (auto& gl : labels)
+      for (auto& stmt : *(gl.label / Body))
+        if (!stmt->empty() && stmt->front() == LocalId)
+          all_def_stmts[stmt->front()->location()] = stmt;
+
+    std::map<Location, Node> lookup_stmts;
+    std::set<std::pair<Location, Location>> typevar_aliases;
+    std::map<Location, std::pair<Location, size_t>> ref_to_tuple;
+
+    // Phase 3: Worklist.
+    std::set<size_t> worklist;
+    for (size_t i = 0; i < n; i++)
+      worklist.insert(i);
+
+    MethodLookupCache method_cache;
+    active_method_cache = &method_cache;
+
+    size_t wl_iters = 0;
+    while (!worklist.empty())
+    {
+      wl_iters++;
+      if (wl_iters > n * 100)
+        break;
+
+      auto wit = worklist.begin();
+      size_t i = *wit;
+      worklist.erase(wit);
+
+      prune_bwd_env(bwd_envs[i], label_live_in[i], label_defs[i]);
+
+      // Build entry env from predecessors.
+      TypeEnv env;
+      auto& gl = labels[i];
+      auto [func_first, func_last] = func_label_range[gl.function];
+
+      if (i == func_first)
+      {
+        // Function entry: copy from exit_envs[func_first] (seeded with params)
+        env = exit_envs[func_first];
+      }
+      else
+      {
+        for (auto p : pred[i])
+        {
+          auto bk = std::make_pair(p, i);
+          auto bi = branch_exits.find(bk);
+          const auto& pe =
+            (bi != branch_exits.end()) ? bi->second : exit_envs[p];
+          for (auto& [loc, info] : pe)
+          {
+            if (label_live_in[i].count(loc) == 0)
+              continue;
+            auto eit = env.find(loc);
+            if (eit == env.end())
+              env[loc] = {clone(info.type), info.is_fixed, info.call_node};
+            else
+            {
+              if (same_type_tree(eit->second.type, info.type))
+              {
+                eit->second.is_fixed = eit->second.is_fixed || info.is_fixed;
+                if (!eit->second.call_node && info.call_node)
+                  eit->second.call_node = info.call_node;
+                continue;
+              }
+              if (eit->second.is_fixed && !info.is_fixed)
+              {
+                if (!eit->second.call_node && info.call_node)
+                  eit->second.call_node = info.call_node;
+                continue;
+              }
+              if (!eit->second.is_fixed && info.is_fixed)
+              {
+                eit->second.type = clone(info.type);
+                eit->second.is_fixed = true;
+                if (!eit->second.call_node && info.call_node)
+                  eit->second.call_node = info.call_node;
+                continue;
+              }
+              auto m = merge_type(eit->second.type, info.type, top);
+              if (m)
+                eit->second.type = m;
+              eit->second.is_fixed = eit->second.is_fixed || info.is_fixed;
+              if (!eit->second.call_node && info.call_node)
+                eit->second.call_node = info.call_node;
+            }
+          }
+        }
+      }
+
+      // Merge bwd envs.
+      for (auto& [loc, info] : bwd_envs[i])
+      {
+        if (
+          label_live_in[i].count(loc) == 0 && label_defs[i].count(loc) == 0)
+          continue;
+        auto eit = env.find(loc);
+        if (eit == env.end())
+        {
+          if (label_defs[i].count(loc) > 0)
+            env[loc] = {clone(info.type), info.is_fixed, {}};
+        }
+        else
+        {
+          if (same_type_tree(eit->second.type, info.type))
+          {
+            eit->second.is_fixed = eit->second.is_fixed || info.is_fixed;
+            continue;
+          }
+          if (eit->second.is_fixed && !info.is_fixed)
+            continue;
+          if (!eit->second.is_fixed && info.is_fixed)
+          {
+            eit->second.type = clone(info.type);
+            eit->second.is_fixed = true;
+            continue;
+          }
+          auto m = merge_type(eit->second.type, info.type, top);
+          if (m)
+            eit->second.type = m;
+        }
+      }
+
+      for (auto s : succ[i])
+      {
+        for (auto& [loc, info] : bwd_envs[s])
+        {
+          if (
+            label_live_in[i].count(loc) == 0 && label_defs[i].count(loc) == 0)
+            continue;
+          auto eit = env.find(loc);
+          if (eit == env.end())
+          {
+            if (label_defs[i].count(loc) > 0)
+              env[loc] = {clone(info.type), info.is_fixed, {}};
+          }
+          else
+          {
+            if (same_type_tree(eit->second.type, info.type))
+            {
+              eit->second.is_fixed = eit->second.is_fixed || info.is_fixed;
+              continue;
+            }
+            if (eit->second.is_fixed && !info.is_fixed)
+              continue;
+            if (!eit->second.is_fixed && info.is_fixed)
+            {
+              eit->second.type = clone(info.type);
+              eit->second.is_fixed = true;
+              continue;
+            }
+            auto m = merge_type(eit->second.type, info.type, top);
+            if (m)
+              eit->second.type = m;
+          }
+        }
+      }
+
+      // Recover forward metadata.
+      for (auto& loc : label_defs[i])
+      {
+        auto eit = env.find(loc);
+        if (eit == env.end())
+          continue;
+        auto def_it = all_def_stmts.find(loc);
+        if (def_it == all_def_stmts.end())
+          continue;
+        if (
+          !eit->second.call_node &&
+          def_it->second->in({Call, CallDyn, TryCallDyn}))
+          eit->second.call_node = def_it->second;
+        if (
+          eit->second.type && !eit->second.type->empty() &&
+          eit->second.type->front() != TypeVar &&
+          !is_default_type(eit->second.type))
+          continue;
+        TypeEnv recovered;
+        if (recover_local_type_from_def(loc, recovered, all_def_stmts, top))
+        {
+          auto rit = recovered.find(loc);
+          if (rit != recovered.end())
+            eit->second.type = clone(rit->second.type);
+        }
+      }
+
+      // Skip if unchanged.
+      bool same_entry =
+        prior_entry_valid[i] && same_type_env(prior_entry_envs[i], env);
+      if (same_entry)
+        continue;
+      prior_entry_envs[i] = env;
+      prior_entry_valid[i] = true;
+
+      // Process body.
+      std::map<Location, TupleTracking> tuple_locals;
+      LabelChanges label_changes;
+      {
+        InferContext ctx{
+          env,
+          bwd_envs[i],
+          top,
+          lookup_stmts,
+          all_def_stmts,
+          typevar_aliases,
+          ref_to_tuple,
+          tuple_locals,
+          {},
+          {},
+          {}};
+        label_changes = ctx.process_body(gl.label / Body);
+      }
+
+      bool forward_out_changed = false;
+
+      // Terminator handling.
+      auto term = gl.label / Return;
+      if (term == Return)
+      {
+        auto func_ret = gl.function / Type;
+        if (func_ret->front() != TypeVar && !is_default_type(func_ret))
+        {
+          std::map<Location, Node> const_defs;
+          for (auto& stmt : *(gl.label / Body))
+            if (stmt == Const)
+              const_defs[(stmt / LocalId)->location()] = stmt;
+
+          auto ret_loc = (term / LocalId)->location();
+          auto ret_prim = extract_backward_primitive(func_ret);
+          if (ret_prim)
+            snmalloc::UNUSED(refine_const_local(
+              env,
+              const_defs,
+              ret_loc,
+              primitive_or_ffi_type(ret_prim->type())));
+          propagate_call_constraint(
+            env, ret_loc, func_ret, top, lookup_stmts, &all_def_stmts);
+          bool changed = merge_env(env, ret_loc, clone(func_ret), top);
+          auto ret_it = env.find(ret_loc);
+          if (ret_it != env.end())
+            ret_it->second.is_fixed = true;
+          bwd_envs[i][ret_loc] = {clone(func_ret), true, {}};
+          if (changed)
+            propagate_call_node(
+              env, ret_loc, top, lookup_stmts, &all_def_stmts);
+        }
+      }
+      else if (term == Raise)
+      {
+        std::map<Location, Node> const_defs;
+        for (auto& stmt : *(gl.label / Body))
+          if (stmt == Const)
+            const_defs[(stmt / LocalId)->location()] = stmt;
+        auto raise_ret = term / Type;
+        auto ret_loc = (term / LocalId)->location();
+        if (refine_const_local(env, const_defs, ret_loc, raise_ret))
+          label_changes.forward = true;
+      }
+
+      // Cond: branch exits with typetest narrowing.
+      if (term == Cond)
+      {
+        auto trace = trace_typetest(term / LocalId, gl.label / Body);
+        if (trace)
+        {
+          auto& idx = func_label_idx[gl.function].idx;
+          auto t_it =
+            idx.find(std::string((term / Lhs)->location().view()));
+          auto f_it =
+            idx.find(std::string((term / Rhs)->location().view()));
+
+          auto make_clone = [&]() {
+            TypeEnv c;
+            for (auto& [loc, info] : env)
+              c[loc] = {clone(info.type), info.is_fixed, info.call_node};
+            return c;
+          };
+          auto update_branch_exit = [&](size_t succ_idx, TypeEnv&& ne) {
+            auto key = std::make_pair(i, succ_idx);
+            auto it = branch_exits.find(key);
+            if (it != branch_exits.end() && same_type_env(it->second, ne))
+              return;
+            branch_exits[key] = std::move(ne);
+            forward_out_changed = true;
+          };
+
+          if (!trace->negated)
+          {
+            if (t_it != idx.end())
+            {
+              auto ne = make_clone();
+              ne[trace->src->location()] = {clone(trace->type), true, {}};
+              update_branch_exit(t_it->second, std::move(ne));
+            }
+            if (f_it != idx.end())
+            {
+              auto ne = make_clone();
+              auto src_it = ne.find(trace->src->location());
+              if (src_it != ne.end())
+              {
+                auto excluded =
+                  exclude_tested_type(top, src_it->second.type, trace->type);
+                if (excluded)
+                  src_it->second = {std::move(excluded), true, {}};
+              }
+              update_branch_exit(f_it->second, std::move(ne));
+            }
+          }
+          else
+          {
+            if (f_it != idx.end())
+            {
+              auto ne = make_clone();
+              ne[trace->src->location()] = {clone(trace->type), true, {}};
+              update_branch_exit(f_it->second, std::move(ne));
+            }
+            if (t_it != idx.end())
+            {
+              auto ne = make_clone();
+              auto src_it = ne.find(trace->src->location());
+              if (src_it != ne.end())
+              {
+                auto excluded =
+                  exclude_tested_type(top, src_it->second.type, trace->type);
+                if (excluded)
+                  src_it->second = {std::move(excluded), true, {}};
+              }
+              update_branch_exit(t_it->second, std::move(ne));
+            }
+          }
+        }
+      }
+
+      // Update exit env and requeue.
+      bool exit_changed = !same_type_env(exit_envs[i], env);
+      if (exit_changed)
+      {
+        exit_envs[i] = env;
+        forward_out_changed = true;
+      }
+      else
+      {
+        exit_envs[i] = env;
+      }
+      if (forward_out_changed)
+        for (auto s : succ[i])
+          worklist.insert(s);
+      if (label_changes.backward)
+        worklist.insert(i);
+
+      bool bwd_changed = label_changes.backward;
+      for (auto s : succ[i])
+      {
+        for (auto& [loc, info] : bwd_envs[s])
+        {
+          if (
+            label_live_in[i].count(loc) == 0 &&
+            label_defs[i].count(loc) == 0)
+            continue;
+          auto bit = bwd_envs[i].find(loc);
+          if (bit == bwd_envs[i].end())
+          {
+            bwd_envs[i][loc] = {clone(info.type), info.is_fixed, {}};
+            bwd_changed = true;
+          }
+          else
+          {
+            if (same_type_tree(bit->second.type, info.type))
+            {
+              if (!bit->second.is_fixed && info.is_fixed)
+              {
+                bit->second.is_fixed = true;
+                bwd_changed = true;
+              }
+              continue;
+            }
+            if (bit->second.is_fixed && !info.is_fixed)
+              continue;
+            if (!bit->second.is_fixed && info.is_fixed)
+            {
+              bit->second.type = clone(info.type);
+              bit->second.is_fixed = true;
+              bwd_changed = true;
+              continue;
+            }
+            auto m = merge_type(bit->second.type, info.type, top);
+            if (m)
+            {
+              bit->second.type = m;
+              bwd_changed = true;
+            }
+          }
+        }
+      }
+      if (bwd_changed)
+        for (auto p : pred[i])
+          worklist.insert(p);
+    }
+
+    active_method_cache = nullptr;
+
+    // Phase 4: Post-convergence cascade + finalization (per function).
+    for (auto& func : functions)
+    {
+      auto [first, last] = func_label_range[func];
+      size_t fn = last - first;
+      if (fn == 0)
+        continue;
+
+      // Run dependency cascade.
+      for (size_t j = first; j < last; j++)
+        run_dependency_cascade(
+          exit_envs[j], labels[j].label / Body, top, lookup_stmts);
+
+      // Finalization: reuse existing process_function for now.
+      // This is the safe incremental path — we converged the envs
+      // globally, now let process_function do its finalization.
+      // TODO: replace with direct AST writes from exit_envs.
+      process_function(func, top, true);
+    }
+  }
+
   // ===== Pass definition =====
 
   PassDef infer()
@@ -5677,6 +6259,31 @@ namespace vc
     PassDef p{"infer", wfPassInfer, dir::once, {}};
 
     p.post([](auto top) {
+      if (use_global_infer())
+      {
+        infer_global(top);
+
+        // Sweep: DefaultInt → u64, DefaultFloat → f64.
+        top->traverse([](Node& node) {
+          if (node->in({DefaultInt, DefaultFloat}))
+          {
+            auto parent = node->parent();
+            bool is_int = (node == DefaultInt);
+            if (parent == Const)
+              parent->replace(node, is_int ? Node{U64} : Node{F64});
+            else
+              parent->replace(
+                node,
+                is_int ? primitive_type(U64)->front() :
+                         primitive_type(F64)->front());
+            return false;
+          }
+          return true;
+        });
+
+        return 0;
+      }
+
       Nodes deferred;
 
       lambda_returns_omitted.clear();
