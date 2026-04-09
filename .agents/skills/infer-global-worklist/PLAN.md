@@ -17,15 +17,20 @@ communicate state changes between functions. Instead:
 
 ## Current State
 
-The code is in `vc/passes/infer.cc` (the original 6780-line file, fully
-working). A backup exists at `vc/passes/infer.cc.old`. The refactoring
-should produce a replacement `infer.cc` that passes all existing tests.
+The code is in `vc/passes/infer.cc` (6364 lines, fully working). A backup
+exists at `vc/passes/infer.cc.old` (6780 lines, the pre-cleanup version).
+The refactoring should produce a replacement `infer.cc` that passes all
+existing tests.
 
-Ring tests (`testsuite/v/ring_*`) are in place and pass with the current code.
-They provide incremental validation targets for the new implementation.
+An existing prototype `infer_global()` (~400 lines, gated behind
+`VC_INFER_GLOBAL` env var) already implements the basic structure:
+flat label collection, CFG construction, liveness, and an undirected
+worklist loop with `process_function` fallback for finalization. The new
+implementation replaces this prototype with the full architecture below.
 
-**Pre-existing test failure**: `union_method_infer` fails with the current
-code (1 failure out of 1100 tests). This is NOT caused by the refactoring.
+All 1100 tests currently pass. Ring tests (`testsuite/v/ring_*`) are
+planned as incremental validation targets but do not yet exist — they
+should be created as part of the skeleton iteration.
 
 ## Architecture (Validated)
 
@@ -45,17 +50,26 @@ struct CFG {
     std::map<Node, std::pair<size_t, size_t>> func_label_range;
     std::vector<std::vector<size_t>> succ, pred;
     std::map<Node, std::map<std::string, size_t>> func_label_idx;
-    std::map<Location, Node> all_def_stmts;
+    // Per-function def stmt maps — scoped to avoid Location collisions.
+    // Location::operator== compares by string content, so local$10 in
+    // function A and local$10 in function B are the "same" Location.
+    std::map<Node, std::map<Location, Node>> func_def_stmts;
 
     void add_function(const Node& func);  // Add labels to global array
     void finalize();                       // Build edges and lookups
     size_t size() const;
+    const std::map<Location, Node>& def_stmts_for(const Node& func) const;
 };
 ```
 
 **Key design choice**: CFG does NOT own `top` or `functions`. It does not
 traverse the AST. `GlobalInfer::build()` collects functions via AST
 traversal and calls `cfg.add_function(func)` for each, then `cfg.finalize()`.
+
+**Key design choice**: `func_def_stmts` is per-function, not a single global
+map. `Location::operator==` compares by string content (`view()`), so
+`local$10` in different functions would collide in a flat map. The accessor
+`def_stmts_for(func)` returns the scoped map for a given function.
 
 ### Liveness (computed from CFG, queried during solve)
 
@@ -108,7 +122,7 @@ struct InferContext {
   No duplicated shared state (the old code passed `top`, `lookup_stmts`,
   `all_def_stmts`, `typevar_aliases`, `ref_to_tuple` as separate references).
 - Transfer functions access shared state via `gi.top`, `gi.lookup_stmts`,
-  `gi.cfg.all_def_stmts`, `gi.typevar_aliases`, `gi.ref_to_tuple`.
+  `gi.cfg.def_stmts_for(function)`, `gi.typevar_aliases`, `gi.ref_to_tuple`.
 - `forward_changed`/`backward_changed` replace the old `LabelChanges` struct.
   The worklist tracks direction, not the return value.
 - `process_body` takes a `Direction dir` parameter and only runs the
@@ -137,8 +151,11 @@ struct GlobalInfer {
     std::map<Location, std::pair<Location, size_t>> ref_to_tuple;
 
     // Publish/subscribe slots (cross-function communication)
-    std::map<Node, Node> slot_types;
+    std::map<Node, SlotInfo> slots;
     std::map<Node, std::vector<size_t>> slot_subscribers;
+
+    // Per-call-site inferred TypeArgs (keyed by Call/CallDyn stmt node)
+    std::map<Node, Node> call_typeargs;
 
     // Direction-aware worklist
     std::deque<size_t> worklist;
@@ -146,8 +163,9 @@ struct GlobalInfer {
 
     void enqueue(size_t label, Direction dir);
     std::pair<size_t, Direction> dequeue();
-    Node read_slot(const Node& key) const;
-    void publish(const Node& key, const Node& type);
+    SlotInfo read_slot(const Node& key) const;
+    void publish_upper(const Node& key, const Node& type);
+    void publish_lower(const Node& key, const Node& type);
     void subscribe(const Node& key, size_t label);
 
     void build(Node top);
@@ -183,64 +201,222 @@ unified mechanism. Each slot is keyed by an AST node pointer:
 | `FieldDef` | Field type | `infer_new_bwd` | `infer_field_ref` |
 | `ParamDef` | Lambda param type | `infer_call_fwd` | `infer_const` (params) |
 | `Function` | Return type | backward refinement | `CallDyn` resolution |
+| `When` | Cown type | `infer_when_fwd` | when-body params |
+
+**Bidirectional bounds**: Each slot stores two types:
+- **Upper bound** (forward/writes): union of all types published by
+  writers (e.g., all `new MyClass{f = val}` sites for a FieldDef).
+  Accumulated via `merge_type`.
+- **Lower bound** (backward/constraints): intersection of all types
+  expected by readers (e.g., all `obj.f` read sites for a FieldDef).
+  Accumulated via type intersection.
+
+Subscribers see both bounds through `read_slot()`, which returns a
+`SlotInfo` with `upper` and `lower` fields.
+
+```cpp
+struct SlotInfo {
+    Node upper;  // Union of writes (forward)
+    Node lower;  // Intersection of read constraints (backward)
+};
+```
 
 **API**:
-- `publish(node, type)`: set the type, enqueue all subscribers with
-  `Direction::Both` if the type changed.
-- `subscribe(node, label)`: register interest. Caller reads current value
-  via `read_slot()` immediately.
-- `read_slot(node)`: return current type or null.
+- `publish_upper(node, type)`: merge type into upper bound via
+  `merge_type`. Enqueue all subscribers with `Direction::Both` if
+  the bound changed.
+- `publish_lower(node, type)`: intersect type into lower bound.
+  Enqueue all subscribers with `Direction::Both` if the bound changed.
+- `subscribe(node, label)`: register interest. Caller reads current
+  value via `read_slot()` immediately.
+- `read_slot(node)`: return current `SlotInfo` (upper/lower, either
+  may be null if no writes/constraints yet).
 
 **Late subscriptions**: `subscribe()` can be called during Phase 2 (solve).
 This handles `CallDyn` where the receiver type isn't known until mid-solve.
 
-## Implementation Steps
+**Simplification note**: The upper/lower split may collapse to a single
+type if practice shows they always converge. Keep both initially to
+validate the design.
 
-### Step 1: Write the new file structure
+## Implementation Strategy: Skeleton-First
 
-Write the complete `infer.cc` as a replacement (not incremental patching).
-The file should contain, in order:
+The implementation uses a clean-room rewrite built up through iterations.
+Each iteration produces a compiling, testable `infer.cc`. The skeleton
+starts with the new architectural scaffolding + stub transfer functions,
+then progressively fills in real implementations.
 
-1. Dispatch tables (verbatim from old code, lines 23-111)
-2. Forward declarations (`is_lambda_function`, `lambda_returns_omitted`, etc.)
-3. Type constructors and predicates (verbatim, lines 112-397)
-4. Core types (`LocalTypeInfo`, `TypeEnv`, `PendingError`)
-5. Helper function declarations (`typename_path_key`, `infer_type_name`)
-6. Forward declarations for method resolution
-7. Comparison helpers (`same_type_tree`, `same_type_env`)
-8. Env mutation helpers (`replace_if_changed`, `refine_const_local`,
-   `upsert_lookup_stmt`, `upsert_ref_to_tuple`)
-9. Type lattice (`merge_type`, `merge_env`)
-10. Liveness helpers (`collect_label_defs/uses/kills`, `prune_bwd_env`)
-11. Dependency cascade (`run_dependency_cascade` and helpers)
-12. Method resolution (`resolve_method_owner`, `resolve_class_method`,
-    `build_class_subst`, `extract_constraints`, `apply_subst`,
-    `resolve_method`, `resolve_method_return_type`,
-    `resolve_callable_method`, `propagate_shape_to_lambda`)
-13. Backward helpers (`ScopeInfo`, `navigate_call`, `backward_refine_call`,
-    `backward_refine_calldyn`, `trace_typetest`, `propagate_call_node`,
-    `propagate_call_constraint`, `infer_typeargs`,
-    `push_arg_types_to_params`, `retarget_numeric_type`,
-    `extract_backward_primitive`, `recover_local_type_from_def`,
-    `refine_function_return_consts`, `infer_tracked_tuple_type`)
-14. `Direction` enum, `TupleTracking` struct
-15. Forward declaration of `GlobalInfer`
-16. `InferContext` struct (declarations only)
-17. `CFG` struct
-18. `Liveness` struct
-19. `GlobalInfer` struct with `build()`, `solve()`, `finalize()`, `run()`
-20. `InferContext` method implementations (inline methods + all transfer
-    functions)
-21. `PassDef infer()` entry point
+**Why clean-room**: The AST-mutation communication pattern pervades every
+transfer function. Incremental removal creates cascading failures because
+each mutation depends on others. The skeleton approach lets us establish
+the new architecture first (structs, worklist, pub/sub, finalize), then
+port transfer functions one category at a time with clear validation.
 
-### Step 2: Adapt transfer functions
+**Termination guarantee**: The solve loop must include a hard iteration cap
+(`worklist_iterations > cfg.size() * MAX_ITERS_PER_LABEL`) with a
+diagnostic message if hit. Convergence relies on the type lattice being
+finite-height and `merge_type` being monotone, but the safety net catches
+bugs during development.
 
-When copying transfer functions from the old file, make these changes:
+### Iteration 0: Skeleton
+
+**Goal**: New file compiles, `infer()` entry point calls `GlobalInfer::run()`,
+all transfer functions are stubs that do nothing. Tests will fail (types
+unrefined) but the build succeeds and the pass runs without crashing.
+
+Write the complete `infer.cc` replacement with this structure:
+
+1. Includes + namespace (verbatim from old code)
+2. Forward declarations (`is_lambda_function`, `lambda_returns_omitted`)
+3. Dispatch tables (verbatim)
+4. Type constructors and predicates (verbatim)
+5. Core types (`LocalTypeInfo`, `TypeEnv`, `PendingError`)
+6. `Direction` enum, `TupleTracking` struct
+7. Forward declaration of `GlobalInfer`
+8. `CFG` struct (with `add_function`, `finalize`, `def_stmts_for`)
+9. `Liveness` struct (with `build`)
+10. `InferContext` struct — declarations only, all methods stubbed
+11. `GlobalInfer` struct with `build()`, `solve()`, `finalize()`, `run()`
+12. `InferContext` stub method bodies (empty forward/backward passes)
+13. `PassDef infer()` entry point (calls `GlobalInfer::run()` unconditionally)
+
+**Validation**: `ninja install` succeeds. Running `dist/vc/vc build
+../testsuite/v/hello` produces a `.vbc` (may have wrong types, but no crash).
+
+### Iteration 1: Infrastructure helpers
+
+**Goal**: Port all stateless helper functions that don't touch InferContext.
+
+Port verbatim (with scoped def_stmts adjustment):
+- Comparison helpers (`same_type_tree`, `same_type_env`)
+- Env mutation helpers (`replace_if_changed`, `refine_const_local`, etc.)
+- Type lattice (`merge_type`, `merge_env`)
+- Liveness helpers (`collect_label_defs/uses/kills`, `prune_bwd_env`)
+- Method resolution (`resolve_method_owner`, `resolve_class_method`,
+  `build_class_subst`, `extract_constraints`, `apply_subst`, etc.)
+- Backward helpers (`navigate_call`, `backward_refine_*`, `trace_typetest`,
+  `propagate_call_*`, `infer_typeargs`, `push_arg_types_to_params`, etc.)
+- Dependency cascade (`run_dependency_cascade`)
+- Misc (`is_lambda_function`, `retarget_numeric_type`,
+  `extract_backward_primitive`, `recover_local_type_from_def`, etc.)
+
+**Validation**: Compiles. Same behavior as Iteration 0 (stubs still active).
+
+### Iteration 2: Solve loop
+
+**Goal**: `build()`, `solve()` produce converged `exit_envs`/`bwd_envs`.
+Transfer functions still stubbed, so envs just propagate seeds.
+
+Implement:
+- `GlobalInfer::build()`: collect functions, build CFG, build liveness,
+  seed entry envs with param types, seed bwd_envs with return types
+- `GlobalInfer::solve()`: worklist loop, entry env construction,
+  requeueing (using change flags, NOT direction flags),
+  terminator handling (Return/Raise/Cond with branch exits)
+- Publish/subscribe stubs (`publish_upper`, `publish_lower`, `subscribe`,
+  `read_slot`)
+
+**Validation**: Compiles. `solve()` terminates (no infinite loop). Can
+add temporary tracing to verify worklist processes expected number of labels.
+
+### Iteration 3: Forward transfer functions
+
+**Goal**: Port forward_pass and all forward transfer functions.
+
+Port InferContext methods category by category, validating compilation after
+each group:
+- `infer_const`, `infer_copy_move`, `infer_convert`
+- `infer_field_ref`, `infer_register_ref`, `infer_array_ref`
+- `infer_new_fwd`, `infer_load`, `infer_store`
+- `infer_call_fwd`, `infer_calldyn_fwd`, `infer_trycalldyn_fwd`
+- `infer_lookup`, `infer_binop`, `infer_unop`, `infer_nulop`
+- `infer_when_fwd`, `infer_typecond`
+- `forward_pass` dispatch
+
+Apply mechanical replacements per the table above. Remove profiling:
+- Strip `InferScopedTimer`, `InferStmtScope`, `note_infer_transfer_change()`
+- Fix `if` statements left bodyless by profiling removal
+- Remove `InferProcessScope` (replace with direct `active_method_cache` mgmt)
+
+**Validation**: Ring 1 (`ring_basic`) and Ring 2 (`ring_call_typed`) tests
+pass if created.
+
+### Iteration 4: Backward transfer functions + pub/sub
+
+**Goal**: Port backward_pass, implement pub/sub for cross-function flows.
+
+Port:
+- `backward_pass` dispatch
+- All `infer_*_bwd` methods
+- `push_arg_types_to_params` → adapted to use `gi.publish_upper(ParamDef, type)`
+- `propagate_shape_to_lambda` → adapted to use `gi.publish_lower(Function, type)`
+- `infer_new_bwd` → adapted to use `gi.publish_upper(FieldDef, type)` (from
+  writes) and `gi.publish_lower(FieldDef, type)` (from read constraints)
+- `infer_when_fwd` → adapted to use `gi.publish_upper(When node, type)`
+
+Implement full pub/sub:
+- `publish_upper()`: merge type into slot upper bound via `merge_type`,
+  enqueue all subscribers with `Direction::Both` if bound changed
+- `publish_lower()`: intersect type into slot lower bound, enqueue all
+  subscribers with `Direction::Both` if bound changed
+- `subscribe()`: register label + read current value
+- `read_slot()`: return current `SlotInfo` (upper/lower)
+
+Forward transfer functions that read cross-function state (e.g.,
+`infer_field_ref` reading field types, `infer_const` reading param types)
+adapted to use `gi.read_slot()` + `gi.subscribe()`. Reads use the
+slot's upper bound (what was written) for forward inference, and may
+publish to the lower bound (what is expected) for backward propagation.
+
+**Validation**: Ring 3-6 (lambda tests) pass if created. Full test suite
+should show significant improvement.
+
+### Iteration 5: Finalize + TypeArgs
+
+**Goal**: `finalize()` writes converged types to AST. TypeArgs re-derived.
+
+Implement `GlobalInfer::finalize()`:
+1. Dependency cascade per label
+2. Const/TypeAssertion/NewArrayConst: write types from converged envs
+3. TypeVar backprop over `typevar_aliases`
+4. Params and fields: write from `exit_envs` + `slot_types`
+5. Return type inference from Return terminator exit_envs (prefer per-label
+   `exit_envs` which have typetest narrowing, NOT a global env)
+6. TypeArgs: re-derive from converged envs (call `infer_typeargs` with
+   final types, write to AST once)
+7. Error checking: report unresolved TypeVars
+8. DefaultInt/DefaultFloat sweep in entry point, after `run()`
+
+**Deferred generics**: The old `infer()` entry point has a deferred loop
+that re-processes functions with unresolved TypeVars. The global worklist
+subsumes this — all functions are processed together, so TypeVar resolution
+across function boundaries happens naturally during solve. If edge cases
+remain, a second `solve()` pass can be added.
+
+**Error reporting**: Errors (type mismatches, undefined methods, etc.) may
+be reported during solve if it simplifies the code. This may complicate
+future parallelization but is acceptable for the initial implementation.
+
+**Validation**: Ring 7-10 (generics, default literals) pass if created.
+Full test suite: all 1100 tests pass.
+
+### Iteration 6: Profiling (optional)
+
+**Goal**: Re-add profiling infrastructure adapted for global worklist.
+
+- Global counters: total worklist iterations, labels processed, labels
+  skipped, convergence iterations per label
+- Per-transfer-function timers (same categories as old code)
+- No per-function `InferProcessScope` — replaced by global stats
+
+### Step-by-Step Transfer Function Port
+
+When copying each transfer function from the old file:
 
 **Mechanical replacements** (in all InferContext methods):
 - `top` → `gi.top`
 - `lookup_stmts` → `gi.lookup_stmts`
-- `all_def_stmts` → `gi.cfg.all_def_stmts`
+- `all_def_stmts` → `gi.cfg.def_stmts_for(function)` (scoped per-function)
 - `typevar_aliases` → `gi.typevar_aliases`
 - `ref_to_tuple` → `gi.ref_to_tuple`
 - `changes.forward = true` → `forward_changed = true`
@@ -248,20 +424,15 @@ When copying transfer functions from the old file, make these changes:
 - `changes = {}` → `forward_changed = false; backward_changed = false;`
 - `return changes;` → `return;`
 
-**Profiling adaptation** (in transfer functions and helpers):
+**Profiling removal** (in transfer functions and helpers):
 
-Most profiling infrastructure can be KEPT. The `InferScopedTimer` calls in
-transfer functions and `InferStmtScope` categorization are still useful.
-
-What must be REMOVED or ADAPTED:
-- `InferProcessScope`: manages per-function profiling lifetime — the concept
-  of "per-function processing" goes away in the global worklist. Replace with
-  a simpler scope that manages `active_method_cache`.
-- `note_infer_transfer_change()` and `active_infer_transfer_epoch`: these
-  implemented a skip optimization based on transfer epochs. They can be
-  removed — the direction-aware worklist handles skip logic differently.
-  When `note_infer_transfer_change()` is the sole body of an `if`, fix the
-  `if`:
+Most profiling infrastructure is STRIPPED in the skeleton. It can be
+re-added in Iteration 6. During transfer function porting (Iterations 3-4):
+- Remove `InferScopedTimer` calls
+- Remove `InferStmtScope` categorization
+- Remove `note_infer_transfer_change()` calls
+- When `note_infer_transfer_change()` is the sole body of an `if`, remove
+  the entire `if`:
   ```cpp
   // Old:
   if (typevar_aliases.insert({dst, src}).second)
@@ -269,39 +440,36 @@ What must be REMOVED or ADAPTED:
   // New:
   typevar_aliases.insert({dst, src});
   ```
-- `prior_transfer_epochs`: no longer needed (was per-label epoch tracking
-  for the old skip optimization).
-- Profile counters specific to the old per-function loop (`labels_processed`,
-  `labels_skipped`, `worklist_iterations`, etc.) need updating for the global
-  loop structure.
+- Remove `InferProcessScope` (replace with direct `active_method_cache` mgmt)
 
 **CRITICAL**: Do NOT use regex-based Python scripts to strip profiling code.
-This was attempted and destroyed brace structure, mixed code from different
-locations, and produced unfixable corruption. Instead, manually identify and
-remove profiling lines during the copy of each function, or copy functions
-one at a time using `read_file`/`replace_string_in_file`.
+This was attempted and destroyed brace structure. Instead, manually identify
+and remove profiling lines during the copy of each function.
 
-### Step 3: Implement solve()
+### process_body and Direction
 
-The solve loop was implemented and tested. The key insights:
+`process_body(body, dir)` runs forward_pass if `dir` is Forward or Both,
+then backward_pass if `dir` is Backward or Both. When backward-only is
+requested, `const_defs` and `def_stmts` must still be rebuilt from the body
+before running `backward_pass`, since backward transfer functions depend on
+them. This is a scan-only step (no env mutations), done at the start of
+`process_body` regardless of direction.
 
-**Entry env construction** (from old `process_function` lines 4740-4960):
+## Solve Loop Details
+
+The solve loop was validated through implementation. Key insights:
+
+**Entry env construction**:
 1. Entry label (i == func_first): copy from exit_envs[func_first]
 2. Other labels: merge predecessor exit_envs (with branch_exits overrides)
 3. Merge bwd_envs from self and successors into entry
 4. Recover forward metadata for locally-defined locations
 
-**Skip logic** (CRITICAL for convergence):
-```cpp
-bool same_entry = prior_entry_valid[i] && same_type_env(prior_entry_envs[i], env);
-if (same_entry && !run_bwd)
-    continue;
-// For backward-only: also check if successor bwd envs have new info
-if (same_entry && run_bwd && !run_fwd) {
-    bool bwd_incoming_changed = /* compare bwd_envs[succ] with bwd_envs[i] */;
-    if (!bwd_incoming_changed) continue;
-}
-```
+**No skip logic initially**: Every dequeued label is processed with
+`Direction::Both`. Convergence is driven entirely by change-based
+requeueing — if processing produces no changes, no neighbors are enqueued.
+Skip optimizations (comparing entry env to prior) can be added later as
+a performance improvement once correctness is validated.
 
 **Requeueing** (CRITICAL — this was the convergence bug):
 ```cpp
@@ -325,34 +493,48 @@ successors to always be enqueued even when nothing changed. This creates
 infinite cycling. The fix: use `body_fwd_changed` (from InferContext) and
 `forward_out_changed` (from exit_env comparison) instead.
 
-**Terminator handling** (adapted from old code lines 5010-5210):
+**Terminator handling**:
 - Return: backward-merge declared return type into env
 - Raise: refine const literals against raise type
 - Cond: create branch exits with typetest narrowing
 
-### Step 4: Implement finalize()
+**Termination bound**:
+```cpp
+constexpr size_t MAX_ITERS_PER_LABEL = 200;
+if (wl_iters > cfg.size() * MAX_ITERS_PER_LABEL)
+{
+    std::cerr << "infer: global worklist exceeded iteration limit ("
+              << wl_iters << " iterations, " << cfg.size() << " labels)\n";
+    break;
+}
+```
 
-Finalize writes converged types to the AST. Adapted from the old
-`process_function` finalization code (lines 5280-5650):
+## Finalize Details
+
+Finalize writes converged types to the AST:
 
 1. **Dependency cascade**: `run_dependency_cascade()` for each label
 2. **Const/TypeAssertion/NewArrayConst**: write types, remove assertions,
    compute tuple types
 3. **TypeVar backprop**: fixpoint over `typevar_aliases`
 4. **Params and fields**: write from exit_envs + slot_types
-5. **Return type inference**: from Return terminator exit_envs
-6. **Error checking**: report unresolved TypeVars
-7. **Slot_types → AST**: write FieldDef, ParamDef types from slot_types
-8. **DefaultInt/DefaultFloat sweep**: in the pass entry point, after
+5. **Return type inference**: from Return terminator exit_envs (prefer
+   per-label `exit_envs` which have typetest narrowing, NOT a global env)
+6. **TypeArgs**: re-derive from converged envs (call `infer_typeargs` with
+   final types, write to AST once). During solve, inferred TypeArgs are
+   tracked in `gi.call_typeargs` (keyed by Call/CallDyn statement node).
+   At finalization, these are written to the AST.
+7. Error checking: report unresolved TypeVars. Errors (type mismatches,\n   undefined methods, etc.) may be reported during solve if convenient,\n   or during finalization. Solve primarily tracks types; finalize\n   validates and reports remaining issues.\n8. **Slot bounds → AST**: write FieldDef, ParamDef types from slot bounds
+9. **DefaultInt/DefaultFloat sweep**: in the pass entry point, after
    `GlobalInfer::run()`
 
-### Step 5: Test and validate
+**Deferred generics**: The old `infer()` entry point has a deferred loop
+that re-processes functions with unresolved TypeVars. The global worklist
+subsumes this — all functions are processed together, so TypeVar resolution
+across function boundaries happens naturally during solve. If edge cases
+remain, a second `solve()` pass can be added.
 
-Run the full test suite (`ctest -j$(nproc)`). Expected:
-- 1099/1100 pass (pre-existing `union_method_infer` failure)
-- Ring tests pass: `ctest -R "^vbc/ring_"`
-
-## Test Rings
+## Test Rings (to be created)
 
 Tests are organized into 10 rings of increasing difficulty:
 
@@ -369,9 +551,26 @@ Tests are organized into 10 rings of increasing difficulty:
 | 9 | `ring_int_constrained` | Default int literals refined by context |
 | 10 | `ring_int_default` | Unconstrained literals stay as u64 |
 
+Each ring should be a self-contained test (no external deps, no
+`use "_builtin"`, bitmask exit code pattern) under `testsuite/v/ring_*`.
+Create golden files with `ninja update-dump` after the relevant iteration
+passes.
+
+## Validation Strategy
+
+| Iteration | Validation |
+|-----------|------------|
+| 0 | `ninja install` succeeds, `vc build` runs without crash |
+| 1 | Same as 0 (stubs still active) |
+| 2 | `solve()` terminates, no infinite loop |
+| 3 | Simple forward-only tests pass |
+| 4 | Lambda cross-function tests pass |
+| 5 | Full test suite: all 1100 tests pass |
+| 6 | Profiling output matches expectations |
+
 ## Key Findings from Implementation Attempts
 
-### Location Collision
+### Location Collision (Resolved)
 
 `Location::operator==` compares by `view()` (string content), not source
 position. `local$10` in function A and `local$10` in function B are the
@@ -380,7 +579,8 @@ have collisions.
 
 **Solution**: Per-label envs (already the case — each label has its own
 `TypeEnv`). Cross-function flows use the publish/subscribe slot system
-keyed by AST node identity, not Location.
+keyed by AST node identity, not Location. `func_def_stmts` in the CFG is
+scoped per-function to avoid the same collision.
 
 ### AST-as-Communication-Channel
 
@@ -396,7 +596,13 @@ functions. During iteration they mutate:
 
 The publish/subscribe slot system replaces mutations 2-4 and 6.
 Mutation 1 is handled by the env (Const type is tracked per-location).
-Mutation 5 is re-derived during finalization from converged envs.
+Mutation 5 (TypeArgs) requires special handling: during solve, TypeArgs
+are tracked in the env as part of the call site's type state. At
+finalization, `infer_typeargs` is called with converged types and writes
+to the AST once. Within a function, later calls that depend on resolved
+TypeArgs from earlier calls see the resolved types through the env
+(the call's result type reflects the resolved TypeArgs), not by reading
+the TypeArgs node itself.
 
 ### Why Incremental Removal Fails
 
@@ -417,66 +623,57 @@ requeueing causes infinite cycling because Both always has `run_fwd=true`.
 
 The old code has ~300 lines of profiling infrastructure
 (`InferProfileStats`, `InferScopedTimer`, `InferStmtScope`,
-`active_infer_profile`, etc.). Most of this can be KEPT — the timers and
-statement categorization are still useful for profiling the new global
-worklist.
+`active_infer_profile`, etc.). All profiling is OMITTED from the skeleton
+and Iterations 1-5. It is re-added in Iteration 6 once the algorithm is
+validated.
 
-What must change:
-- `InferProcessScope`: remove (per-function concept gone)
-- `note_infer_transfer_change()` / `active_infer_transfer_epoch`: remove
-  (old skip optimization, replaced by direction-aware worklist)
-- `prior_transfer_epochs`: remove (same)
-- Profile counters: adapt for global loop (the per-function counters like
-  `worklist_iterations`, `labels_processed` move from per-function to global)
+Items to remove during porting:
+- `InferProcessScope`: per-function concept gone
+- `note_infer_transfer_change()` / `active_infer_transfer_epoch`: old skip
+  optimization, replaced by direction-aware worklist
+- `prior_transfer_epochs`: same
+- All `InferScopedTimer` and `InferStmtScope` instances
+- Profile counters (`labels_processed`, `labels_skipped`, etc.)
 
-**WARNING**: profiling patterns often use multi-line constructs:
-```cpp
-InferScopedTimer timer(
-    (active_infer_profile != nullptr) ?
-        &active_infer_profile->some_field :
-        nullptr);
-```
-And conditional statements with profiling as the only body:
-```cpp
-if (condition)
-    note_infer_transfer_change();
-```
-Removing the body without fixing the `if` creates syntax errors. Automated
-regex stripping was attempted and destroyed the file structure. Use manual
-function-by-function copying with targeted edits instead.
+**WARNING**: profiling patterns often use multi-line constructs and
+conditional statements with profiling as the only body. Removing the body
+without fixing the `if` creates syntax errors. Handle manually per function.
 
 ### Old Code Structure Reference
 
-The old `infer.cc` (6780 lines) has this layout:
+The old `infer.cc.old` (6780 lines) has the canonical layout. The current
+`infer.cc` (6364 lines) is a cleaned-up version with the same structure
+but slightly different line numbers. Use `infer.cc.old` line numbers as
+reference when porting:
 
-| Lines | Content |
-|-------|---------|
+| Lines (`.old`) | Content |
+|----------------|---------|
 | 1-12 | Includes, namespace |
 | 13-21 | `is_lambda_function` fwd decl, `lambda_returns_omitted` |
 | 23-111 | Dispatch tables |
 | 112-397 | Type constructors and predicates |
-| 398-660 | Profiling infrastructure (SKIP) |
+| 398-660 | Profiling infrastructure (OMIT in skeleton) |
 | 662-680 | `LocalTypeInfo`, `TypeEnv`, `PendingError` |
 | 682-760 | `MethodInfo`, `MethodOwner`, `MethodLookupKey`, cache types |
 | 761-808 | `typename_path_key`, `infer_type_name` |
 | 809-904 | `resolve_method_owner`, `resolve_class_method` |
 | 905-970 | `same_type_tree`, `same_type_env` |
-| 972-977 | `note_infer_transfer_change` (profiling — SKIP) |
+| 972-977 | `note_infer_transfer_change` (profiling — OMIT) |
 | 978-1087 | `replace_if_changed`, `refine_const_local`, `upsert_*` |
 | 1088-1304 | `merge_type`, `merge_env` |
 | 1305-1693 | `SrcIndex`, liveness helpers, `run_dependency_cascade` |
 | 1694-2006 | `build_class_subst`, `extract_constraints`, `apply_subst`, method resolution |
 | 2007-2094 | `propagate_shape_to_lambda` |
-| 2095-2604 | Backward helpers (`navigate_call`, `backward_refine_*`, `trace_typetest`, `propagate_call_*`) |
+| 2095-2604 | Backward helpers |
 | 2605-2771 | `infer_typeargs`, `push_arg_types_to_params` |
-| 2772-3016 | `is_lambda_function`, `retarget_numeric_type`, `extract_backward_primitive`, `recover_local_type_from_def`, `refine_function_return_consts`, `infer_tracked_tuple_type` |
-| 3017-3083 | `LabelChanges`, `InferStmtScope` (profiling — SKIP) |
+| 2772-3016 | `is_lambda_function`, `retarget_numeric_type`, misc helpers |
+| 3017-3083 | `LabelChanges`, `InferStmtScope` (profiling — OMIT) |
 | 3084-3286 | `InferContext` struct with inline methods |
 | 3287-4578 | `InferContext` method implementations (transfer functions) |
-| 4580-5657 | `process_function` (worklist + finalization) |
+| 4580-5657 | `process_function` (worklist + finalization — REPLACE) |
 | 5658-5686 | `has_typevar`, `use_global_infer` |
-| 5687-6672 | `infer_global` (old global attempt — SKIP entirely) |
-| 6673-6780 | `PassDef infer()` entry point |
+| 5687-6672 | `infer_global` (existing prototype — REPLACE) |
+| 6673-6780 | `PassDef infer()` entry point (REPLACE) |
 
 ### `_builtin` Functions
 
@@ -494,3 +691,36 @@ Slight differences from the existing inference are expected and acceptable:
 - Error messages may differ in location/wording
 - Some edge cases may resolve differently (likely bugs in the old
   algorithm's ordering sensitivity)
+
+## Design Decisions (Resolved)
+
+Decisions made during plan review, recorded for reference:
+
+1. **Per-function def_stmts scoping**: `func_def_stmts` is per-function
+   (mathematically equivalent to indexing by `(function, location)` pair).
+   Prevents `Location` string-equality collisions across functions.
+
+2. **Bidirectional pub/sub slots**: Each slot stores upper bound (union of
+   writes via `merge_type`) and lower bound (intersection of read
+   constraints). May simplify to a single type if practice shows they
+   always converge.
+
+3. **Error reporting during solve**: Acceptable if it simplifies code.
+   May complicate future parallelization but not a concern for initial
+   implementation.
+
+4. **No skip optimization initially**: Every dequeued label is processed
+   (always `Direction::Both`). Convergence relies solely on change-based
+   requeueing. Skip optimizations (entry env comparison) deferred as a
+   later performance investigation.
+
+5. **Call TypeArgs tracking**: `std::map<Node, Node> call_typeargs` in
+   `GlobalInfer`, keyed by Call/CallDyn statement node. Written to AST
+   once during finalization.
+
+6. **Worklist ordering**: FIFO (`std::deque`) vs ordered (`std::set`)
+   is not initially important. FIFO chosen in the plan; measure later.
+
+7. **Ring tests**: Created incrementally per iteration, not all upfront.
+
+8. **Line budget**: Target similar or smaller than current 6364 lines.
