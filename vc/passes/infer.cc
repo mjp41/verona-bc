@@ -80,6 +80,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <unordered_set>
 #include <vector>
 
 namespace vc
@@ -665,6 +666,751 @@ namespace vc
     return std::nullopt;
   }
 
+  // ===== Method resolution infrastructure =====
+
+  struct MethodInfo
+  {
+    Node func;
+    NodeMap<Node> subst;
+  };
+
+  struct MethodOwner
+  {
+    Node class_def;
+    Node subst_source;
+    std::string key;
+  };
+
+  static std::string typename_path_key(const Node& type_name)
+  {
+    if (type_name != TypeName)
+      return {};
+    std::string key;
+    for (auto& elem : *type_name)
+    {
+      if (!key.empty())
+        key += "::";
+      key += std::string((elem / Ident)->location().view());
+    }
+    return key;
+  }
+
+  static MethodOwner resolve_method_owner(Node top, const Node& receiver_type)
+  {
+    if (receiver_type != Type)
+      return {};
+    auto inner = receiver_type->front();
+    if (inner != TypeName)
+      return {};
+    auto class_def = find_def(top, inner);
+    Node subst_source = inner;
+
+    while (class_def == TypeAlias)
+    {
+      auto alias_type = class_def / Type;
+      if (alias_type->front() != TypeName)
+        break;
+      class_def = find_def(top, alias_type->front());
+      if (!class_def)
+        return {};
+    }
+
+    if ((!class_def || class_def != ClassDef) && inner->size() > 1)
+    {
+      Node base = TypeName;
+      for (size_t i = 0; i + 1 < inner->size(); i++)
+        base << clone(inner->at(i));
+      auto base_def = find_def(top, base);
+      if (base_def && base_def == ClassDef)
+      {
+        class_def = base_def;
+        subst_source = base;
+      }
+    }
+
+    if (!class_def || class_def != ClassDef)
+      return {};
+    return {class_def, subst_source, typename_path_key(subst_source)};
+  }
+
+  // ===== Generic type inference helpers =====
+
+  NodeMap<Node>
+  build_class_subst(const Node& class_def, const Node& typename_node)
+  {
+    NodeMap<Node> subst;
+    auto tps = class_def / TypeParams;
+    auto ta = typename_node->back() / TypeArgs;
+    if (tps->size() == ta->size())
+      for (size_t i = 0; i < tps->size(); i++)
+        subst[tps->at(i)] = ta->at(i);
+    return subst;
+  }
+
+  // Forward decl for mutual recursion.
+  Node apply_subst(Node top, const Node& type_node, const NodeMap<Node>& subst);
+
+  void extract_constraints(
+    Node top,
+    const Node& f_inner,
+    const Node& a_inner,
+    NodeMap<LocalTypeInfo>& constraints,
+    bool is_default)
+  {
+    if (f_inner == TypeName)
+    {
+      auto def = find_def(top, f_inner);
+      if (def && def == TypeParam)
+      {
+        Node actual_type = Type << clone(a_inner);
+        auto existing = constraints.find(def);
+        if (existing == constraints.end())
+          constraints[def] = {actual_type, {}};
+        else if (is_default_type(existing->second.type) && !is_default)
+          constraints[def] = {actual_type, {}};
+        return;
+      }
+    }
+
+    if (f_inner == TypeName && a_inner == TypeName)
+    {
+      bool structural = (f_inner->size() == a_inner->size());
+      if (structural)
+      {
+        for (size_t i = 0; i < f_inner->size(); i++)
+        {
+          if (
+            (f_inner->at(i) / Ident)->location().view() !=
+            (a_inner->at(i) / Ident)->location().view())
+          {
+            structural = false;
+            break;
+          }
+          if (
+            (f_inner->at(i) / TypeArgs)->size() !=
+            (a_inner->at(i) / TypeArgs)->size())
+          {
+            structural = false;
+            break;
+          }
+        }
+      }
+
+      if (structural)
+      {
+        for (size_t i = 0; i < f_inner->size(); i++)
+        {
+          auto f_ta = f_inner->at(i) / TypeArgs;
+          auto a_ta = a_inner->at(i) / TypeArgs;
+          for (size_t j = 0; j < f_ta->size(); j++)
+            extract_constraints(
+              top,
+              f_ta->at(j)->front(),
+              a_ta->at(j)->front(),
+              constraints,
+              is_default);
+        }
+        return;
+      }
+
+      auto f_def = find_def(top, f_inner);
+      auto a_def = find_def(top, a_inner);
+      if (
+        f_def && a_def && f_def == ClassDef && (f_def / Shape) == Shape &&
+        a_def == ClassDef)
+      {
+        auto shape_to_formal = build_class_subst(f_def, f_inner);
+        if (!shape_to_formal.empty())
+        {
+          auto actual_subst = build_class_subst(a_def, a_inner);
+          for (auto& sf : *(f_def / ClassBody))
+          {
+            if (sf != Function)
+              continue;
+            auto mname = (sf / Ident)->location().view();
+            auto hand = (sf / Lhs)->type();
+            auto arity = (sf / Params)->size();
+            for (auto& af : *(a_def / ClassBody))
+            {
+              if (af != Function)
+                continue;
+              if ((af / Ident)->location().view() != mname)
+                continue;
+              if ((af / Lhs)->type() != hand)
+                continue;
+              if ((af / Params)->size() != arity)
+                continue;
+              auto formal_params = sf / Params;
+              auto actual_params = af / Params;
+              for (size_t j = 0; j < formal_params->size(); j++)
+              {
+                auto formal_param = apply_subst(
+                  top, formal_params->at(j) / Type, shape_to_formal);
+                auto actual_param =
+                  apply_subst(top, actual_params->at(j) / Type, actual_subst);
+                if (
+                  !formal_param || !actual_param ||
+                  actual_param->front() == TypeVar)
+                  continue;
+                extract_constraints(
+                  top,
+                  formal_param->front(),
+                  actual_param->front(),
+                  constraints,
+                  is_default);
+              }
+              auto formal_ret = apply_subst(top, sf / Type, shape_to_formal);
+              auto actual_ret = apply_subst(top, af / Type, actual_subst);
+              extract_constraints(
+                top,
+                formal_ret->front(),
+                actual_ret->front(),
+                constraints,
+                is_default);
+              break;
+            }
+          }
+        }
+      }
+      return;
+    }
+
+    if (
+      f_inner->type() == a_inner->type() &&
+      f_inner->size() == a_inner->size() &&
+      f_inner->in({Union, Isect, TupleType}))
+    {
+      for (size_t i = 0; i < f_inner->size(); i++)
+        extract_constraints(
+          top, f_inner->at(i), a_inner->at(i), constraints, is_default);
+    }
+  }
+
+  Node apply_subst(Node top, const Node& type_node, const NodeMap<Node>& subst)
+  {
+    if (type_node != Type || subst.empty())
+      return clone(type_node);
+    auto inner = type_node->front();
+
+    if (inner == TypeName)
+    {
+      auto def = find_def(top, inner);
+      if (def && def == TypeParam)
+      {
+        auto it = subst.find(def);
+        if (it != subst.end())
+          return clone(it->second);
+      }
+      Node new_tn = TypeName;
+      for (auto& elem : *inner)
+      {
+        Node new_ta = TypeArgs;
+        for (auto& ta_child : *(elem / TypeArgs))
+          new_ta << apply_subst(top, ta_child, subst);
+        new_tn << (NameElement << clone(elem / Ident) << new_ta);
+      }
+      return Type << new_tn;
+    }
+
+    if (inner->in({Union, Isect, TupleType}))
+    {
+      Node new_inner = inner->type();
+      for (auto& child : *inner)
+        new_inner << apply_subst(top, Type << clone(child), subst)->front();
+      return Type << new_inner;
+    }
+    return clone(type_node);
+  }
+
+  // ===== Method resolution =====
+
+  // Method cache: module-level (reset per run).
+  static std::map<
+    std::tuple<std::string, std::string, std::string, size_t>,
+    Node>*
+    active_method_cache = nullptr;
+
+  static Node resolve_class_method_cached(
+    const MethodOwner& owner,
+    std::string_view method_name,
+    Token hand,
+    size_t arity)
+  {
+    if (!owner.class_def)
+      return {};
+
+    auto key = std::make_tuple(
+      owner.key,
+      std::string(method_name),
+      std::string(hand.str()),
+      arity);
+
+    if (active_method_cache)
+    {
+      auto it = active_method_cache->find(key);
+      if (it != active_method_cache->end())
+        return it->second;
+    }
+
+    Node func;
+    for (auto& child : *(owner.class_def / ClassBody))
+    {
+      if (child != Function)
+        continue;
+      auto child_name = lookup_method_name(child);
+      if (!child_name || child_name->location().view() != method_name)
+        continue;
+      if ((child / Lhs)->type() != hand)
+        continue;
+      if ((child / Params)->size() != arity)
+        continue;
+      func = child;
+      break;
+    }
+
+    if (active_method_cache)
+      (*active_method_cache)[std::move(key)] = func;
+
+    return func;
+  }
+
+  static MethodInfo resolve_method(
+    Node top,
+    const Node& receiver_type,
+    const Node& method_ident,
+    Token hand,
+    size_t arity,
+    const Node& method_typeargs)
+  {
+    auto owner = resolve_method_owner(top, receiver_type);
+    if (owner.class_def)
+    {
+      auto subst = build_class_subst(owner.class_def, owner.subst_source);
+      auto func = resolve_class_method_cached(
+        owner, method_ident->location().view(), hand, arity);
+      if (func)
+      {
+        auto func_tps = func / TypeParams;
+        if (
+          !method_typeargs->empty() &&
+          method_typeargs->size() == func_tps->size())
+        {
+          for (size_t i = 0; i < func_tps->size(); i++)
+            subst[func_tps->at(i)] = method_typeargs->at(i);
+        }
+        return MethodInfo{func, std::move(subst)};
+      }
+    }
+
+    if (receiver_type == Type && receiver_type->front() == Union)
+    {
+      MethodInfo first_info;
+      for (auto& member : *(receiver_type->front()))
+      {
+        Node member_type = Type << clone(member);
+        auto info = resolve_method(
+          top, member_type, method_ident, hand, arity, method_typeargs);
+        if (!info.func)
+          return {};
+        if (!first_info.func)
+          first_info = std::move(info);
+      }
+      return first_info;
+    }
+
+    auto ref_inner = extract_ref_inner(receiver_type);
+    if (!ref_inner)
+      ref_inner = extract_cown_inner(receiver_type);
+    if (ref_inner)
+      return resolve_method(
+        top, ref_inner, method_ident, hand, arity, method_typeargs);
+    return {};
+  }
+
+  static Node resolve_method_return_type(
+    Node top,
+    const Node& receiver_type,
+    const Node& method_ident,
+    Token hand,
+    size_t arity,
+    const Node& method_typeargs)
+  {
+    auto info = resolve_method(
+      top, receiver_type, method_ident, hand, arity, method_typeargs);
+    if (!info.func)
+      return {};
+    auto ret = apply_subst(top, info.func / Type, info.subst);
+
+    if (ret && ret->front() == TypeVar && hand == Rhs)
+    {
+      auto lhs_info = resolve_method(
+        top, receiver_type, method_ident, Lhs, arity, method_typeargs);
+      if (lhs_info.func)
+      {
+        auto lhs_ret = apply_subst(top, lhs_info.func / Type, lhs_info.subst);
+        auto inner = extract_ref_inner(lhs_ret);
+        if (inner)
+          return inner;
+      }
+    }
+    return ret;
+  }
+
+  static MethodInfo resolve_callable_method(
+    Node top,
+    const Node& receiver_type,
+    const Node& method_ident,
+    Token hand,
+    size_t arity,
+    const Node& method_typeargs)
+  {
+    auto info = resolve_method(
+      top, receiver_type, method_ident, hand, arity, method_typeargs);
+    if (!info.func && hand == Rhs)
+      info = resolve_method(
+        top, receiver_type, method_ident, Lhs, arity, method_typeargs);
+    return info;
+  }
+
+  // ===== Shape propagation =====
+
+  static bool replace_if_changed(
+    const Node& owner, const Node& old_child, const Node& new_child)
+  {
+    if (same_type_tree(old_child, new_child))
+      return false;
+    owner->replace(old_child, new_child);
+    return true;
+  }
+
+  static std::unordered_set<const void*>& get_lambda_returns_omitted()
+  {
+    static std::unordered_set<const void*> s;
+    return s;
+  }
+
+  static bool lambda_return_was_omitted(const Node& func)
+  {
+    return get_lambda_returns_omitted().count(func.get()) > 0;
+  }
+
+  bool propagate_shape_to_lambda(
+    Node top, const Node& shape_type, const Node& actual_type)
+  {
+    if (shape_type != Type || actual_type != Type)
+      return false;
+    auto shape_inner = shape_type->front();
+    auto actual_inner = actual_type->front();
+    if (shape_inner != TypeName || actual_inner != TypeName)
+      return false;
+    auto shape_def = find_def(top, shape_inner);
+    auto actual_def = find_def(top, actual_inner);
+    if (!shape_def || !actual_def)
+      return false;
+
+    while (shape_def == TypeAlias)
+    {
+      auto alias_type = shape_def / Type;
+      if (alias_type->front() != TypeName)
+        break;
+      shape_def = find_def(top, alias_type->front());
+      if (!shape_def)
+        return false;
+    }
+
+    if (shape_def != ClassDef || actual_def != ClassDef)
+      return false;
+    if ((shape_def / Shape) != Shape)
+      return false;
+
+    bool changed = false;
+    auto shape_subst = build_class_subst(shape_def, shape_inner);
+    for (auto& sf : *(shape_def / ClassBody))
+    {
+      if (sf != Function)
+        continue;
+      auto mname = (sf / Ident)->location().view();
+      auto hand = (sf / Lhs)->type();
+
+      for (auto& af : *(actual_def / ClassBody))
+      {
+        if (af != Function)
+          continue;
+        if ((af / Ident)->location().view() != mname)
+          continue;
+        if ((af / Lhs)->type() != hand)
+          continue;
+        if ((af / Params)->size() != (sf / Params)->size())
+          continue;
+
+        auto shape_params = sf / Params;
+        auto actual_params = af / Params;
+        for (size_t j = 0; j < shape_params->size(); j++)
+        {
+          auto ap = actual_params->at(j);
+          auto apt = ap / Type;
+          if (apt->front() != TypeVar)
+            continue;
+          auto spt = apply_subst(top, shape_params->at(j) / Type, shape_subst);
+          if (!spt || spt->front() == TypeVar || spt->front() == TypeSelf)
+            continue;
+          changed |= replace_if_changed(ap, apt, clone(spt));
+        }
+
+        auto actual_ret = af / Type;
+        auto shape_ret = apply_subst(top, sf / Type, shape_subst);
+        if (shape_ret && shape_ret->front() != TypeVar)
+        {
+          if (
+            actual_ret->front() == TypeVar ||
+            (is_lambda_function(af) && lambda_return_was_omitted(af)))
+          {
+            changed |= replace_if_changed(af, actual_ret, clone(shape_ret));
+          }
+        }
+        break;
+      }
+    }
+    return changed;
+  }
+
+  // ===== Call navigation =====
+
+  struct ScopeInfo
+  {
+    Node name_elem;
+    Node def;
+  };
+
+  Node navigate_call(Node call, Node top, std::vector<ScopeInfo>& scopes)
+  {
+    auto funcname = call / FuncName;
+    auto args = call / Args;
+    auto func_def = find_func_def(top, funcname, args->size(), call / Lhs);
+    if (!func_def)
+      return {};
+
+    Node def = top;
+    for (auto it = funcname->begin(); it != funcname->end(); ++it)
+    {
+      bool is_last = (it + 1 == funcname->end());
+      if (is_last)
+      {
+        scopes.push_back({*it, func_def});
+      }
+      else
+      {
+        auto defs = def->look(((*it) / Ident)->location());
+        def = defs.front();
+        scopes.push_back({*it, def});
+      }
+    }
+    return func_def;
+  }
+
+  // ===== TypeArg inference =====
+
+  static bool infer_typeargs(
+    Node call,
+    Node func_def,
+    std::vector<ScopeInfo>& scopes,
+    TypeEnv& env,
+    Node top)
+  {
+    auto args = call / Args;
+    auto params = func_def / Params;
+
+    bool needs_inference = false;
+    for (auto& scope : scopes)
+    {
+      auto ta = scope.name_elem / TypeArgs;
+      auto tps = scope.def / TypeParams;
+      if (ta->empty() && !tps->empty())
+      {
+        needs_inference = true;
+        break;
+      }
+    }
+
+    if (!needs_inference)
+      return false;
+
+    NodeMap<LocalTypeInfo> constraints;
+    for (size_t i = 0; i < params->size() && i < args->size(); i++)
+    {
+      auto arg_loc = (args->at(i) / Rhs)->location();
+      auto arg_it = env.find(arg_loc);
+      if (arg_it == env.end())
+        continue;
+      extract_constraints(
+        top,
+        (params->at(i) / Type)->front(),
+        arg_it->second.type->front(),
+        constraints,
+        is_default_type(arg_it->second.type));
+    }
+
+    bool all_default = !constraints.empty();
+    for (auto& [tp, info] : constraints)
+      if (!is_default_type(info.type))
+        all_default = false;
+
+    for (auto& scope : scopes)
+    {
+      auto ta = scope.name_elem / TypeArgs;
+      auto tps = scope.def / TypeParams;
+      if (tps->empty())
+        continue;
+
+      if (!ta->empty())
+      {
+        bool needs_reinfer = false;
+        for (auto& t : *ta)
+          if (direct_typeparam(top, t))
+          {
+            needs_reinfer = true;
+            break;
+          }
+        if (!needs_reinfer)
+          continue;
+      }
+
+      bool all_constrained = true;
+      Node new_ta = TypeArgs;
+      for (auto& tp : *tps)
+      {
+        auto find = constraints.find(tp);
+        if (find == constraints.end())
+        {
+          all_constrained = false;
+          break;
+        }
+        new_ta << clone(find->second.type);
+      }
+      if (all_constrained)
+        snmalloc::UNUSED(replace_if_changed(scope.name_elem, ta, new_ta));
+    }
+
+    return all_default;
+  }
+
+  // Push concrete arg types into TypeVar formal params.
+  static void push_arg_types_to_params(
+    Node func_def, const Node& args, TypeEnv& env, Node /*top*/)
+  {
+    auto params = func_def / Params;
+    auto parent_cls = func_def->parent(ClassDef);
+
+    for (size_t i = 0; i < params->size() && i < args->size(); i++)
+    {
+      auto param = params->at(i);
+      auto formal_type = param / Type;
+      if (!contains_typevar(formal_type))
+        continue;
+
+      Node resolved;
+      bool allow_default_arg = false;
+
+      if (parent_cls)
+      {
+        auto pname = (param / Ident)->location().view();
+        for (auto& child : *(parent_cls / ClassBody))
+        {
+          if (child != FieldDef)
+            continue;
+          if ((child / Ident)->location().view() != pname)
+            continue;
+          if (!contains_typevar(child / Type))
+            resolved = child / Type;
+          else if (is_lambda_function(func_def))
+            allow_default_arg = true;
+          break;
+        }
+      }
+
+      if (!resolved)
+      {
+        auto arg_loc = (args->at(i) / Rhs)->location();
+        auto arg_it = env.find(arg_loc);
+        if (arg_it == env.end() || contains_typevar(arg_it->second.type))
+          continue;
+        if (contains_default_type(arg_it->second.type) && !allow_default_arg)
+          continue;
+        resolved = arg_it->second.type;
+      }
+
+      snmalloc::UNUSED(replace_if_changed(param, formal_type, clone(resolved)));
+
+      if (parent_cls)
+      {
+        auto pname = (param / Ident)->location().view();
+        for (auto& child : *(parent_cls / ClassBody))
+        {
+          if (child != FieldDef)
+            continue;
+          if ((child / Ident)->location().view() != pname)
+            continue;
+          if (contains_typevar(child / Type))
+            snmalloc::UNUSED(
+              replace_if_changed(child, child / Type, clone(resolved)));
+          break;
+        }
+      }
+    }
+  }
+
+  // ===== Tuple tracking =====
+
+  struct TupleTracking
+  {
+    size_t size;
+    bool is_array_lit;
+    std::vector<Node> element_types;
+    std::vector<Location> element_value_locs;
+  };
+
+  static Node infer_tracked_tuple_type(const TupleTracking& tt)
+  {
+    if (tt.is_array_lit)
+    {
+      Node common;
+      bool uniform = true;
+      for (size_t i = 0; i < tt.size && uniform; i++)
+      {
+        if (tt.element_value_locs[i].view().empty())
+        {
+          uniform = false;
+          break;
+        }
+        auto& et = tt.element_types[i];
+        if (!et || !extract_primitive(et))
+        {
+          uniform = false;
+          break;
+        }
+        if (!common)
+          common = clone(et);
+        else if (et->front()->type() != common->front()->type())
+          uniform = false;
+      }
+      if (uniform && common && tt.size > 0)
+        return clone(common);
+      return {};
+    }
+
+    for (size_t i = 0; i < tt.size; i++)
+      if (!tt.element_types[i])
+        return {};
+    if (tt.size == 0)
+      return {};
+    if (tt.size == 1)
+      return Type << clone(tt.element_types[0]->front());
+
+    Node tup = TupleType;
+    for (auto& et : tt.element_types)
+      tup << clone(et->front());
+    return Type << tup;
+  }
   // ===== CFG (immutable after construction) =====
 
   struct CFG
@@ -889,16 +1635,602 @@ namespace vc
     std::set<std::pair<Location, Location>> typevar_aliases;
     std::map<Location, std::pair<Location, size_t>> ref_to_tuple;
 
-    // Method resolution cache (instance variable, not static global).
-    struct MethodLookupKey
+    // Method resolution cache.
+    std::map<
+      std::tuple<std::string, std::string, std::string, size_t>,
+      Node>
+      method_cache_storage;
+
+    // Per-label tuple tracking state.
+    std::map<Location, TupleTracking> tuple_locals;
+
+    // Run forward transfer functions over a label body.
+    // Reads from env (starts as copy of fwd[label]).
+    // Returns true if any type was produced/changed.
+    bool forward_pass(TypeEnv& env, const Node& body, const Node& /*func*/)
     {
-      std::string owner_key;
-      std::string method_name;
-      std::string hand_name;
-      size_t arity;
-      auto operator<=>(const MethodLookupKey&) const = default;
-    };
-    std::map<MethodLookupKey, Node> method_cache;
+      bool changed = false;
+      auto merge = [&](const Location& loc, const Node& type,
+                       Node call_node = {}) -> bool {
+        auto it = env.find(loc);
+        if (it == env.end())
+        {
+          env[loc] = {clone(type), call_node};
+          changed = true;
+          return true;
+        }
+        if (it->second.type == type)
+          return false;
+        auto merged = merge_type(it->second.type, type, top);
+        if (!merged)
+          return false;
+        it->second.type = merged;
+        if (call_node && !it->second.call_node)
+          it->second.call_node = call_node;
+        changed = true;
+        return true;
+      };
+
+      for (auto& stmt : *body)
+      {
+        if (stmt == Const)
+        {
+          auto dst = stmt->front();
+          Node type_tok;
+          if (stmt->size() == 3)
+            type_tok = stmt->at(1);
+          else
+            type_tok = default_literal_type(stmt->back());
+          auto type = type_tok->in({DefaultInt, DefaultFloat}) ?
+            (Type << type_tok->type()) :
+            primitive_or_ffi_type(type_tok->type());
+
+          if (is_default_type(type))
+          {
+            auto it = env.find(dst->location());
+            if (it != env.end() && !is_default_type(it->second.type))
+            {
+              auto prim = extract_primitive(it->second.type);
+              if (
+                prim &&
+                ((type->front() == DefaultInt && prim->in(integer_types)) ||
+                 (type->front() == DefaultFloat && prim->in(float_types))))
+                type = clone(it->second.type);
+            }
+          }
+          merge(dst->location(), type);
+        }
+        else if (stmt == ConstStr)
+        {
+          merge((stmt / LocalId)->location(), string_type());
+        }
+        else if (stmt == Convert)
+        {
+          merge((stmt / LocalId)->location(), clone(stmt / Type));
+        }
+        else if (stmt->in({Copy, Move}))
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto src_loc = (stmt / Rhs)->location();
+          auto src_it = env.find(src_loc);
+          auto dst_it = env.find(dst_loc);
+
+          if (src_it != env.end() && dst_it != env.end())
+          {
+            bool dst_tv = dst_it->second.type->front() == TypeVar;
+            bool src_tv = src_it->second.type->front() == TypeVar;
+            if (dst_tv != src_tv)
+              typevar_aliases.insert({dst_loc, src_loc});
+          }
+
+          if (src_it != env.end())
+            merge(dst_loc, src_it->second.type, src_it->second.call_node);
+
+          auto tuple_ref = ref_to_tuple.find(src_loc);
+          if (tuple_ref != ref_to_tuple.end())
+            ref_to_tuple[dst_loc] = tuple_ref->second;
+        }
+        else if (stmt == RegisterRef)
+        {
+          auto src_it = env.find((stmt / Rhs)->location());
+          if (src_it != env.end())
+            merge(
+              (stmt / LocalId)->location(),
+              ref_type(clone(src_it->second.type)));
+        }
+        else if (stmt == FieldRef)
+        {
+          auto arg_src = (stmt / Arg) / Rhs;
+          auto dst_loc = (stmt / LocalId)->location();
+          auto obj_it = env.find(arg_src->location());
+          if (obj_it != env.end())
+          {
+            auto inner = obj_it->second.type->front();
+            if (inner == TypeName)
+            {
+              auto class_def = find_def(top, inner);
+              if (class_def && class_def == ClassDef)
+              {
+                auto subst = build_class_subst(class_def, inner);
+                auto fname = (stmt / FieldId)->location().view();
+                for (auto& f : *(class_def / ClassBody))
+                {
+                  if (f != FieldDef)
+                    continue;
+                  if ((f / Ident)->location().view() != fname)
+                    continue;
+                  auto ft = apply_subst(top, f / Type, subst);
+                  if (ft)
+                    merge(dst_loc, ref_type(ft));
+                  break;
+                }
+              }
+            }
+          }
+        }
+        else if (stmt == Load)
+        {
+          auto src_it = env.find((stmt / Rhs)->location());
+          if (src_it != env.end())
+          {
+            auto inner = extract_ref_inner(src_it->second.type);
+            if (inner)
+              merge((stmt / LocalId)->location(), inner);
+          }
+        }
+        else if (stmt == Store)
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto ref_loc = (stmt / Rhs)->location();
+          auto val_loc = ((stmt / Arg) / Rhs)->location();
+
+          auto ref_it = env.find(ref_loc);
+          if (ref_it != env.end())
+          {
+            auto inner = extract_ref_inner(ref_it->second.type);
+            if (inner)
+            {
+              merge(dst_loc, clone(inner));
+
+              auto rtt = ref_to_tuple.find(ref_loc);
+              if (rtt != ref_to_tuple.end())
+              {
+                auto& [tup_loc, idx] = rtt->second;
+                auto tt = tuple_locals.find(tup_loc);
+                if (tt != tuple_locals.end() && idx < tt->second.size)
+                {
+                  auto val_it = env.find(val_loc);
+                  if (val_it != env.end())
+                  {
+                    tt->second.element_types[idx] =
+                      clone(val_it->second.type);
+                    if (tt->second.is_array_lit)
+                      tt->second.element_value_locs[idx] = val_loc;
+
+                    auto tracked = infer_tracked_tuple_type(tt->second);
+                    if (tracked)
+                    {
+                      auto tup_it = env.find(tup_loc);
+                      if (
+                        (tup_it == env.end()) ||
+                        !same_type_tree(tup_it->second.type, tracked))
+                      {
+                        env[tup_loc] = {clone(tracked), {}};
+                        changed = true;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        else if (stmt->in({ArrayRef, ArrayRefConst}))
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto arg_loc = ((stmt / Arg) / Rhs)->location();
+          auto src_it = env.find(arg_loc);
+
+          if (stmt == ArrayRefConst)
+          {
+            auto index = from_chars_sep_v<size_t>(stmt / Rhs);
+            auto rtt = ref_to_tuple.find(arg_loc);
+            if (rtt != ref_to_tuple.end())
+              ref_to_tuple[dst_loc] = {rtt->second.first, index};
+            else
+              ref_to_tuple[dst_loc] = {arg_loc, index};
+
+            if (src_it != env.end())
+            {
+              auto inner = src_it->second.type->front();
+              if (inner == TupleType && index < inner->size())
+              {
+                merge(dst_loc, ref_type(Type << clone(inner->at(index))));
+                continue;
+              }
+            }
+          }
+
+          if (src_it != env.end())
+            merge(dst_loc, ref_type(clone(src_it->second.type)));
+        }
+        else if (stmt == ArrayRefFromEnd)
+        {
+          auto arg_loc = ((stmt / Arg) / Rhs)->location();
+          auto src_it = env.find(arg_loc);
+          if (src_it != env.end())
+          {
+            auto inner = src_it->second.type->front();
+            if (inner == TupleType)
+            {
+              auto offset = from_chars_sep_v<size_t>(stmt / Rhs);
+              if (offset > 0 && offset <= inner->size())
+              {
+                auto index = inner->size() - offset;
+                merge(
+                  (stmt / LocalId)->location(),
+                  ref_type(Type << clone(inner->at(index))));
+                continue;
+              }
+            }
+            merge(
+              (stmt / LocalId)->location(),
+              ref_type(clone(src_it->second.type)));
+          }
+        }
+        else if (stmt == SplatOp)
+        {
+          auto arg_loc = ((stmt / Arg) / Rhs)->location();
+          auto src_it = env.find(arg_loc);
+          if (
+            src_it != env.end() &&
+            src_it->second.type->front() == TupleType)
+          {
+            auto inner = src_it->second.type->front();
+            auto before = from_chars_sep_v<size_t>(stmt / Lhs);
+            auto after = from_chars_sep_v<size_t>(stmt / Rhs);
+            if (before + after <= inner->size())
+            {
+              auto remaining = inner->size() - before - after;
+              if (remaining == 0)
+                merge((stmt / LocalId)->location(), primitive_type(None));
+              else if (remaining == 1)
+                merge(
+                  (stmt / LocalId)->location(),
+                  Type << clone(inner->at(before)));
+              else
+              {
+                Node tup = TupleType;
+                for (size_t i = before; i < before + remaining; i++)
+                  tup << clone(inner->at(i));
+                merge((stmt / LocalId)->location(), Type << tup);
+              }
+              continue;
+            }
+          }
+          merge((stmt / LocalId)->location(), make_type());
+        }
+        else if (stmt->in({NewArray, NewArrayConst}))
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto init_type = stmt / Type;
+          auto dst_it = env.find(dst_loc);
+          if (!(dst_it != env.end() && is_any_type(init_type) &&
+                !is_any_type(dst_it->second.type) &&
+                (dst_it->second.type->front() != TypeVar)))
+            merge(dst_loc, clone(init_type));
+
+          if (stmt == NewArrayConst)
+          {
+            auto sz = from_chars_sep_v<size_t>(stmt / Rhs);
+            bool is_lit =
+              dst_loc.view().find("array") != std::string_view::npos;
+            tuple_locals[dst_loc] = {
+              sz, is_lit, std::vector<Node>(sz), std::vector<Location>(sz)};
+            ref_to_tuple[dst_loc] = {dst_loc, 0};
+          }
+        }
+        else if (stmt == TypeAssertion)
+        {
+          auto loc = (stmt / LocalId)->location();
+          merge(loc, clone(stmt / Type));
+          auto it = env.find(loc);
+          if (it != env.end())
+            it->second.type = clone(stmt / Type); // Fixed.
+        }
+        else if (stmt->in({New, Stack}))
+        {
+          merge((stmt / LocalId)->location(), clone(stmt / Type));
+        }
+        else if (stmt->in(propagate_lhs_ops))
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto lhs_loc = (stmt / Lhs)->location();
+          auto rhs_loc = (stmt / Rhs)->location();
+          auto lhs_it = env.find(lhs_loc);
+          auto rhs_it = env.find(rhs_loc);
+
+          if (
+            lhs_it != env.end() && rhs_it != env.end() &&
+            is_default_type(lhs_it->second.type))
+          {
+            auto rhs_prim = extract_callable_primitive(rhs_it->second.type);
+            bool compatible = rhs_prim &&
+              ((lhs_it->second.type->front() == DefaultInt &&
+                rhs_prim->in(integer_types)) ||
+               (lhs_it->second.type->front() == DefaultFloat &&
+                rhs_prim->in(float_types)));
+            if (compatible)
+            {
+              auto refined = primitive_or_ffi_type(rhs_prim->type());
+              merge(dst_loc, clone(refined));
+              lhs_it = env.find(lhs_loc);
+            }
+          }
+
+          if (lhs_it != env.end())
+            merge(dst_loc, clone(lhs_it->second.type));
+        }
+        else if (stmt->in(propagate_rhs_ops))
+        {
+          auto src_it = env.find((stmt / Rhs)->location());
+          if (src_it != env.end())
+            merge((stmt / LocalId)->location(), clone(src_it->second.type));
+        }
+        else if (auto frt = fixed_result_type.find(stmt->type());
+                 frt != fixed_result_type.end())
+        {
+          merge((stmt / LocalId)->location(), primitive_type(frt->second));
+        }
+        else if (auto ffrt = fixed_ffi_result_type.find(stmt->type());
+                 ffrt != fixed_ffi_result_type.end())
+        {
+          merge(
+            (stmt / LocalId)->location(), ffi_primitive_type(ffrt->second));
+        }
+        else if (stmt == FFIStruct)
+        {
+          merge((stmt / LocalId)->location(), ffi_struct_result_type());
+        }
+        else if (stmt == FFILoad)
+        {
+          merge((stmt / LocalId)->location(), clone(stmt / Type));
+        }
+        else if (stmt == Call)
+        {
+          std::vector<ScopeInfo> scopes;
+          auto func_def = navigate_call(stmt, top, scopes);
+          if (!func_def)
+            continue;
+
+          auto args = stmt / Args;
+          auto params = func_def / Params;
+
+          bool all_default =
+            infer_typeargs(stmt, func_def, scopes, env, top);
+
+          NodeMap<Node> subst;
+          for (auto& scope : scopes)
+          {
+            auto ta = scope.name_elem / TypeArgs;
+            auto tps = scope.def / TypeParams;
+            if (!ta->empty() && ta->size() == tps->size())
+              for (size_t i = 0; i < tps->size(); i++)
+                subst[tps->at(i)] = ta->at(i);
+          }
+
+          auto ret = apply_subst(top, func_def / Type, subst);
+          if (ret)
+            merge(
+              (stmt / LocalId)->location(),
+              ret,
+              all_default ? stmt : Node{});
+
+          for (size_t i = 0; i < params->size() && i < args->size(); i++)
+          {
+            auto pt = apply_subst(top, params->at(i) / Type, subst);
+            if (pt && pt->front() != TypeVar)
+            {
+              auto arg_it = env.find((args->at(i) / Rhs)->location());
+              if (arg_it != env.end())
+                changed |=
+                  propagate_shape_to_lambda(top, pt, arg_it->second.type);
+            }
+          }
+
+          push_arg_types_to_params(func_def, args, env, top);
+        }
+        else if (stmt == Lookup)
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto src_it = env.find((stmt / Rhs)->location());
+          if (src_it != env.end())
+          {
+            if (is_default_type(src_it->second.type))
+            {
+              merge(dst_loc, clone(src_it->second.type));
+            }
+            else
+            {
+              auto hand = (stmt / Lhs)->type();
+              auto method_ident = lookup_method_name(stmt);
+              auto method_ta = stmt / TypeArgs;
+              auto arity = from_chars_sep_v<size_t>(stmt / Int);
+              auto ret = resolve_method_return_type(
+                top,
+                src_it->second.type,
+                method_ident,
+                hand,
+                arity,
+                method_ta);
+              if (ret)
+                merge(dst_loc, ret);
+            }
+          }
+          lookup_stmts[dst_loc] = stmt;
+        }
+        else if (stmt->in({CallDyn, TryCallDyn}))
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto src_loc = (stmt / Rhs)->location();
+          auto args = stmt / Args;
+
+          auto src_it = env.find(src_loc);
+          if (src_it != env.end())
+            merge(dst_loc, clone(src_it->second.type));
+
+          auto dst_it = env.find(dst_loc);
+          if (dst_it != env.end() && !dst_it->second.call_node)
+            dst_it->second.call_node = stmt;
+
+          auto lookup_it = lookup_stmts.find(src_loc);
+          if (lookup_it != lookup_stmts.end())
+          {
+            auto lookup_node = lookup_it->second;
+            auto recv_it = env.find((lookup_node / Rhs)->location());
+            if (
+              recv_it != env.end() &&
+              !is_default_type(recv_it->second.type))
+            {
+              auto hand = (lookup_node / Lhs)->type();
+              auto method_ident = lookup_method_name(lookup_node);
+              auto method_ta = lookup_node / TypeArgs;
+              auto arity = from_chars_sep_v<size_t>(lookup_node / Int);
+              auto info = resolve_callable_method(
+                top,
+                recv_it->second.type,
+                method_ident,
+                hand,
+                arity,
+                method_ta);
+              if (info.func)
+              {
+                auto params = info.func / Params;
+                for (
+                  size_t i = 0;
+                  i < params->size() && i < args->size();
+                  i++)
+                {
+                  auto pt =
+                    apply_subst(top, params->at(i) / Type, info.subst);
+                  if (pt && pt->front() != TypeVar)
+                  {
+                    auto arg_it =
+                      env.find((args->at(i) / Rhs)->location());
+                    if (arg_it != env.end())
+                      changed |= propagate_shape_to_lambda(
+                        top, pt, arg_it->second.type);
+                  }
+                }
+                push_arg_types_to_params(info.func, args, env, top);
+              }
+            }
+          }
+        }
+        else if (stmt == FFI)
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto sym_name = (stmt / SymbolId)->location();
+          auto cls = body->parent(Function)->parent(ClassDef);
+          while (cls)
+          {
+            bool found = false;
+            for (auto& child : *(cls / ClassBody))
+            {
+              if (child != Lib)
+                continue;
+              for (auto& sym : *(child / Symbols))
+              {
+                if (sym != Symbol)
+                  continue;
+                if ((sym / SymbolId)->location() != sym_name)
+                  continue;
+                auto ret_type = sym / Type;
+                if (!ret_type->empty())
+                  merge(dst_loc, clone(ret_type));
+                found = true;
+                break;
+              }
+              if (found)
+                break;
+            }
+            if (found)
+              break;
+            cls = cls->parent(ClassDef);
+          }
+        }
+        else if (stmt == When)
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto src_it = env.find((stmt / Rhs)->location());
+          if (src_it != env.end())
+          {
+            auto apply_ret = src_it->second.type;
+            snmalloc::UNUSED(
+              replace_if_changed(stmt, stmt / Type, clone(apply_ret)));
+            merge(dst_loc, cown_type(apply_ret));
+          }
+
+          auto l_it = lookup_stmts.find((stmt / Rhs)->location());
+          if (l_it != lookup_stmts.end())
+          {
+            auto recv_it = env.find((l_it->second / Rhs)->location());
+            if (recv_it != env.end())
+            {
+              auto recv_inner = recv_it->second.type->front();
+              if (recv_inner == TypeName)
+              {
+                auto class_def = find_def(top, recv_inner);
+                if (class_def && class_def == ClassDef)
+                {
+                  Node apply_func;
+                  for (auto& child : *(class_def / ClassBody))
+                  {
+                    if (
+                      child == Function &&
+                      (child / Ident)->location().view() == "apply")
+                    {
+                      apply_func = child;
+                      break;
+                    }
+                  }
+                  if (apply_func)
+                  {
+                    auto params = apply_func / Params;
+                    auto when_args = stmt / Args;
+                    for (
+                      size_t i = 1;
+                      i < when_args->size() && i < params->size();
+                      ++i)
+                    {
+                      auto param = params->at(i);
+                      auto arg_it =
+                        env.find((when_args->at(i) / Rhs)->location());
+                      if (arg_it == env.end())
+                        continue;
+                      auto ci = extract_cown_inner(arg_it->second.type);
+                      if (!ci)
+                        continue;
+                      auto new_type = ref_type(ci);
+                      snmalloc::UNUSED(
+                        replace_if_changed(param, param / Type, new_type));
+                      env[(param / Ident)->location()] = {
+                        clone(new_type), {}};
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        else if (stmt == Typetest)
+        {
+          merge((stmt / LocalId)->location(), primitive_type(Bool));
+        }
+      }
+
+      return changed;
+    }
 
     // Direction-aware worklist.
     std::deque<size_t> worklist;
@@ -995,6 +2327,17 @@ namespace vc
       // Compute liveness.
       liveness.build(cfg);
 
+      // Track lambda functions with omitted return types.
+      auto& lro = get_lambda_returns_omitted();
+      lro.clear();
+      top->traverse([&](auto node) {
+        if (
+          node == Function && is_lambda_function(node) &&
+          (node / Type)->front() == TypeVar)
+          lro.insert(node.get());
+        return true;
+      });
+
       // Allocate per-label state.
       fwd.resize(n);
       bwd.resize(n);
@@ -1083,9 +2426,16 @@ namespace vc
         // ---- Forward phase ----
         if (run_fwd)
         {
-          // With stub transfer functions, fwd_exit = fwd[label].
-          // TODO: Iteration 2 -- run forward transfer functions here.
-          auto& fwd_exit = fwd[label];
+          // Copy entry env as starting point for forward processing.
+          TypeEnv fwd_exit = fwd[label];
+          for (auto& [loc, info] : fwd[label])
+            fwd_exit[loc] = {clone(info.type), info.call_node};
+
+          // Clear per-label tuple tracking.
+          tuple_locals.clear();
+
+          // Run forward transfer functions.
+          forward_pass(fwd_exit, body, li.function);
 
           // Push to successors.
           if (term == Cond)
@@ -1277,9 +2627,11 @@ namespace vc
 
     void run()
     {
+      active_method_cache = &method_cache_storage;
       build();
       solve();
       finalize();
+      active_method_cache = nullptr;
     }
   };
 
