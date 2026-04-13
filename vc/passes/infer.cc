@@ -2232,6 +2232,339 @@ namespace vc
       return changed;
     }
 
+    // Run backward transfer functions over a label body (reverse order).
+    // Reads from env (forward types) and bwd_exit (backward constraints
+    // from successors). Produces bwd_entry (constraints to push to preds).
+    bool backward_pass(
+      TypeEnv& env,
+      TypeEnv& bwd_entry,
+      const TypeEnv& bwd_exit,
+      const Node& body)
+    {
+      bool changed = false;
+
+      // Build const_defs and def_stmts for this body.
+      std::map<Location, Node> const_defs;
+      std::map<Location, Node> def_stmts;
+      for (auto& stmt : *body)
+      {
+        if (!stmt->empty() && stmt->front() == LocalId)
+          def_stmts[stmt->front()->location()] = stmt;
+        if (stmt == Const)
+          const_defs[(stmt / LocalId)->location()] = stmt;
+      }
+
+      // refine_local_const: refine default-typed Const literals.
+      auto refine_local_const =
+        [&](const Location& loc, const Node& expected) -> bool {
+        auto const_it = const_defs.find(loc);
+        if (const_it == const_defs.end())
+          return false;
+        auto env_it = env.find(loc);
+        if (env_it == env.end())
+          return false;
+        auto expected_prim = extract_primitive(expected);
+        if (!expected_prim)
+          return false;
+        auto current_prim = extract_primitive(env_it->second.type);
+        bool compatible = (env_it->second.type->front() == DefaultInt &&
+                           expected_prim->in(integer_types)) ||
+          (env_it->second.type->front() == DefaultFloat &&
+           expected_prim->in(float_types)) ||
+          (current_prim && current_prim->in(integer_types) &&
+           expected_prim->in(integer_types)) ||
+          (current_prim && current_prim->in(float_types) &&
+           expected_prim->in(float_types));
+        if (!compatible)
+          return false;
+        env_it->second.type = primitive_or_ffi_type(expected_prim->type());
+        // Also update the Const statement AST.
+        auto const_stmt = const_it->second;
+        if (const_stmt->size() == 3)
+        {
+          auto old_type = const_stmt->at(1);
+          if (old_type->type() != expected_prim->type())
+            const_stmt->replace(old_type, expected_prim->type());
+        }
+        else
+        {
+          auto dst = const_stmt->front();
+          auto lit = const_stmt->back();
+          const_stmt->erase(const_stmt->begin(), const_stmt->end());
+          const_stmt << dst << expected_prim->type() << lit;
+        }
+        changed = true;
+        return true;
+      };
+
+      // merge_bwd: merge a backward constraint into bwd_entry.
+      auto merge_bwd = [&](const Location& loc, const Node& type) -> bool {
+        if (!type || type->empty() ||
+            type->front()->in({TypeVar, DefaultInt, DefaultFloat}))
+          return false;
+        auto it = bwd_entry.find(loc);
+        if (it == bwd_entry.end())
+        {
+          bwd_entry[loc] = {clone(type), {}};
+          changed = true;
+          return true;
+        }
+        auto merged = merge_type(it->second.type, type, top);
+        if (!merged)
+          return false;
+        it->second.type = merged;
+        changed = true;
+        return true;
+      };
+
+      // Walk body in reverse.
+      for (auto it = body->rbegin(); it != body->rend(); ++it)
+      {
+        auto& stmt = *it;
+
+        if (stmt->in({Copy, Move}))
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto src_loc = (stmt / Rhs)->location();
+          auto dst_it = env.find(dst_loc);
+          if (dst_it != env.end())
+          {
+            // Use bwd constraint for dst if available and concrete.
+            Node expected = dst_it->second.type;
+            auto bwd_it = bwd_exit.find(dst_loc);
+            if (
+              bwd_it != bwd_exit.end() && bwd_it->second.type &&
+              !bwd_it->second.type->empty() &&
+              !bwd_it->second.type->front()->in(
+                {TypeVar, DefaultInt, DefaultFloat, Union}))
+              expected = bwd_it->second.type;
+
+            snmalloc::UNUSED(refine_local_const(src_loc, expected));
+            snmalloc::UNUSED(merge_bwd(src_loc, expected));
+          }
+        }
+        else if (stmt == Load)
+        {
+          auto src_loc = (stmt / Rhs)->location();
+          auto dst_loc = (stmt / LocalId)->location();
+          auto dst_it = env.find(dst_loc);
+          if (dst_it != env.end() && !is_default_type(dst_it->second.type))
+            snmalloc::UNUSED(
+              merge_bwd(src_loc, ref_type(clone(dst_it->second.type))));
+        }
+        else if (stmt == Store)
+        {
+          auto ref_loc = (stmt / Rhs)->location();
+          auto val_loc = ((stmt / Arg) / Rhs)->location();
+          auto ref_it = env.find(ref_loc);
+          if (ref_it != env.end())
+          {
+            auto inner = extract_ref_inner(ref_it->second.type);
+            if (inner && !is_any_type(inner))
+            {
+              snmalloc::UNUSED(refine_local_const(val_loc, inner));
+              snmalloc::UNUSED(merge_bwd(val_loc, clone(inner)));
+            }
+          }
+        }
+        else if (stmt->in({New, Stack}))
+        {
+          auto new_type = stmt / Type;
+          auto inner = new_type->front();
+          if (inner == TypeName)
+          {
+            auto class_def = find_def(top, inner);
+            if (class_def && class_def == ClassDef)
+            {
+              auto subst = build_class_subst(class_def, inner);
+              for (auto& na : *(stmt / NewArgs))
+              {
+                auto arg_loc = (na / Rhs)->location();
+                auto fname = (na / Ident)->location().view();
+                for (auto& f : *(class_def / ClassBody))
+                {
+                  if (f != FieldDef)
+                    continue;
+                  if ((f / Ident)->location().view() != fname)
+                    continue;
+                  auto ft = apply_subst(top, f / Type, subst);
+                  if (ft && !contains_typevar(ft))
+                  {
+                    snmalloc::UNUSED(refine_local_const(arg_loc, ft));
+                    snmalloc::UNUSED(merge_bwd(arg_loc, ft));
+                  }
+                  // Reverse: push concrete arg into TypeVar FieldDef.
+                  auto arg_it = env.find(arg_loc);
+                  if (
+                    arg_it != env.end() && contains_typevar(f / Type) &&
+                    !contains_typevar(arg_it->second.type) &&
+                    !contains_default_type(arg_it->second.type))
+                    snmalloc::UNUSED(replace_if_changed(
+                      f, f / Type, clone(arg_it->second.type)));
+                  break;
+                }
+              }
+            }
+          }
+        }
+        else if (stmt->in(propagate_lhs_ops))
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto lhs_loc = (stmt / Lhs)->location();
+          auto rhs_loc = (stmt / Rhs)->location();
+          auto lhs_it = env.find(lhs_loc);
+          if (lhs_it != env.end())
+            snmalloc::UNUSED(merge_bwd(rhs_loc, clone(lhs_it->second.type)));
+          auto dst_it = env.find(dst_loc);
+          if (dst_it != env.end() && !is_default_type(dst_it->second.type))
+          {
+            snmalloc::UNUSED(merge_bwd(lhs_loc, clone(dst_it->second.type)));
+            snmalloc::UNUSED(merge_bwd(rhs_loc, clone(dst_it->second.type)));
+          }
+        }
+        else if (stmt->in(propagate_rhs_ops))
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto src_loc = (stmt / Rhs)->location();
+          auto dst_it = env.find(dst_loc);
+          if (dst_it != env.end() && !is_default_type(dst_it->second.type))
+            snmalloc::UNUSED(merge_bwd(src_loc, clone(dst_it->second.type)));
+        }
+        else if (stmt == FFIStore)
+        {
+          auto value_loc = (stmt / ValueSrc)->location();
+          auto expected = clone(stmt / Type);
+          snmalloc::UNUSED(refine_local_const(value_loc, expected));
+          snmalloc::UNUSED(merge_bwd(value_loc, expected));
+        }
+        else if (stmt == Call)
+        {
+          std::vector<ScopeInfo> scopes;
+          auto func_def = navigate_call(stmt, top, scopes);
+          if (!func_def)
+            continue;
+
+          auto args = stmt / Args;
+          auto params = func_def / Params;
+
+          NodeMap<Node> subst;
+          for (auto& scope : scopes)
+          {
+            auto ta = scope.name_elem / TypeArgs;
+            auto tps = scope.def / TypeParams;
+            if (!ta->empty() && ta->size() == tps->size())
+              for (size_t i = 0; i < tps->size(); i++)
+                subst[tps->at(i)] = ta->at(i);
+          }
+
+          for (size_t i = 0; i < params->size() && i < args->size(); i++)
+          {
+            auto expected = apply_subst(top, params->at(i) / Type, subst);
+            if (
+              expected && expected->front() != TypeVar &&
+              !is_uninformative_backward_type(expected))
+            {
+              auto arg_loc = (args->at(i) / Rhs)->location();
+              snmalloc::UNUSED(refine_local_const(arg_loc, expected));
+              snmalloc::UNUSED(merge_bwd(arg_loc, expected));
+            }
+          }
+        }
+        else if (stmt->in({CallDyn, TryCallDyn}))
+        {
+          auto src_loc = (stmt / Rhs)->location();
+          auto args = stmt / Args;
+
+          auto lookup_it = lookup_stmts.find(src_loc);
+          if (lookup_it != lookup_stmts.end())
+          {
+            auto lookup_node = lookup_it->second;
+            auto recv_it = env.find((lookup_node / Rhs)->location());
+            if (
+              recv_it != env.end() &&
+              !is_default_type(recv_it->second.type))
+            {
+              auto hand = (lookup_node / Lhs)->type();
+              auto method_ident = lookup_method_name(lookup_node);
+              auto method_ta = lookup_node / TypeArgs;
+              auto arity = from_chars_sep_v<size_t>(lookup_node / Int);
+              auto info = resolve_callable_method(
+                top,
+                recv_it->second.type,
+                method_ident,
+                hand,
+                arity,
+                method_ta);
+              if (info.func)
+              {
+                auto params = info.func / Params;
+                for (
+                  size_t i = 0;
+                  i < params->size() && i < args->size();
+                  i++)
+                {
+                  auto expected =
+                    apply_subst(top, params->at(i) / Type, info.subst);
+                  if (
+                    expected && expected->front() != TypeVar &&
+                    !is_uninformative_backward_type(expected))
+                  {
+                    auto arg_loc = (args->at(i) / Rhs)->location();
+                    snmalloc::UNUSED(refine_local_const(arg_loc, expected));
+                    snmalloc::UNUSED(merge_bwd(arg_loc, expected));
+                  }
+                }
+              }
+            }
+          }
+        }
+        else if (stmt == FFI)
+        {
+          auto sym_name = (stmt / SymbolId)->location();
+          auto cls = body->parent(Function)->parent(ClassDef);
+          while (cls)
+          {
+            bool found = false;
+            for (auto& child : *(cls / ClassBody))
+            {
+              if (child != Lib)
+                continue;
+              for (auto& sym : *(child / Symbols))
+              {
+                if (sym != Symbol)
+                  continue;
+                if ((sym / SymbolId)->location() != sym_name)
+                  continue;
+                auto ffi_params = sym / FFIParams;
+                auto ffi_args = stmt / Args;
+                auto fp = ffi_params->begin();
+                auto fa = ffi_args->begin();
+                while (fp != ffi_params->end() && fa != ffi_args->end())
+                {
+                  snmalloc::UNUSED(
+                    refine_local_const((*fa)->location(), clone(*fp)));
+                  snmalloc::UNUSED(
+                    merge_bwd((*fa)->location(), clone(*fp)));
+                  ++fp;
+                  ++fa;
+                }
+                found = true;
+                break;
+              }
+              if (found)
+                break;
+            }
+            if (found)
+              break;
+            cls = cls->parent(ClassDef);
+          }
+        }
+        // When backward is a no-op.
+      }
+
+      return changed;
+    }
+
     // Direction-aware worklist.
     std::deque<size_t> worklist;
     std::map<size_t, Direction> worklist_dir;
@@ -2423,11 +2756,13 @@ namespace vc
         bool run_bwd =
           (dir == Direction::Backward || dir == Direction::Both);
 
+        // Forward exit env — shared between forward and backward phases.
+        TypeEnv fwd_exit;
+
         // ---- Forward phase ----
         if (run_fwd)
         {
           // Copy entry env as starting point for forward processing.
-          TypeEnv fwd_exit = fwd[label];
           for (auto& [loc, info] : fwd[label])
             fwd_exit[loc] = {clone(info.type), info.call_node};
 
@@ -2511,9 +2846,20 @@ namespace vc
         // ---- Backward phase ----
         if (run_bwd)
         {
-          // With stub transfer functions, bwd_entry = bwd[label].
-          // TODO: Iteration 3a -- run backward transfer functions here.
-          auto& bwd_entry = bwd[label];
+          // If forward didn't run, seed fwd_exit from fwd[label].
+          if (!run_fwd)
+          {
+            for (auto& [loc, info] : fwd[label])
+              fwd_exit[loc] = {clone(info.type), info.call_node};
+          }
+
+          // Build bwd_entry from backward transfer functions.
+          TypeEnv bwd_entry;
+          // Seed with existing bwd constraints for this label.
+          for (auto& [loc, info] : bwd[label])
+            bwd_entry[loc] = {clone(info.type), info.call_node};
+
+          backward_pass(fwd_exit, bwd_entry, bwd[label], body);
 
           // Push to predecessors (path-sensitive).
           for (auto p : cfg.pred[label])
