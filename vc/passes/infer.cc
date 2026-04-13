@@ -1511,7 +1511,9 @@ namespace vc
     // Run forward transfer functions over a label body.
     // Reads from env (starts as copy of fwd[label]).
     // Returns true if any type was produced/changed.
-    bool forward_pass(TypeEnv& env, const Node& body, const Node& /*func*/)
+    bool forward_pass(
+      TypeEnv& env, const Node& body,
+      const Node& /*func*/)
     {
       bool changed = false;
       auto merge = [&](const Location& loc, const Node& type,
@@ -1551,6 +1553,7 @@ namespace vc
 
           if (is_default_type(type))
           {
+            // Check existing env (from prior iteration).
             auto it = env.find(dst->location());
             if (it != env.end() && !is_default_type(it->second.type))
             {
@@ -2773,6 +2776,7 @@ namespace vc
       while (dequeue(label, dir))
       {
         wl_iters++;
+
         if (wl_iters > n * MAX_ITERS_PER_LABEL)
         {
           // Convergence failure -- emit compilation error.
@@ -2951,10 +2955,9 @@ namespace vc
         }
 
         // ---- Refinement ----
-        // For each location in fwd[label], check if bwd has a
-        // compatible concrete type that can refine a Default/TypeVar.
+        // For each location in fwd[label] (entry env), check if bwd
+        // has a compatible concrete type that can refine Default/TypeVar.
         {
-          // Copy keys to avoid iterator invalidation.
           std::vector<Location> fwd_locs;
           fwd_locs.reserve(fwd[label].size());
           for (auto& [loc, info] : fwd[label])
@@ -2972,16 +2975,12 @@ namespace vc
             auto& fwd_type = fwd_it->second.type;
             auto& bwd_type = bwd_it->second.type;
 
-            // Only refine Default/TypeVar with compatible single
-            // concrete.
             if (!fwd_type || fwd_type->empty())
               continue;
             auto fwd_front = fwd_type->front();
             if (!fwd_front->in({DefaultInt, DefaultFloat, TypeVar}))
               continue;
 
-            // bwd must be a single concrete type (not Union, not
-            // Default, not TypeVar).
             if (!bwd_type || bwd_type->empty())
               continue;
             auto bwd_front = bwd_type->front();
@@ -2989,7 +2988,6 @@ namespace vc
                   {DefaultInt, DefaultFloat, TypeVar, Union, Isect}))
               continue;
 
-            // Compatibility check.
             if (fwd_front == DefaultInt)
             {
               auto prim = extract_primitive(bwd_type);
@@ -3002,9 +3000,7 @@ namespace vc
               if (!prim || !prim->in(float_types))
                 continue;
             }
-            // TypeVar: any concrete type refines it.
 
-            // Refine.
             fwd_it->second.type = clone(bwd_type);
             enqueue(label, Direction::Forward);
           }
