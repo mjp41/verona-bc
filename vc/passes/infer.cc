@@ -78,6 +78,7 @@
 #include <deque>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <set>
 #include <vector>
 
@@ -486,6 +487,184 @@ namespace vc
 
   using TypeEnv = std::map<Location, LocalTypeInfo>;
 
+  // ===== Type lattice helpers =====
+
+  static bool same_type_tree(const Node& left, const Node& right)
+  {
+    if (left == right)
+      return true;
+    if (!left || !right)
+      return false;
+    if (left->type() != right->type())
+      return false;
+    if (left->size() != right->size())
+      return false;
+    if (left == Ident)
+      return left->location().view() == right->location().view();
+    for (size_t i = 0; i < left->size(); i++)
+      if (!same_type_tree(left->at(i), right->at(i)))
+        return false;
+    return true;
+  }
+
+  // Returns the merged type, or {} if no change from existing.
+  static Node merge_type(const Node& existing, const Node& incoming, Node top)
+  {
+    if (!existing || existing->empty() || existing->front() == TypeVar)
+    {
+      // Both TypeVar -> no change.
+      if (incoming && !incoming->empty() && incoming->front() == TypeVar)
+        return {};
+      return clone(incoming);
+    }
+    if (!incoming || incoming->empty() || incoming->front() == TypeVar)
+      return {};
+
+    // Pointer equality fast path.
+    if (existing == incoming)
+      return {};
+    // Structural equality fast path.
+    if (same_type_tree(existing, incoming))
+      return {};
+
+    // Default yields to compatible concrete primitive.
+    if (is_default_type(existing) && !is_default_type(incoming))
+    {
+      auto prim = extract_primitive(incoming);
+      if (prim)
+      {
+        bool compat =
+          (existing->front() == DefaultInt && prim->in(integer_types)) ||
+          (existing->front() == DefaultFloat && prim->in(float_types));
+        if (compat)
+          return clone(incoming);
+      }
+    }
+
+    if (is_default_type(incoming) && !is_default_type(existing))
+    {
+      auto prim = extract_primitive(existing);
+      if (prim)
+      {
+        bool compat =
+          (incoming->front() == DefaultInt && prim->in(integer_types)) ||
+          (incoming->front() == DefaultFloat && prim->in(float_types));
+        if (compat)
+          return {};
+      }
+    }
+
+    bool existing_has_self = contains_self_type(existing);
+    bool incoming_has_self = contains_self_type(incoming);
+    if (existing_has_self != incoming_has_self)
+    {
+      if (existing_has_self)
+        return clone(incoming);
+      return {};
+    }
+
+    SequentCtx ctx{top, {}, {}};
+
+    if (Subtype.invariant(ctx, existing, incoming))
+      return {};
+
+    if (Subtype(ctx, incoming, existing))
+      return {};
+    if (Subtype(ctx, existing, incoming))
+      return clone(incoming);
+
+    // Build union.
+    auto e_inner = existing->front();
+    auto i_inner = incoming->front();
+    Node u = Union;
+
+    if (e_inner == Union)
+      for (auto& c : *e_inner)
+        u << clone(c);
+    else
+      u << clone(e_inner);
+
+    // If incoming is a concrete primitive, replace compatible Default
+    // members in the union.
+    auto inc_prim = extract_primitive(incoming);
+    if (inc_prim && !is_default_type(incoming))
+    {
+      auto it = u->begin();
+      while (it != u->end())
+      {
+        bool is_def_int = (*it) == DefaultInt;
+        bool is_def_float = (*it) == DefaultFloat;
+        if (
+          (is_def_int && inc_prim->in(integer_types)) ||
+          (is_def_float && inc_prim->in(float_types)))
+          it = u->erase(it, std::next(it));
+        else
+          ++it;
+      }
+    }
+
+    bool covered = false;
+    for (auto& m : *u)
+    {
+      if (Subtype(ctx, incoming, Type << clone(m)))
+      {
+        covered = true;
+        break;
+      }
+    }
+
+    if (!covered)
+    {
+      auto it = u->begin();
+      while (it != u->end())
+      {
+        if (Subtype(ctx, Type << clone(*it), incoming))
+          it = u->erase(it, std::next(it));
+        else
+          ++it;
+      }
+      u << clone(i_inner);
+    }
+
+    return (u->size() == 1) ? Type << clone(u->front()) : Type << u;
+  }
+
+  // ===== Typetest trace =====
+
+  struct TypetestTrace
+  {
+    Node src;
+    Node type;
+    bool negated;
+  };
+
+  static std::optional<TypetestTrace>
+  trace_typetest(const Node& cond_local, const Node& body)
+  {
+    auto target_loc = cond_local->location();
+    bool negated = false;
+    for (auto it = body->rbegin(); it != body->rend(); ++it)
+    {
+      auto& stmt = *it;
+      if (stmt == Not)
+      {
+        auto dst = stmt / LocalId;
+        if (dst->location() == target_loc)
+        {
+          target_loc = (stmt / Rhs)->location();
+          negated = !negated;
+        }
+      }
+      else if (stmt == Typetest)
+      {
+        auto dst = stmt / LocalId;
+        if (dst->location() == target_loc)
+          return TypetestTrace{stmt / Rhs, stmt / Type, negated};
+      }
+    }
+    return std::nullopt;
+  }
+
   // ===== CFG (immutable after construction) =====
 
   struct CFG
@@ -769,11 +948,32 @@ namespace vc
         return true;
       }
 
-      // TODO: Iteration 2 -- use merge_type here for proper widening.
-      // For now, just keep existing type (stub).
-      snmalloc::UNUSED(type);
-      snmalloc::UNUSED(call_node);
-      return false;
+      // Pointer equality fast path.
+      if (it->second.type == type)
+      {
+        if (call_node && !it->second.call_node)
+        {
+          it->second.call_node = call_node;
+          return true;
+        }
+        return false;
+      }
+
+      auto merged = merge_type(it->second.type, type, top);
+      if (!merged)
+      {
+        if (call_node && !it->second.call_node)
+        {
+          it->second.call_node = call_node;
+          return true;
+        }
+        return false;
+      }
+
+      it->second.type = merged;
+      if (call_node && !it->second.call_node)
+        it->second.call_node = call_node;
+      return true;
     }
 
     // Cross-function constraint push.
@@ -837,9 +1037,12 @@ namespace vc
         }
       }
 
-      // Enqueue all labels for initial processing.
-      for (size_t i = 0; i < n; i++)
-        enqueue(i, Direction::Both);
+      // Enqueue entry labels for forward, return labels for backward.
+      for (auto& [func, entry_idx] : func_entry)
+        enqueue(entry_idx, Direction::Forward);
+      for (auto& [func, return_indices] : func_returns)
+        for (auto idx : return_indices)
+          enqueue(idx, Direction::Backward);
     }
 
     void solve()
@@ -868,30 +1071,201 @@ namespace vc
           return;
         }
 
+        auto& li = cfg.labels[label];
+        auto body = li.label / Body;
+        auto term = li.label / Return;
+
         bool run_fwd =
           (dir == Direction::Forward || dir == Direction::Both);
         bool run_bwd =
           (dir == Direction::Backward || dir == Direction::Both);
 
-        // TODO: Iteration 2 -- forward transfer functions
+        // ---- Forward phase ----
         if (run_fwd)
         {
-          // Stub: no forward processing yet.
+          // With stub transfer functions, fwd_exit = fwd[label].
+          // TODO: Iteration 2 -- run forward transfer functions here.
+          auto& fwd_exit = fwd[label];
+
+          // Push to successors.
+          if (term == Cond)
+          {
+            // Typetest narrowing on Cond.
+            auto trace = trace_typetest(term / LocalId, body);
+            auto& func_idx = cfg.func_label_idx[li.function];
+            auto t_it =
+              func_idx.find(std::string((term / Lhs)->location().view()));
+            auto f_it =
+              func_idx.find(std::string((term / Rhs)->location().view()));
+
+            // Push non-narrowed locations to both successors.
+            for (auto& [loc, info] : fwd_exit)
+            {
+              if (trace && loc == trace->src->location())
+                continue; // Handled below with narrowing.
+              if (t_it != func_idx.end())
+                if (push(fwd[t_it->second], loc, info.type, info.call_node))
+                  enqueue(t_it->second, Direction::Forward);
+              if (f_it != func_idx.end())
+                if (push(fwd[f_it->second], loc, info.type, info.call_node))
+                  enqueue(f_it->second, Direction::Forward);
+            }
+
+            // Push narrowed/excluded types.
+            if (trace)
+            {
+              auto src_loc = trace->src->location();
+              auto src_it = fwd_exit.find(src_loc);
+              if (src_it != fwd_exit.end())
+              {
+                auto true_succ = trace->negated ? f_it : t_it;
+                auto false_succ = trace->negated ? t_it : f_it;
+
+                // True branch: narrowed to tested type.
+                if (true_succ != func_idx.end())
+                  if (push(fwd[true_succ->second], src_loc, trace->type))
+                    enqueue(true_succ->second, Direction::Forward);
+
+                // False branch: excluded type.
+                if (false_succ != func_idx.end())
+                {
+                  auto excluded = exclude_tested_type(
+                    top, src_it->second.type, trace->type);
+                  auto& push_type =
+                    excluded ? excluded : src_it->second.type;
+                  if (push(
+                        fwd[false_succ->second],
+                        src_loc,
+                        push_type,
+                        src_it->second.call_node))
+                    enqueue(false_succ->second, Direction::Forward);
+                }
+              }
+            }
+          }
+          else if (term == Jump)
+          {
+            auto& func_idx = cfg.func_label_idx[li.function];
+            auto t_it = func_idx.find(
+              std::string((term / LabelId)->location().view()));
+            if (t_it != func_idx.end())
+            {
+              for (auto& [loc, info] : fwd_exit)
+                if (push(fwd[t_it->second], loc, info.type, info.call_node))
+                  enqueue(t_it->second, Direction::Forward);
+            }
+          }
+          // Return: no forward successors.
         }
 
-        // TODO: Iteration 3a -- backward transfer functions
+        // ---- Backward phase ----
         if (run_bwd)
         {
-          // Stub: no backward processing yet.
+          // With stub transfer functions, bwd_entry = bwd[label].
+          // TODO: Iteration 3a -- run backward transfer functions here.
+          auto& bwd_entry = bwd[label];
+
+          // Push to predecessors (path-sensitive).
+          for (auto p : cfg.pred[label])
+          {
+            auto& pred_li = cfg.labels[p];
+            auto pred_term = pred_li.label / Return;
+
+            for (auto& [loc, info] : bwd_entry)
+            {
+              // Path-sensitive check for Cond predecessors.
+              if (pred_term == Cond)
+              {
+                auto trace =
+                  trace_typetest(pred_term / LocalId, pred_li.label / Body);
+                if (trace && loc == trace->src->location())
+                {
+                  // Determine which edge (true/false) connects p to
+                  // label.
+                  auto& pred_func_idx = cfg.func_label_idx[pred_li.function];
+                  auto t_it = pred_func_idx.find(
+                    std::string((pred_term / Lhs)->location().view()));
+
+                  bool is_true_edge =
+                    (t_it != pred_func_idx.end() &&
+                     t_it->second == label) != trace->negated;
+
+                  if (is_true_edge)
+                  {
+                    // True edge: backward must be subtype of narrowed.
+                    SequentCtx ctx{top, {}, {}};
+                    if (!Subtype(ctx, info.type, trace->type))
+                      continue; // Skip incompatible.
+                  }
+                  // False edge: push unconditionally (conservative).
+                }
+              }
+
+              if (push(bwd[p], loc, info.type))
+                enqueue(p, Direction::Backward);
+            }
+          }
         }
 
-        // TODO: Iteration 1 -- refinement step
-        // For each location in fwd[label]:
-        //   if fwd is Default/TypeVar and bwd has compatible concrete:
-        //     refine fwd, enqueue label Forward.
+        // ---- Refinement ----
+        // For each location in fwd[label], check if bwd has a
+        // compatible concrete type that can refine a Default/TypeVar.
+        {
+          // Copy keys to avoid iterator invalidation.
+          std::vector<Location> fwd_locs;
+          fwd_locs.reserve(fwd[label].size());
+          for (auto& [loc, info] : fwd[label])
+            fwd_locs.push_back(loc);
 
-        snmalloc::UNUSED(run_fwd);
-        snmalloc::UNUSED(run_bwd);
+          for (auto& loc : fwd_locs)
+          {
+            auto fwd_it = fwd[label].find(loc);
+            if (fwd_it == fwd[label].end())
+              continue;
+            auto bwd_it = bwd[label].find(loc);
+            if (bwd_it == bwd[label].end())
+              continue;
+
+            auto& fwd_type = fwd_it->second.type;
+            auto& bwd_type = bwd_it->second.type;
+
+            // Only refine Default/TypeVar with compatible single
+            // concrete.
+            if (!fwd_type || fwd_type->empty())
+              continue;
+            auto fwd_front = fwd_type->front();
+            if (!fwd_front->in({DefaultInt, DefaultFloat, TypeVar}))
+              continue;
+
+            // bwd must be a single concrete type (not Union, not
+            // Default, not TypeVar).
+            if (!bwd_type || bwd_type->empty())
+              continue;
+            auto bwd_front = bwd_type->front();
+            if (bwd_front->in(
+                  {DefaultInt, DefaultFloat, TypeVar, Union, Isect}))
+              continue;
+
+            // Compatibility check.
+            if (fwd_front == DefaultInt)
+            {
+              auto prim = extract_primitive(bwd_type);
+              if (!prim || !prim->in(integer_types))
+                continue;
+            }
+            else if (fwd_front == DefaultFloat)
+            {
+              auto prim = extract_primitive(bwd_type);
+              if (!prim || !prim->in(float_types))
+                continue;
+            }
+            // TypeVar: any concrete type refines it.
+
+            // Refine.
+            fwd_it->second.type = clone(bwd_type);
+            enqueue(label, Direction::Forward);
+          }
+        }
       }
     }
 
