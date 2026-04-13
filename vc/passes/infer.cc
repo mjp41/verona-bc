@@ -2073,7 +2073,7 @@ namespace vc
                       if (arg_it == env.end())
                         continue;
                       auto ci = extract_cown_inner(arg_it->second.type);
-                      if (!ci)
+                      if (!ci || contains_typevar(ci) || is_any_type(ci))
                         continue;
                       auto new_type = ref_type(ci);
                       // Push into lambda's entry env, not AST.
