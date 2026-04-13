@@ -1094,86 +1094,6 @@ namespace vc
     return get_lambda_returns_omitted().count(func.get()) > 0;
   }
 
-  bool propagate_shape_to_lambda(
-    Node top, const Node& shape_type, const Node& actual_type)
-  {
-    if (shape_type != Type || actual_type != Type)
-      return false;
-    auto shape_inner = shape_type->front();
-    auto actual_inner = actual_type->front();
-    if (shape_inner != TypeName || actual_inner != TypeName)
-      return false;
-    auto shape_def = find_def(top, shape_inner);
-    auto actual_def = find_def(top, actual_inner);
-    if (!shape_def || !actual_def)
-      return false;
-
-    while (shape_def == TypeAlias)
-    {
-      auto alias_type = shape_def / Type;
-      if (alias_type->front() != TypeName)
-        break;
-      shape_def = find_def(top, alias_type->front());
-      if (!shape_def)
-        return false;
-    }
-
-    if (shape_def != ClassDef || actual_def != ClassDef)
-      return false;
-    if ((shape_def / Shape) != Shape)
-      return false;
-
-    bool changed = false;
-    auto shape_subst = build_class_subst(shape_def, shape_inner);
-    for (auto& sf : *(shape_def / ClassBody))
-    {
-      if (sf != Function)
-        continue;
-      auto mname = (sf / Ident)->location().view();
-      auto hand = (sf / Lhs)->type();
-
-      for (auto& af : *(actual_def / ClassBody))
-      {
-        if (af != Function)
-          continue;
-        if ((af / Ident)->location().view() != mname)
-          continue;
-        if ((af / Lhs)->type() != hand)
-          continue;
-        if ((af / Params)->size() != (sf / Params)->size())
-          continue;
-
-        auto shape_params = sf / Params;
-        auto actual_params = af / Params;
-        for (size_t j = 0; j < shape_params->size(); j++)
-        {
-          auto ap = actual_params->at(j);
-          auto apt = ap / Type;
-          if (apt->front() != TypeVar)
-            continue;
-          auto spt = apply_subst(top, shape_params->at(j) / Type, shape_subst);
-          if (!spt || spt->front() == TypeVar || spt->front() == TypeSelf)
-            continue;
-          changed |= replace_if_changed(ap, apt, clone(spt));
-        }
-
-        auto actual_ret = af / Type;
-        auto shape_ret = apply_subst(top, sf / Type, shape_subst);
-        if (shape_ret && shape_ret->front() != TypeVar)
-        {
-          if (
-            actual_ret->front() == TypeVar ||
-            (is_lambda_function(af) && lambda_return_was_omitted(af)))
-          {
-            changed |= replace_if_changed(af, actual_ret, clone(shape_ret));
-          }
-        }
-        break;
-      }
-    }
-    return changed;
-  }
-
   // ===== Call navigation =====
 
   struct ScopeInfo
@@ -1293,72 +1213,6 @@ namespace vc
 
     return all_default;
   }
-
-  // Push concrete arg types into TypeVar formal params.
-  static void push_arg_types_to_params(
-    Node func_def, const Node& args, TypeEnv& env, Node /*top*/)
-  {
-    auto params = func_def / Params;
-    auto parent_cls = func_def->parent(ClassDef);
-
-    for (size_t i = 0; i < params->size() && i < args->size(); i++)
-    {
-      auto param = params->at(i);
-      auto formal_type = param / Type;
-      if (!contains_typevar(formal_type))
-        continue;
-
-      Node resolved;
-      bool allow_default_arg = false;
-
-      if (parent_cls)
-      {
-        auto pname = (param / Ident)->location().view();
-        for (auto& child : *(parent_cls / ClassBody))
-        {
-          if (child != FieldDef)
-            continue;
-          if ((child / Ident)->location().view() != pname)
-            continue;
-          if (!contains_typevar(child / Type))
-            resolved = child / Type;
-          else if (is_lambda_function(func_def))
-            allow_default_arg = true;
-          break;
-        }
-      }
-
-      if (!resolved)
-      {
-        auto arg_loc = (args->at(i) / Rhs)->location();
-        auto arg_it = env.find(arg_loc);
-        if (arg_it == env.end() || contains_typevar(arg_it->second.type))
-          continue;
-        if (contains_default_type(arg_it->second.type) && !allow_default_arg)
-          continue;
-        resolved = arg_it->second.type;
-      }
-
-      snmalloc::UNUSED(replace_if_changed(param, formal_type, clone(resolved)));
-
-      if (parent_cls)
-      {
-        auto pname = (param / Ident)->location().view();
-        for (auto& child : *(parent_cls / ClassBody))
-        {
-          if (child != FieldDef)
-            continue;
-          if ((child / Ident)->location().view() != pname)
-            continue;
-          if (contains_typevar(child / Type))
-            snmalloc::UNUSED(
-              replace_if_changed(child, child / Type, clone(resolved)));
-          break;
-        }
-      }
-    }
-  }
-
   // ===== Tuple tracking =====
 
   struct TupleTracking
@@ -1634,6 +1488,13 @@ namespace vc
     std::map<Location, Node> lookup_stmts;
     std::set<std::pair<Location, Location>> typevar_aliases;
     std::map<Location, std::pair<Location, size_t>> ref_to_tuple;
+
+    // Inferred TypeArgs tracked in side-structure (not AST).
+    // Key is the call statement's LocalId location; value is the
+    // inferred TypeArgs for each scope in the FuncName path.
+    // Written to AST at finalization.
+    std::map<Node, std::vector<std::pair<Node, Node>>>
+      call_typeargs; // stmt -> [(name_elem, TypeArgs)]
 
     // Method resolution cache.
     std::map<
@@ -2034,11 +1895,11 @@ namespace vc
               auto arg_it = env.find((args->at(i) / Rhs)->location());
               if (arg_it != env.end())
                 changed |=
-                  propagate_shape_to_lambda(top, pt, arg_it->second.type);
+                  push_shape_to_lambda(pt, arg_it->second.type);
             }
           }
 
-          push_arg_types_to_params(func_def, args, env, top);
+          push_args_to_callee(func_def, args, env);
         }
         else if (stmt == Lookup)
         {
@@ -2118,11 +1979,11 @@ namespace vc
                     auto arg_it =
                       env.find((args->at(i) / Rhs)->location());
                     if (arg_it != env.end())
-                      changed |= propagate_shape_to_lambda(
-                        top, pt, arg_it->second.type);
+                      changed |= push_shape_to_lambda(
+                        pt, arg_it->second.type);
                   }
                 }
-                push_arg_types_to_params(info.func, args, env, top);
+                push_args_to_callee(info.func, args, env);
               }
             }
           }
@@ -2166,11 +2027,11 @@ namespace vc
           if (src_it != env.end())
           {
             auto apply_ret = src_it->second.type;
-            snmalloc::UNUSED(
-              replace_if_changed(stmt, stmt / Type, clone(apply_ret)));
+            // Track When return type in env, not AST.
             merge(dst_loc, cown_type(apply_ret));
           }
 
+          // Push cown inner types into lambda params via fwd envs.
           auto l_it = lookup_stmts.find((stmt / Rhs)->location());
           if (l_it != lookup_stmts.end())
           {
@@ -2212,10 +2073,11 @@ namespace vc
                       if (!ci)
                         continue;
                       auto new_type = ref_type(ci);
-                      snmalloc::UNUSED(
-                        replace_if_changed(param, param / Type, new_type));
-                      env[(param / Ident)->location()] = {
-                        clone(new_type), {}};
+                      // Push into lambda's entry env, not AST.
+                      push_param_type(
+                        apply_func,
+                        (param / Ident)->location(),
+                        new_type);
                     }
                   }
                 }
@@ -2254,7 +2116,8 @@ namespace vc
           const_defs[(stmt / LocalId)->location()] = stmt;
       }
 
-      // refine_local_const: refine default-typed Const literals.
+      // refine_local_const: refine default-typed Const literals in env
+      // only. AST writes are deferred to finalization.
       auto refine_local_const =
         [&](const Location& loc, const Node& expected) -> bool {
         auto const_it = const_defs.find(loc);
@@ -2278,21 +2141,7 @@ namespace vc
         if (!compatible)
           return false;
         env_it->second.type = primitive_or_ffi_type(expected_prim->type());
-        // Also update the Const statement AST.
-        auto const_stmt = const_it->second;
-        if (const_stmt->size() == 3)
-        {
-          auto old_type = const_stmt->at(1);
-          if (old_type->type() != expected_prim->type())
-            const_stmt->replace(old_type, expected_prim->type());
-        }
-        else
-        {
-          auto dst = const_stmt->front();
-          auto lit = const_stmt->back();
-          const_stmt->erase(const_stmt->begin(), const_stmt->end());
-          const_stmt << dst << expected_prim->type() << lit;
-        }
+        // No AST mutation here — deferred to finalize().
         changed = true;
         return true;
       };
@@ -2393,14 +2242,8 @@ namespace vc
                     snmalloc::UNUSED(refine_local_const(arg_loc, ft));
                     snmalloc::UNUSED(merge_bwd(arg_loc, ft));
                   }
-                  // Reverse: push concrete arg into TypeVar FieldDef.
-                  auto arg_it = env.find(arg_loc);
-                  if (
-                    arg_it != env.end() && contains_typevar(f / Type) &&
-                    !contains_typevar(arg_it->second.type) &&
-                    !contains_default_type(arg_it->second.type))
-                    snmalloc::UNUSED(replace_if_changed(
-                      f, f / Type, clone(arg_it->second.type)));
+                  // FieldDef TypeVar → concrete: tracked via env,
+                  // written at finalization.
                   break;
                 }
               }
@@ -2645,8 +2488,200 @@ namespace vc
     bool push_cross(
       const Node& /*target*/, const Node& /*type*/, Direction /*dir*/)
     {
-      // TODO: Iteration 3b -- implement cross-function constraint flow.
+      // Generic push_cross — unused, specific methods below.
       return false;
+    }
+
+    // Push a concrete arg type into a callee function's entry env
+    // at the param location. Replaces push_arg_types_to_params AST
+    // mutation.
+    bool push_param_type(
+      const Node& func_def,
+      const Location& param_loc,
+      const Node& type)
+    {
+      auto entry_it = func_entry.find(func_def);
+      if (entry_it == func_entry.end())
+        return false;
+      bool changed = push(fwd[entry_it->second], param_loc, type);
+      if (changed)
+        enqueue(entry_it->second, Direction::Forward);
+      return changed;
+    }
+
+    // Push a backward constraint on a callee function's return type.
+    // Used to propagate shape return type expectations.
+    bool push_return_constraint(
+      const Node& func_def,
+      const Node& type)
+    {
+      auto ret_it = func_returns.find(func_def);
+      if (ret_it == func_returns.end())
+        return false;
+      bool changed = false;
+      for (auto idx : ret_it->second)
+      {
+        auto term = cfg.labels[idx].label / Return;
+        if (term == Return)
+        {
+          auto ret_loc = (term / LocalId)->location();
+          if (push(bwd[idx], ret_loc, type))
+          {
+            enqueue(idx, Direction::Backward);
+            changed = true;
+          }
+        }
+      }
+      return changed;
+    }
+
+    // Push concrete arg types into callee param locations via fwd envs.
+    // Replaces the old push_arg_types_to_params that mutated AST.
+    void push_args_to_callee(
+      const Node& func_def,
+      const Node& args,
+      TypeEnv& caller_env)
+    {
+      auto params = func_def / Params;
+      auto parent_cls = func_def->parent(ClassDef);
+
+      for (size_t i = 0; i < params->size() && i < args->size(); i++)
+      {
+        auto param = params->at(i);
+        auto formal_type = param / Type;
+        if (!contains_typevar(formal_type))
+          continue;
+
+        // Check if FieldDef has a concrete type already.
+        Node resolved;
+        bool allow_default = false;
+        if (parent_cls)
+        {
+          auto pname = (param / Ident)->location().view();
+          for (auto& child : *(parent_cls / ClassBody))
+          {
+            if (child != FieldDef)
+              continue;
+            if ((child / Ident)->location().view() != pname)
+              continue;
+            if (!contains_typevar(child / Type))
+              resolved = child / Type;
+            else if (is_lambda_function(func_def))
+              allow_default = true;
+            break;
+          }
+        }
+
+        if (!resolved)
+        {
+          auto arg_loc = (args->at(i) / Rhs)->location();
+          auto arg_it = caller_env.find(arg_loc);
+          if (
+            arg_it == caller_env.end() ||
+            contains_typevar(arg_it->second.type))
+            continue;
+          if (
+            contains_default_type(arg_it->second.type) && !allow_default)
+            continue;
+          resolved = arg_it->second.type;
+        }
+
+        push_param_type(
+          func_def, (param / Ident)->location(), resolved);
+      }
+    }
+
+    // Push shape type constraints into a lambda's params/return via
+    // fwd/bwd envs. Replaces AST-mutating propagate_shape_to_lambda.
+    bool push_shape_to_lambda(
+      const Node& shape_type,
+      const Node& actual_type)
+    {
+      if (shape_type != Type || actual_type != Type)
+        return false;
+      auto shape_inner = shape_type->front();
+      auto actual_inner = actual_type->front();
+      if (shape_inner != TypeName || actual_inner != TypeName)
+        return false;
+      auto shape_def = find_def(top, shape_inner);
+      auto actual_def = find_def(top, actual_inner);
+      if (!shape_def || !actual_def)
+        return false;
+
+      while (shape_def == TypeAlias)
+      {
+        auto alias_type = shape_def / Type;
+        if (alias_type->front() != TypeName)
+          break;
+        shape_def = find_def(top, alias_type->front());
+        if (!shape_def)
+          return false;
+      }
+
+      if (shape_def != ClassDef || actual_def != ClassDef)
+        return false;
+      if ((shape_def / Shape) != Shape)
+        return false;
+
+      bool changed = false;
+      auto shape_subst = build_class_subst(shape_def, shape_inner);
+      for (auto& sf : *(shape_def / ClassBody))
+      {
+        if (sf != Function)
+          continue;
+        auto mname = (sf / Ident)->location().view();
+        auto hand = (sf / Lhs)->type();
+
+        for (auto& af : *(actual_def / ClassBody))
+        {
+          if (af != Function)
+            continue;
+          if ((af / Ident)->location().view() != mname)
+            continue;
+          if ((af / Lhs)->type() != hand)
+            continue;
+          if ((af / Params)->size() != (sf / Params)->size())
+            continue;
+
+          auto shape_params = sf / Params;
+          auto actual_params = af / Params;
+          for (size_t j = 0; j < shape_params->size(); j++)
+          {
+            auto ap = actual_params->at(j);
+            auto apt = ap / Type;
+            if (apt->front() != TypeVar)
+              continue;
+            auto spt =
+              apply_subst(top, shape_params->at(j) / Type, shape_subst);
+            if (!spt || spt->front() == TypeVar || spt->front() == TypeSelf)
+              continue;
+            // Push into lambda's entry env instead of mutating AST.
+            if (push_param_type(
+                  af->parent(Function) ? af->parent(Function) : af,
+                  (ap / Ident)->location(),
+                  spt))
+              changed = true;
+          }
+
+          auto shape_ret = apply_subst(top, sf / Type, shape_subst);
+          if (shape_ret && shape_ret->front() != TypeVar)
+          {
+            auto actual_ret = af / Type;
+            if (
+              actual_ret->front() == TypeVar ||
+              (is_lambda_function(af) && lambda_return_was_omitted(af)))
+            {
+              // Push as backward constraint on lambda returns.
+              auto lambda_func =
+                af->parent(Function) ? af->parent(Function) : af;
+              if (push_return_constraint(lambda_func, shape_ret))
+                changed = true;
+            }
+          }
+          break;
+        }
+      }
+      return changed;
     }
 
     void build()
