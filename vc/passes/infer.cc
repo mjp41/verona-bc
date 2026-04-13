@@ -2903,6 +2903,11 @@ namespace vc
 
           backward_pass(label_exit, bwd_entry, bwd[label], body);
 
+          // Merge locally-derived backward constraints back into
+          // bwd[label] so the refinement step can see them.
+          for (auto& [loc, info] : bwd_entry)
+            push(bwd[label], loc, info.type);
+
           // Push to predecessors (path-sensitive).
           for (auto p : cfg.pred[label])
           {
