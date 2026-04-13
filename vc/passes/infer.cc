@@ -2184,15 +2184,25 @@ namespace vc
           auto dst_it = env.find(dst_loc);
           if (dst_it != env.end())
           {
-            // Use bwd constraint for dst if available and concrete.
             Node expected = dst_it->second.type;
-            auto bwd_it = bwd_exit.find(dst_loc);
+            // Check bwd_entry (locally accumulated), then bwd_exit.
+            auto be_it = bwd_entry.find(dst_loc);
             if (
-              bwd_it != bwd_exit.end() && bwd_it->second.type &&
-              !bwd_it->second.type->empty() &&
-              !bwd_it->second.type->front()->in(
+              be_it != bwd_entry.end() && be_it->second.type &&
+              !be_it->second.type->empty() &&
+              !be_it->second.type->front()->in(
                 {TypeVar, DefaultInt, DefaultFloat, Union}))
-              expected = bwd_it->second.type;
+              expected = be_it->second.type;
+            else
+            {
+              auto bx_it = bwd_exit.find(dst_loc);
+              if (
+                bx_it != bwd_exit.end() && bx_it->second.type &&
+                !bx_it->second.type->empty() &&
+                !bx_it->second.type->front()->in(
+                  {TypeVar, DefaultInt, DefaultFloat, Union}))
+                expected = bx_it->second.type;
+            }
 
             snmalloc::UNUSED(refine_local_const(src_loc, expected));
             snmalloc::UNUSED(merge_bwd(src_loc, expected));
@@ -2892,11 +2902,21 @@ namespace vc
         // ---- Backward phase ----
         if (run_bwd)
         {
-          // If forward didn't run, seed label_exit from fwd[label].
+          // If forward didn't run, seed label_exit from fwd_exit[label]
+          // (which has locally-defined types from the last forward run).
+          // Fall back to fwd[label] if fwd_exit is empty.
           if (!run_fwd)
           {
-            for (auto& [loc, info] : fwd[label])
-              label_exit[loc] = {clone(info.type), info.call_node};
+            if (!fwd_exit[label].empty())
+            {
+              for (auto& [loc, info] : fwd_exit[label])
+                label_exit[loc] = {clone(info.type), info.call_node};
+            }
+            else
+            {
+              for (auto& [loc, info] : fwd[label])
+                label_exit[loc] = {clone(info.type), info.call_node};
+            }
           }
 
           // Build bwd_entry from backward transfer functions.
@@ -2906,6 +2926,20 @@ namespace vc
             bwd_entry[loc] = {clone(info.type), info.call_node};
 
           backward_pass(label_exit, bwd_entry, bwd[label], body);
+
+          // Merge backward-refined env types into fwd_exit so
+          // finalization sees them.
+          for (auto& [loc, info] : label_exit)
+          {
+            auto exit_it = fwd_exit[label].find(loc);
+            if (exit_it != fwd_exit[label].end())
+            {
+              if (
+                is_default_type(exit_it->second.type) &&
+                !is_default_type(info.type))
+                exit_it->second.type = clone(info.type);
+            }
+          }
 
           // Merge locally-derived backward constraints back into
           // bwd[label] so the refinement step can see them.
@@ -3192,12 +3226,16 @@ namespace vc
           {
             auto dst = (*it)->front();
             auto loc = dst->location();
-            auto env_it = fwd_exit[i].find(loc);
+
+            // Find the best type: prefer concrete fwd_exit, then bwd,
+            // then default fwd_exit refined by bwd.
             Node final_type;
+            auto env_it = fwd_exit[i].find(loc);
             if (
               env_it != fwd_exit[i].end() &&
               !is_default_type(env_it->second.type))
               final_type = env_it->second.type;
+
             if (!final_type)
             {
               auto bwd_it = bwd[i].find(loc);
@@ -3205,6 +3243,40 @@ namespace vc
                 bwd_it != bwd[i].end() &&
                 !is_default_type(bwd_it->second.type))
                 final_type = bwd_it->second.type;
+            }
+
+            // Also check: if fwd_exit has Default and bwd has
+            // compatible concrete, use bwd.
+            if (
+              !final_type && env_it != fwd_exit[i].end() &&
+              is_default_type(env_it->second.type))
+            {
+              // Check all bwd labels in this function for a constraint.
+              auto [frange_begin, frange_end] =
+                cfg.func_label_range[cfg.labels[i].function];
+              for (size_t j = frange_begin; j < frange_end; j++)
+              {
+                auto bwd_it = bwd[j].find(loc);
+                if (
+                  bwd_it != bwd[j].end() &&
+                  !is_default_type(bwd_it->second.type))
+                {
+                  auto prim = extract_primitive(bwd_it->second.type);
+                  if (prim)
+                  {
+                    bool compat =
+                      (env_it->second.type->front() == DefaultInt &&
+                       prim->in(integer_types)) ||
+                      (env_it->second.type->front() == DefaultFloat &&
+                       prim->in(float_types));
+                    if (compat)
+                    {
+                      final_type = bwd_it->second.type;
+                      break;
+                    }
+                  }
+                }
+              }
             }
             Node final_prim;
             if (final_type)
