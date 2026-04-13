@@ -20,7 +20,7 @@ communicate state changes between functions. Instead:
 The code is in `vc/passes/infer.cc` (6364 lines, fully working). A backup
 exists at `vc/passes/infer.cc.old` (6780 lines, the pre-cleanup version).
 The refactoring should produce a replacement `infer.cc` that passes all
-existing tests.
+existing tests. Target line count: similar or smaller than current.
 
 An existing prototype `infer_global()` (~400 lines, gated behind
 `VC_INFER_GLOBAL` env var) already implements the basic structure:
@@ -32,130 +32,486 @@ All 1100 tests currently pass. Ring tests (`testsuite/v/ring_*`) are
 planned as incremental validation targets but do not yet exist — they
 should be created as part of the skeleton iteration.
 
-## Architecture (Validated)
 
-The architecture was designed, skeleton-tested, and validated through
-interactive review. The final design has four core structs:
+## Architecture: Bidirectional Bounds
 
-### CFG (immutable after construction)
+The core insight: type inference is two independent analyses that interact
+through refinement.
+
+- **Forward analysis** computes what each variable *could be* (upper bounds).
+  Flows from definitions toward uses. Merges widen (union at joins).
+- **Backward analysis** collects use-site constraints on each variable.
+  Flows from uses toward definitions. Merges widen (union — a variable
+  flowing to multiple uses must satisfy all of them, so constraints
+  accumulate).
+- **Refinement** resolves unresolved types (DefaultInt, DefaultFloat,
+  TypeVar) when a backward constraint provides a concrete type.
+
+These three concerns are cleanly separated. No `is_fixed` hack needed —
+typetest narrowing is just an edge-specific tighter upper bound in the
+forward analysis.
+
+### Per-label state
+
+```cpp
+struct LocalTypeInfo {
+    Node type;
+    Node call_node;  // Call/CallDyn that produced this (for backward prop)
+};
+using TypeEnv = std::map<Location, LocalTypeInfo>;
+
+// Per-label, two envs storing INPUTS:
+std::vector<TypeEnv> fwd;  // fwd[i] = forward types at ENTRY of label i
+std::vector<TypeEnv> bwd;  // bwd[i] = backward constraints at EXIT of label i
+```
+
+Both store what a label **knows before it starts processing** in the
+respective direction. No `is_fixed` field. The forward and backward
+channels don't contaminate each other.
+
+### Push-based data flow
+
+The key design choice: labels store their **inputs**, and processing a
+label **pushes outputs directly into successor/predecessor inputs** via
+`merge_type`. This eliminates the "build entry env" phase entirely.
+
+**Forward processing of label `i`**:
+1. Read `fwd[i]` (already built by predecessors pushing into it).
+2. Run forward transfer functions over the body: `fwd[i]` → `fwd_exit`.
+3. For each successor `s`: merge `fwd_exit` into `fwd[s]` via `merge_type`.
+   If `fwd[s]` changed, enqueue `s` Forward.
+4. For Cond terminators: push narrowed types directly into `fwd[true_succ]`
+   and excluded types into `fwd[false_succ]`. No separate BranchNarrowing
+   struct needed. If the variable being tested is `TypeVar`, the true
+   branch receives the tested concrete type (e.g., `i32`), and the false
+   branch receives `TypeVar` unchanged (we don't know what to exclude
+   from an unresolved type). Once the TypeVar is refined via backward
+   constraints, subsequent iterations will produce meaningful exclusions.
+
+**Backward processing of label `i`**:
+1. Read `bwd[i]` (already built by successors pushing into it).
+2. Run backward transfer functions over the body in reverse:
+   `bwd[i]` → `bwd_entry`.
+3. For each predecessor `p`: push `bwd_entry` into `bwd[p]`, but only
+   for locations where the backward constraint is **compatible** with
+   the forward type on that edge (see below). If `bwd[p]` changed,
+   enqueue `p` Backward.
+
+**Path-sensitive backward push**: At a join point where one predecessor
+produces `x: i32` (via typetest narrowing) and another produces
+`x: string`, a backward constraint "x must be i32" is only valid for
+the first predecessor. Pushing it blindly to both would incorrectly
+refine the second path.
+
+The only source of path-sensitive forward types is Cond terminators
+(typetest narrowing). The rule: when pushing backward constraint
+`bwd_entry[loc]` to predecessor `p`, check if `p`'s terminator is a
+Cond that narrowed `loc` on the edge to `i`. If so, check compatibility
+between the backward type and the narrowed forward type on that
+specific edge. If incompatible, skip the push for that (predecessor,
+location) pair. For non-Cond predecessors, push unconditionally.
+
+Note: the old code does NOT do this — it pushes backward constraints
+uniformly to all predecessors. This is a soundness improvement.
+
+**Why this is better than storing outputs**:
+- No "build entry env" merge phase — the entry IS the stored state.
+- Change detection is trivial: `merge_type` returns whether it changed
+  the target. If it did, enqueue. No whole-env comparison.
+- Branch narrowing is natural: computed exit types are pushed directly
+  into the appropriate successor's `fwd`, not stored as edge metadata.
+
+### Forward transfer functions
+
+Update the env based on definitions:
+- `Const`: env[dst] = literal_type (DefaultInt, DefaultFloat, Bool, etc.)
+- `Copy/Move`: env[dst] = env[src]
+- `New`: env[dst] = class_type
+- `Call`: env[dst] = return_type_of_callee
+- `CallDyn`: env[dst] = resolved_method_return_type
+- `Binop/Unop`: env[dst] = result_type
+- etc.
+
+### Backward transfer functions
+
+Propagate constraints from uses to defs:
+- `Return x` where func returns `T`: bwd[x] ⊇ T
+- `Call f(x)` where param is `T`: bwd[x] ⊇ T
+- `Store ref.field = x` where field is `T`: bwd[x] ⊇ T
+- `Copy/Move dst = src`: bwd[src] ⊇ bwd[dst]
+- etc.
+
+### Refinement
+
+Refinement runs **inline at each label during the solve loop**, not as a
+separate post-fixpoint phase. It has two forms:
+
+#### Cross-label refinement (entry types)
+
+After processing forward and backward for a label, for each location
+in `fwd[i]` (the entry state):
+- If `fwd` is `DefaultInt`/`DefaultFloat` and `bwd` is a compatible
+  **single concrete** type, refine `fwd` to `bwd`.
+- If `fwd` is `TypeVar` and `bwd` is a single concrete type, refine
+  `fwd` to `bwd`.
+- Refinement changes `fwd[i]`, which triggers forward requeueing.
+
+**Union backward constraints do NOT trigger refinement.** If backward
+derives `Union(i32, string)` for a DefaultInt location, refinement does
+not fire — the constraints are ambiguous. The DefaultInt will fall
+through to the default sweep (`DefaultInt → u64`) at the end. If a
+use site expects a specific type from that union, it will produce a
+type error during finalization. This is correct: a literal `42` used
+as both i32 and string is a genuine ambiguity.
+
+"Compatible single concrete" means: the backward type is a single
+primitive type (not a Union, not TypeVar, not DefaultInt/DefaultFloat),
+and the Default type is compatible with it (`DefaultInt` with integer
+types, `DefaultFloat` with float types).
+
+#### Intra-label refinement (local definitions)
+
+For locations **defined within the label** (e.g., `x = 42`), the
+forward type is set by the forward transfer function, not inherited
+from predecessors. These are not in `fwd[i]` (the entry state), so
+cross-label refinement doesn't apply.
+
+Instead, forward transfer functions themselves perform refinement at
+definition sites: when a `Const` statement produces `DefaultInt`, the
+forward transfer checks the backward constraint on that location
+(from `bwd[i]`). If the backward constraint is a compatible single
+concrete type, the forward transfer produces the refined type directly.
+
+Example: `Const x = 42` in a label where `bwd` has `x: i32`:
+- Forward transfer for Const: check bwd for dst location
+- bwd has `x: i32`, compatible with DefaultInt → produce `x: i32`
+- No separate refinement step needed; it's part of forward processing
+
+This naturally handles the intra-label case: the backward constraint
+is already available in `bwd[i]` when the forward pass runs.
+
+#### Why inline refinement is necessary
+
+This must be inline because refinement affects dynamic dispatch:
+refining a variable from `TypeVar` to `i32` changes how `CallDyn`
+resolves on it, which produces a concrete return type that flows
+forward. Deferring refinement to a final phase would miss these
+cascading effects.
+
+#### Intra-label refinement example
+
+Consider a label containing:
+```
+y = x.method()     // CallDyn on x
+z.f = x            // Store x into field f of type i32
+```
+
+Assume `x: TypeVar` on entry and `z: MyClass` where `MyClass.f: i32`.
+
+**Iteration 1**:
+- Forward pass: `y = x.method()` — x is TypeVar, can't resolve, y = TypeVar.
+  `z.f = x` — Store executes but doesn't constrain x in the forward direction.
+- Backward pass (reverse order): `z.f = x` — field f is i32, so backward
+  produces `x must be i32`. Then `y = x.method()` — backward for CallDyn
+  sees x now has a backward constraint, may propagate further.
+- Refinement: fwd has `x: TypeVar`, backward derived `x: i32` within this
+  label → refine fwd entry `x = i32`. Enqueue this label Forward.
+
+**Iteration 2**:
+- Forward pass (re-run): `y = x.method()` — now x is i32, CallDyn resolves
+  to `i32::method()`, y gets concrete return type. Push to successors.
+
+Key point: the backward constraint from `z.f = x` is derived **within
+the label's own backward pass**, not pushed from a successor. The
+backward pass walks statements in reverse, accumulating constraints.
+These locally-derived constraints participate in refinement at the same
+label, triggering a forward re-run that resolves previously-stuck
+dynamic dispatch.
+
+### Why this is cleaner
+
+1. **No `is_fixed`**: typetest narrowing is a direct push of a tighter
+   type into the true successor's `fwd`. The forward and backward
+   channels don't interfere.
+
+2. **No conflated merge blocks**: forward merge is pure `merge_type`
+   and backward merge is pure `merge_type` — same function, different
+   data, different direction.
+
+3. **No "build entry env" phase**: the entry IS the stored state,
+   accumulated by predecessors/successors pushing into it.
+
+4. **Simpler convergence**: both forward and backward are monotone
+   (union/widen). No priority logic that could break monotonicity.
+
+5. **Trivial change detection**: `merge_type` returns a bool. No
+   whole-environment comparison needed.
+
+### Convergence and termination
+
+The system has three interacting operations: forward merge (widen),
+backward merge (widen), and refinement (narrow). Forward and backward
+are individually monotone. Refinement is not monotone in isolation, but
+the combined system converges because of a key property of `merge_type`:
+
+**Absorption property**: `merge_type` absorbs unresolved types into
+concrete types:
+- `merge_type(i32, DefaultInt)` → no change (i32 stays)
+- `merge_type(i32, TypeVar)` → no change (i32 stays)
+- `merge_type(Union(i32, string), DefaultInt)` → DefaultInt replaced
+  by i32 in the union (no new Default introduced)
+
+This means: **once a location is refined from DefaultInt/TypeVar to a
+concrete type, `merge_type` will never reintroduce DefaultInt/TypeVar
+at that location.** A subsequent merge from another path that has
+DefaultInt will be absorbed by the existing concrete type.
+
+**Proof of termination**:
+1. Forward and backward envs grow monotonically (merge_type only widens
+   or stays the same).
+2. The type lattice has finite height (bounded by the number of types
+   in the program). Forward/backward reach fixpoint in finite steps.
+3. Refinement fires at most once per (label, location) pair. After
+   refinement sets `fwd[i][loc]` to a concrete type, merge_type's
+   absorption property prevents any subsequent merge from reverting it
+   to DefaultInt/TypeVar. So the refinement condition
+   (fwd is Default/TypeVar AND bwd is concrete) cannot be re-triggered
+   at that location.
+4. Each refinement may trigger forward requeueing, but the forward
+   re-processing can only widen further (monotone), potentially
+   triggering more refinements downstream. The total number of
+   refinement events is bounded by `labels × locations_per_label`.
+5. Therefore the algorithm terminates.
+
+**Safety net**: `MAX_ITERS_PER_LABEL = 200` catches bugs during
+development. Hitting this limit indicates a convergence bug, not
+expected behavior.
+
+### Path-sensitive backward: compatibility definition
+
+When pushing backward constraint `bwd_entry[loc]` to predecessor `p`,
+and `p`'s terminator is a Cond that narrowed `loc`:
+- Look up which edge (true/false) connects `p` to label `i`.
+- The Cond's `trace_typetest` gives the tested type `T`.
+- On the true edge: `loc` was narrowed to `T`.
+  Compatible if `bwd_type <: T` (backward constraint is within the
+  narrowed type).
+- On the false edge: `loc` had `T` excluded.
+  Compatible if `bwd_type` and `T` are disjoint (backward constraint
+  doesn't require the excluded type).
+- If incompatible, skip the push for that (predecessor, location) pair.
+
+For non-Cond predecessors (Jump, unconditional): always push.
+
+### Default literal fallback
+
+After the solve loop converges and `finalize()` writes types to the AST,
+any remaining unresolved types are resolved:
+- `DefaultInt` → `u64`
+- `DefaultFloat` → `f64`
+- `TypeVar` → error (reported to user)
+
+This sweep happens in the pass entry point after `GlobalInfer::run()`,
+not inside finalize.
+
+### Cross-function constraint flow
+
+The solve loop's forward/backward push follows CFG edges within a
+function. But type constraints also flow across function boundaries
+in three cases: call sites, shape propagation, and lambda captures.
+
+#### 1. Call sites
+
+- **Forward (return → caller)**: When the callee's return type is
+  resolved, it flows forward to the call site's result variable.
+- **Backward (arg → param)**: When `f(x)` is called and x has type T,
+  the callee's parameter must accept T. Push T as a backward constraint
+  to the callee's entry label.
+
+#### 2. Shape propagation
+
+When a lambda is passed where a shape type is expected, the shape's
+method signatures become constraints on the lambda's params and return
+type. This is a backward constraint from the call site to the lambda.
+
+#### 3. Lambda captures (bidirectional)
+
+Lambdas capture variables from their enclosing scope. Captures require
+**bidirectional** cross-function flow:
+
+- **Forward (outer → lambda)**: The outer scope writes a captured
+  variable (e.g., `x = 42`). The lambda reads it (e.g., `return x`).
+  The outer scope's forward type for `x` must reach the lambda's `fwd`
+  at labels where `x` is used, so the lambda can determine the return
+  type.
+
+- **Backward (outer → lambda)**: The outer scope has a backward
+  constraint on a captured variable (e.g., `call expects_i32(x)` after
+  the lambda). That constraint must reach the lambda's `bwd` at labels
+  where `x` is written, so default literals assigned to `x` inside the
+  lambda can be refined.
+
+- **Forward (lambda → outer)**: The lambda writes a captured variable
+  (e.g., `x = 42` inside the lambda). The forward type from the
+  lambda's write must reach the outer scope's `fwd` at labels after the
+  lambda call, so the outer scope knows x's updated type.
+
+- **Backward (lambda → outer)**: The lambda reads a captured variable
+  in a constrained context (e.g., `call expects_i32(x)` inside the
+  lambda). That backward constraint must reach the outer scope's `bwd`
+  at labels where `x` is defined, so the outer scope can refine `x`.
+
+#### Mechanism: `push_cross()`
+
+All cross-function flows use the same primitive:
+
+```cpp
+// Push a type constraint across function boundaries.
+// target: the AST node identifying the destination (ParamDef, FieldDef,
+//         Function, or captured variable's defining Ident)
+// type: the constraint type
+// dir: Forward or Backward
+bool push_cross(const Node& target, const Node& type, Direction dir);
+```
+
+Internally, `push_cross` maps the target AST node to the label(s)
+that reference it, and pushes the type into the appropriate `fwd` or
+`bwd` env at those labels. If anything changed, those labels are
+enqueued.
+
+**Concrete mappings** (built during `GlobalInfer::build()`):
+- `func_entry[Function] → label_index` — entry label of each function
+- `func_returns[Function] → [label_indices]` — labels with Return terminators
+- `param_label[ParamDef] → label_index` — which label the param is live in
+- `capture_labels[FieldDef] → [(label_index, Location)]` — labels in
+  both the outer scope and the lambda that reference a captured variable,
+  with the local Location used at each label
+
+For captures, `build()` identifies lambda-lifted classes with captured
+fields (FieldDefs whose names correspond to outer scope variables) and
+builds the bidirectional mapping.
+
+**TypeVar unification**: TypeVar aliases within a function (from
+Copy/Move of TypeVar↔concrete) are resolved by the standard
+intra-label refinement (fwd has TypeVar, bwd has concrete → refine).
+Cross-function TypeVars (lambda captures its enclosing scope's
+TypeParam) are resolved by `push_cross`: the outer scope's resolved
+TypeParam flows forward to the lambda, and the lambda's use-site
+constraints flow backward to the outer scope.
+
+#### When `push_cross` fires
+
+`push_cross` is called **by transfer functions** during normal forward
+and backward processing, not as a separate phase:
+
+- **Call site forward transfer** (`infer_call_fwd`): after computing
+  argument types, push each arg type as a backward constraint to the
+  callee's corresponding ParamDef. After determining the callee's
+  return type, push it forward to the call site's result.
+
+- **Call site backward transfer** (`infer_call_bwd`): push backward
+  constraints on the result variable to the callee's return labels.
+
+- **Capture forward transfer** (`infer_field_ref`, `infer_load`): when
+  reading a captured field, `push_cross` queries the outer scope's
+  forward type for that capture and uses it. When writing a captured
+  field (`infer_store`), `push_cross` pushes the written type forward
+  to labels that read the capture.
+
+- **Capture backward transfer**: when a captured variable is used in a
+  constrained context (e.g., passed to a typed parameter), `push_cross`
+  pushes the constraint backward to labels that define the capture.
+
+Because transfer functions call `push_cross` during normal processing,
+and `push_cross` enqueues affected labels, the worklist naturally
+schedules cross-function work. No special phase or ordering is needed.
+
+For nested lambdas (lambda1 captures x from outer, lambda2 captures x
+from lambda1), `push_cross` chains automatically: lambda2's transfer
+pushes to lambda1's capture labels, lambda1's transfer pushes to
+outer's labels. Each push enqueues the target, so the worklist handles
+depth naturally.
+
+This mechanism must be part of the skeleton (Iteration 0) because
+it is structural — the solve loop, transfer functions, and refinement
+all depend on cross-function constraints flowing correctly. Deferring
+it would require fundamentally different plumbing.
+
+### Core structs
+
+#### CFG (immutable after construction)
 
 ```cpp
 struct CFG {
     struct LabelInfo {
-        Node function;  // Owning Function node
-        Node label;     // Label AST node
+        Node function;
+        Node label;
     };
 
     std::vector<LabelInfo> labels;
     std::map<Node, std::pair<size_t, size_t>> func_label_range;
     std::vector<std::vector<size_t>> succ, pred;
     std::map<Node, std::map<std::string, size_t>> func_label_idx;
-    // Per-function def stmt maps — scoped to avoid Location collisions.
-    // Location::operator== compares by string content, so local$10 in
-    // function A and local$10 in function B are the "same" Location.
     std::map<Node, std::map<Location, Node>> func_def_stmts;
 
-    void add_function(const Node& func);  // Add labels to global array
-    void finalize();                       // Build edges and lookups
+    void add_function(const Node& func);
+    void finalize();
     size_t size() const;
     const std::map<Location, Node>& def_stmts_for(const Node& func) const;
 };
 ```
 
-**Key design choice**: CFG does NOT own `top` or `functions`. It does not
-traverse the AST. `GlobalInfer::build()` collects functions via AST
-traversal and calls `cfg.add_function(func)` for each, then `cfg.finalize()`.
-
-**Key design choice**: `func_def_stmts` is per-function, not a single global
-map. `Location::operator==` compares by string content (`view()`), so
-`local$10` in different functions would collide in a flat map. The accessor
-`def_stmts_for(func)` returns the scoped map for a given function.
-
-### Liveness (computed from CFG, queried during solve)
+#### Liveness (computed from CFG)
 
 ```cpp
 struct Liveness {
-    std::vector<std::set<Location>> defs, uses, kills, live_in, live_out;
-
+    std::vector<std::set<Location>> defs, uses, live_in, live_out;
     void build(const CFG& cfg);
     bool is_live_in(size_t label, const Location& loc) const;
     bool is_defined(size_t label, const Location& loc) const;
-    bool is_killed(size_t label, const Location& loc) const;
 };
 ```
 
-**Key design choice**: Liveness is NOT part of CFG. CFG is pure graph topology.
-Liveness is an analysis computed on the CFG and used by the solver.
-
-### InferContext (per-label, created for each worklist item)
+#### LabelProcessor (per-label processing)
 
 ```cpp
-struct InferContext {
-    TypeEnv& env;        // Forward env (entry → exit for this label)
-    TypeEnv& bwd;        // Backward expectations
-    Node function;       // Owning function for this label
-    GlobalInfer& gi;     // Access to all shared/global state
+struct LabelProcessor {
+    TypeEnv& fwd_entry;  // Forward input (read)
+    TypeEnv& bwd_exit;   // Backward input (read)
+    Node function;
+    GlobalInfer& gi;
 
-    // Per-invocation bookkeeping
-    bool forward_changed = false;
-    bool backward_changed = false;
-    std::map<Location, Node> const_defs;
-    std::map<Location, Node> def_stmts;
-    std::map<Location, TupleTracking> tuple_locals;
+    // Computed outputs (local, pushed to neighbors after processing)
+    TypeEnv fwd_exit;     // Forward output → pushed into fwd[succ]
+    TypeEnv bwd_entry;    // Backward output → pushed into bwd[pred]
 
-    // Methods (declared, defined out-of-line after GlobalInfer)
-    bool merge(...);
-    bool refine_local_const(...);
-    bool merge_bwd(...);
-    void propagate_backward(...);
-    void refine_and_propagate(...);
-    PendingError pending_when_lookup_error(...);
     void forward_pass(const Node& body);
     void backward_pass(const Node& body);
-    void process_body(const Node& body, Direction dir);
-    // ... all infer_* transfer functions ...
 };
 ```
 
-**Key design choices**:
-- InferContext holds ONLY per-label state plus a `GlobalInfer&` reference.
-  No duplicated shared state (the old code passed `top`, `lookup_stmts`,
-  `all_def_stmts`, `typevar_aliases`, `ref_to_tuple` as separate references).
-- Transfer functions access shared state via `gi.top`, `gi.lookup_stmts`,
-  `gi.cfg.def_stmts_for(function)`, `gi.typevar_aliases`, `gi.ref_to_tuple`.
-- `forward_changed`/`backward_changed` replace the old `LabelChanges` struct.
-  The worklist tracks direction, not the return value.
-- `process_body` takes a `Direction dir` parameter and only runs the
-  requested passes (forward_pass if Forward/Both, backward_pass if
-  Backward/Both).
-
-### GlobalInfer (orchestrates the 3-phase algorithm)
+#### GlobalInfer (orchestrator)
 
 ```cpp
 struct GlobalInfer {
     Node top;
     std::vector<Node> functions;
     CFG cfg;
-
-    // Per-label solver state
-    std::vector<TypeEnv> exit_envs, bwd_envs;
-    std::vector<TypeEnv> prior_entry_envs;
-    std::vector<bool> prior_entry_valid;
-    std::map<std::pair<size_t, size_t>, TypeEnv> branch_exits;
-
     Liveness liveness;
+
+    // Per-label state: stored INPUTS in each direction
+    std::vector<TypeEnv> fwd;   // fwd[i] = forward state at ENTRY of label i
+    std::vector<TypeEnv> bwd;   // bwd[i] = backward state at EXIT of label i
+
+    // Cross-function mappings (built during build())
+    std::map<Node, size_t> func_entry;       // Function → entry label index
+    std::map<Node, std::vector<size_t>> func_returns; // Function → return labels
+    std::map<Node, size_t> param_label;      // ParamDef → label where param is live
 
     // Shared mutable state
     std::map<Location, Node> lookup_stmts;
     std::set<std::pair<Location, Location>> typevar_aliases;
     std::map<Location, std::pair<Location, size_t>> ref_to_tuple;
-
-    // Publish/subscribe slots (cross-function communication)
-    std::map<Node, SlotInfo> slots;
-    std::map<Node, std::vector<size_t>> slot_subscribers;
-
-    // Per-call-site inferred TypeArgs (keyed by Call/CallDyn stmt node)
-    std::map<Node, Node> call_typeargs;
 
     // Direction-aware worklist
     std::deque<size_t> worklist;
@@ -163,10 +519,13 @@ struct GlobalInfer {
 
     void enqueue(size_t label, Direction dir);
     std::pair<size_t, Direction> dequeue();
-    SlotInfo read_slot(const Node& key) const;
-    void publish_upper(const Node& key, const Node& type);
-    void publish_lower(const Node& key, const Node& type);
-    void subscribe(const Node& key, size_t label);
+
+    // Merge a type into a target env. Returns true if changed.
+    bool push(TypeEnv& target, const Location& loc,
+              const Node& type, Node call_node = {});
+
+    // Cross-function constraint push.
+    bool push_cross(const Node& target, const Node& type, Direction dir);
 
     void build(Node top);
     void solve();
@@ -175,69 +534,45 @@ struct GlobalInfer {
 };
 ```
 
-### Direction-Aware Worklist
+### Solve loop pseudocode
 
-```cpp
-enum class Direction { Forward, Backward, Both };
 ```
+dequeue label i with direction dir:
 
-**Implementation**: `std::deque<size_t>` (FIFO queue) + `std::map<size_t,
-Direction>` (direction tracking). `enqueue()` merges directions — if Forward
-is pending and Backward arrives, it becomes Both. `dequeue()` pops from the
-front and removes the direction entry.
+if dir is Forward or Both:
+    // fwd[i] is already populated by predecessors
+    fwd_exit = run forward_pass(body, fwd[i])
 
-**Seeding**: Only entry labels (first label of each function) are seeded,
-with `Direction::Forward`. Forward propagation naturally reaches all
-reachable labels. Backward starts when forward reaches a return label
-that has seeded `bwd_envs`.
+    // Push outputs to successors
+    if terminator is Cond:
+        trace typetest, compute narrowed/excluded types
+        push narrowed into fwd[true_succ]
+        push excluded into fwd[false_succ]
+    elif terminator is Jump:
+        push fwd_exit into fwd[target]
+    elif terminator is Return:
+        seed bwd[i] with declared return type (backward starts here)
 
-### Publish/Subscribe Slots (Cross-Function Communication)
+    // For each push that changed fwd[succ], enqueue succ Forward
 
-Replaces the four typed side maps from the earlier design with a single
-unified mechanism. Each slot is keyed by an AST node pointer:
+if dir is Backward or Both:
+    // bwd[i] is already populated by successors
+    bwd_entry = run backward_pass(body_reverse, bwd[i])
 
-| AST Node | Purpose | Publisher | Subscriber |
-|-----------|---------|-----------|------------|
-| `FieldDef` | Field type | `infer_new_bwd` | `infer_field_ref` |
-| `ParamDef` | Lambda param type | `infer_call_fwd` | `infer_const` (params) |
-| `Function` | Return type | backward refinement | `CallDyn` resolution |
-| `When` | Cown type | `infer_when_fwd` | when-body params |
+    // Push outputs to predecessors (Cond-aware)
+    for each pred p:
+        for each (loc, type) in bwd_entry:
+            if p's terminator is Cond that narrowed loc on edge to i:
+                check compatibility with narrowed type; skip if incompatible
+            push into bwd[p]
+            if changed: enqueue p Backward
 
-**Bidirectional bounds**: Each slot stores two types:
-- **Upper bound** (forward/writes): union of all types published by
-  writers (e.g., all `new MyClass{f = val}` sites for a FieldDef).
-  Accumulated via `merge_type`.
-- **Lower bound** (backward/constraints): intersection of all types
-  expected by readers (e.g., all `obj.f` read sites for a FieldDef).
-  Accumulated via type intersection.
-
-Subscribers see both bounds through `read_slot()`, which returns a
-`SlotInfo` with `upper` and `lower` fields.
-
-```cpp
-struct SlotInfo {
-    Node upper;  // Union of writes (forward)
-    Node lower;  // Intersection of read constraints (backward)
-};
+refinement:
+    for each loc in fwd[i]:
+        if fwd is Default/TypeVar and bwd has compatible concrete:
+            refine fwd[i][loc]
+            re-run forward from this label (enqueue i Forward)
 ```
-
-**API**:
-- `publish_upper(node, type)`: merge type into upper bound via
-  `merge_type`. Enqueue all subscribers with `Direction::Both` if
-  the bound changed.
-- `publish_lower(node, type)`: intersect type into lower bound.
-  Enqueue all subscribers with `Direction::Both` if the bound changed.
-- `subscribe(node, label)`: register interest. Caller reads current
-  value via `read_slot()` immediately.
-- `read_slot(node)`: return current `SlotInfo` (upper/lower, either
-  may be null if no writes/constraints yet).
-
-**Late subscriptions**: `subscribe()` can be called during Phase 2 (solve).
-This handles `CallDyn` where the receiver type isn't known until mid-solve.
-
-**Simplification note**: The upper/lower split may collapse to a single
-type if practice shows they always converge. Keep both initially to
-validate the design.
 
 ## Implementation Strategy: Skeleton-First
 
@@ -264,74 +599,65 @@ bugs during development.
 all transfer functions are stubs that do nothing. Tests will fail (types
 unrefined) but the build succeeds and the pass runs without crashing.
 
-Write the complete `infer.cc` replacement with this structure:
+Key deliverables:
+- CFG, Liveness, LabelProcessor (stubbed), GlobalInfer structs
+- Cross-function mappings: `func_entry`, `func_returns`, `param_label`
+- `push()` and `push_cross()` primitives (structural, even if unused by stubs)
+- `build()`: collect functions, build CFG, build liveness, build
+  cross-function maps, seed `fwd` with param types
+- `solve()`: worklist loop with forward/backward push and refinement
+  (all producing no changes since transfer functions are stubs)
+- `finalize()`: stub
+- Pass entry point calling `GlobalInfer::run()`
+- Static globals (`active_method_cache`, `active_infer_profile`,
+  `active_infer_transfer_epoch`) moved to `GlobalInfer` instance vars
+- Iteration cap: exceed → compilation error with diagnostic (not silent)
+- 80-line architecture comment at top of file documenting bidirectional
+  bounds model, push mechanism, convergence proof, and Cond-aware
+  backward compatibility rule
 
-1. Includes + namespace (verbatim from old code)
-2. Forward declarations (`is_lambda_function`, `lambda_returns_omitted`)
-3. Dispatch tables (verbatim)
-4. Type constructors and predicates (verbatim)
-5. Core types (`LocalTypeInfo`, `TypeEnv`, `PendingError`)
-6. `Direction` enum, `TupleTracking` struct
-7. Forward declaration of `GlobalInfer`
-8. `CFG` struct (with `add_function`, `finalize`, `def_stmts_for`)
-9. `Liveness` struct (with `build`)
-10. `InferContext` struct — declarations only, all methods stubbed
-11. `GlobalInfer` struct with `build()`, `solve()`, `finalize()`, `run()`
-12. `InferContext` stub method bodies (empty forward/backward passes)
-13. `PassDef infer()` entry point (calls `GlobalInfer::run()` unconditionally)
+**Validation**: `ninja install` succeeds. `dist/vc/vc build` runs without
+crash on any test. Verify ring tests exist (`testsuite/v/ring_*`).
 
-**Validation**: `ninja install` succeeds. Running `dist/vc/vc build
-../testsuite/v/hello` produces a `.vbc` (may have wrong types, but no crash).
+### Iteration 1: Solve loop
 
-### Iteration 1: Infrastructure helpers
-
-**Goal**: Port all stateless helper functions that don't touch InferContext.
-
-Port verbatim (with scoped def_stmts adjustment):
-- Comparison helpers (`same_type_tree`, `same_type_env`)
-- Env mutation helpers (`replace_if_changed`, `refine_const_local`, etc.)
-- Type lattice (`merge_type`, `merge_env`)
-- Liveness helpers (`collect_label_defs/uses/kills`, `prune_bwd_env`)
-- Method resolution (`resolve_method_owner`, `resolve_class_method`,
-  `build_class_subst`, `extract_constraints`, `apply_subst`, etc.)
-- Backward helpers (`navigate_call`, `backward_refine_*`, `trace_typetest`,
-  `propagate_call_*`, `infer_typeargs`, `push_arg_types_to_params`, etc.)
-- Dependency cascade (`run_dependency_cascade`)
-- Misc (`is_lambda_function`, `retarget_numeric_type`,
-  `extract_backward_primitive`, `recover_local_type_from_def`, etc.)
-
-**Validation**: Compiles. Same behavior as Iteration 0 (stubs still active).
-
-### Iteration 2: Solve loop
-
-**Goal**: `build()`, `solve()` produce converged `exit_envs`/`bwd_envs`.
+**Goal**: `build()`, `solve()` produce converged `fwd`/`bwd` envs.
 Transfer functions still stubbed, so envs just propagate seeds.
 
 Implement:
-- `GlobalInfer::build()`: collect functions, build CFG, build liveness,
-  seed entry envs with param types, seed bwd_envs with return types
-- `GlobalInfer::solve()`: worklist loop, entry env construction,
-  requeueing (using change flags, NOT direction flags),
-  terminator handling (Return/Raise/Cond with branch exits)
-- Publish/subscribe stubs (`publish_upper`, `publish_lower`, `subscribe`,
-  `read_slot`)
+- Forward push: process label, push fwd_exit to successors
+- Backward push: process label, push bwd_entry to predecessors
+  (Cond-aware compatibility check)
+- Cond terminator: push narrowed/excluded types to true/false successors
+- Return terminator: seed `bwd[i]` from declared return type
+- `push_cross()`: push arg types to callee params, return types to callers
+- Refinement: Default/TypeVar fwd + concrete bwd → refine fwd
+- Change-based requeueing (NOT direction-based)
 
-**Validation**: Compiles. `solve()` terminates (no infinite loop). Can
-add temporary tracing to verify worklist processes expected number of labels.
+**Validation**: Compiles. `solve()` terminates (no infinite loop).
 
-### Iteration 3: Forward transfer functions
+### Iteration 2: Forward transfer functions
 
 **Goal**: Port forward_pass and all forward transfer functions.
 
-Port InferContext methods category by category, validating compilation after
-each group:
+Port InferContext methods category by category, pulling in only the
+helpers each category needs. Validate compilation after each group:
 - `infer_const`, `infer_copy_move`, `infer_convert`
+  - Helpers needed: `merge_type`, `replace_if_changed`, `refine_const_local`,
+    `same_type_tree`, type predicates
 - `infer_field_ref`, `infer_register_ref`, `infer_array_ref`
+  - Helpers needed: `upsert_*` helpers
 - `infer_new_fwd`, `infer_load`, `infer_store`
 - `infer_call_fwd`, `infer_calldyn_fwd`, `infer_trycalldyn_fwd`
+  - Helpers needed: `resolve_method_owner`, `resolve_class_method`,
+    `build_class_subst`, `extract_constraints`, `apply_subst`,
+    `infer_typeargs`, method cache types
 - `infer_lookup`, `infer_binop`, `infer_unop`, `infer_nulop`
 - `infer_when_fwd`, `infer_typecond`
 - `forward_pass` dispatch
+
+Each helper is added to the file only when first needed by a transfer
+function being ported. No standalone "infrastructure helpers" iteration.
 
 Apply mechanical replacements per the table above. Remove profiling:
 - Strip `InferScopedTimer`, `InferStmtScope`, `note_infer_transfer_change()`
@@ -341,13 +667,30 @@ Apply mechanical replacements per the table above. Remove profiling:
 **Validation**: Ring 1 (`ring_basic`) and Ring 2 (`ring_call_typed`) tests
 pass if created.
 
-### Iteration 4: Backward transfer functions + pub/sub
+### Iteration 3a: Backward transfer functions
 
-**Goal**: Port backward_pass, implement pub/sub for cross-function flows.
+**Goal**: Port backward_pass and all backward transfer functions.
 
 Port:
 - `backward_pass` dispatch
 - All `infer_*_bwd` methods
+- `backward_refine_call`, `backward_refine_calldyn`
+- `propagate_call_node`, `propagate_call_constraint`
+
+Apply the same mechanical replacements and profiling removal as
+Iteration 2. Backward transfer functions read `bwd` (backward
+constraints from successors) and produce `bwd_entry` (constraints
+to push to predecessors).
+
+**Validation**: Ring 3-4 (lambda_one, lambda_multi) should show
+improvement. Convergence testing: verify backward constraints
+flow and refine default literals.
+
+### Iteration 3b: Cross-function pub/sub
+
+**Goal**: Implement pub/sub for cross-function constraint flow.
+
+Port and adapt:
 - `push_arg_types_to_params` → adapted to use `gi.publish_upper(ParamDef, type)`
 - `propagate_shape_to_lambda` → adapted to use `gi.publish_lower(Function, type)`
 - `infer_new_bwd` → adapted to use `gi.publish_upper(FieldDef, type)` (from
@@ -368,24 +711,34 @@ adapted to use `gi.read_slot()` + `gi.subscribe()`. Reads use the
 slot's upper bound (what was written) for forward inference, and may
 publish to the lower bound (what is expected) for backward propagation.
 
-**Validation**: Ring 3-6 (lambda tests) pass if created. Full test suite
-should show significant improvement.
+**Validation**: Ring 5-6 (lambda_topo, lambda_cycle) pass if created.
+Full test suite should show significant improvement.
 
-### Iteration 5: Finalize + TypeArgs
+### Iteration 4a: Finalize (type writes)
 
-**Goal**: `finalize()` writes converged types to AST. TypeArgs re-derived.
+**Goal**: `finalize()` writes converged types to AST.
 
 Implement `GlobalInfer::finalize()`:
 1. Dependency cascade per label
 2. Const/TypeAssertion/NewArrayConst: write types from converged envs
 3. TypeVar backprop over `typevar_aliases`
 4. Params and fields: write from `exit_envs` + `slot_types`
-5. Return type inference from Return terminator exit_envs (prefer per-label
+5. Slot bounds → AST: write FieldDef, ParamDef types from slot bounds
+
+**Validation**: Basic tests with explicit types should pass.
+Forward-only tests (Ring 1-2) should produce correct AST output.
+
+### Iteration 4b: Return types, TypeArgs, errors
+
+**Goal**: Return type inference, TypeArgs re-derivation, error checking.
+
+Implement:
+1. Return type inference from Return terminator exit_envs (prefer per-label
    `exit_envs` which have typetest narrowing, NOT a global env)
-6. TypeArgs: re-derive from converged envs (call `infer_typeargs` with
+2. TypeArgs: re-derive from converged envs (call `infer_typeargs` with
    final types, write to AST once)
-7. Error checking: report unresolved TypeVars
-8. DefaultInt/DefaultFloat sweep in entry point, after `run()`
+3. Error checking: report unresolved TypeVars
+4. DefaultInt/DefaultFloat sweep in entry point, after `run()`
 
 **Deferred generics**: The old `infer()` entry point has a deferred loop
 that re-processes functions with unresolved TypeVars. The global worklist
@@ -393,14 +746,17 @@ subsumes this — all functions are processed together, so TypeVar resolution
 across function boundaries happens naturally during solve. If edge cases
 remain, a second `solve()` pass can be added.
 
-**Error reporting**: Errors (type mismatches, undefined methods, etc.) may
-be reported during solve if it simplifies the code. This may complicate
-future parallelization but is acceptable for the initial implementation.
+**Error reporting**: Structural errors (undefined methods, failed lookups)
+are reported during solve when first encountered; they stop processing of
+that label. Type mismatches and unresolved TypeVars are reported during
+finalization, after the solver converges. Default literal ambiguity
+(Union backward for DefaultInt) is silent — DefaultInt falls through to
+the default sweep (u64).
 
 **Validation**: Ring 7-10 (generics, default literals) pass if created.
 Full test suite: all 1100 tests pass.
 
-### Iteration 6: Profiling (optional)
+### Iteration 5: Profiling (optional)
 
 **Goal**: Re-add profiling infrastructure adapted for global worklist.
 
@@ -427,7 +783,7 @@ When copying each transfer function from the old file:
 **Profiling removal** (in transfer functions and helpers):
 
 Most profiling infrastructure is STRIPPED in the skeleton. It can be
-re-added in Iteration 6. During transfer function porting (Iterations 3-4):
+re-added in Iteration 5. During transfer function porting (Iterations 2-3):
 - Remove `InferScopedTimer` calls
 - Remove `InferStmtScope` categorization
 - Remove `note_infer_transfer_change()` calls
@@ -457,57 +813,24 @@ them. This is a scan-only step (no env mutations), done at the start of
 
 ## Solve Loop Details
 
-The solve loop was validated through implementation. Key insights:
-
-**Entry env construction**:
-1. Entry label (i == func_first): copy from exit_envs[func_first]
-2. Other labels: merge predecessor exit_envs (with branch_exits overrides)
-3. Merge bwd_envs from self and successors into entry
-4. Recover forward metadata for locally-defined locations
-
-**No skip logic initially**: Every dequeued label is processed with
-`Direction::Both`. Convergence is driven entirely by change-based
-requeueing — if processing produces no changes, no neighbors are enqueued.
-Skip optimizations (comparing entry env to prior) can be added later as
-a performance improvement once correctness is validated.
-
-**Requeueing** (CRITICAL — this was the convergence bug):
-```cpp
-// WRONG: uses direction flags for requeueing
-if (forward_out_changed || run_fwd)  // run_fwd is always true for Both!
-    for (auto s : cfg.succ[i]) enqueue(s, Forward);
-
-// CORRECT: uses actual change flags from body processing
-if (forward_out_changed || body_fwd_changed)
-    for (auto s : cfg.succ[i]) enqueue(s, Forward);
-
-bool bwd_changed = body_bwd_changed;  // NOT run_bwd!
-// ... merge successor bwd envs, set bwd_changed if anything new ...
-if (bwd_changed)
-    for (auto p : cfg.pred[i]) enqueue(p, Backward);
-```
-
-The bug: `run_fwd` (from the dequeued Direction) was used for requeueing
-decisions. When direction is Both, `run_fwd` is always true, causing
-successors to always be enqueued even when nothing changed. This creates
-infinite cycling. The fix: use `body_fwd_changed` (from InferContext) and
-`forward_out_changed` (from exit_env comparison) instead.
-
-**Terminator handling**:
-- Return: backward-merge declared return type into env
-- Raise: refine const literals against raise type
-- Cond: create branch exits with typetest narrowing
+See the Architecture section above. The solve loop pseudocode
+captures the full algorithm. Key implementation notes:
 
 **Termination bound**:
 ```cpp
 constexpr size_t MAX_ITERS_PER_LABEL = 200;
-if (wl_iters > cfg.size() * MAX_ITERS_PER_LABEL)
-{
-    std::cerr << "infer: global worklist exceeded iteration limit ("
-              << wl_iters << " iterations, " << cfg.size() << " labels)\n";
-    break;
+if (wl_iters > cfg.size() * MAX_ITERS_PER_LABEL) {
+  // MUST fail compilation — do NOT silently truncate.
+  err(top, "Type inference did not converge");
+  return;
 }
 ```
+
+**Convergence**: Both forward and backward analyses are monotone
+(merge_type only widens). Refinement lowers Default/TypeVar to
+concrete types, which is also monotone (each location refines at
+most once per type). The type lattice has finite height, so the
+fixpoint is guaranteed.
 
 ## Finalize Details
 
@@ -517,14 +840,18 @@ Finalize writes converged types to the AST:
 2. **Const/TypeAssertion/NewArrayConst**: write types, remove assertions,
    compute tuple types
 3. **TypeVar backprop**: fixpoint over `typevar_aliases`
-4. **Params and fields**: write from exit_envs + slot_types
-5. **Return type inference**: from Return terminator exit_envs (prefer
-   per-label `exit_envs` which have typetest narrowing, NOT a global env)
+4. **Params and fields**: write from `fwd` envs
+5. **Return type inference**: from Return terminator `fwd` envs (prefer
+   per-label `fwd[i]` which have typetest narrowing, NOT a global env)
 6. **TypeArgs**: re-derive from converged envs (call `infer_typeargs` with
    final types, write to AST once). During solve, inferred TypeArgs are
    tracked in `gi.call_typeargs` (keyed by Call/CallDyn statement node).
    At finalization, these are written to the AST.
-7. Error checking: report unresolved TypeVars. Errors (type mismatches,\n   undefined methods, etc.) may be reported during solve if convenient,\n   or during finalization. Solve primarily tracks types; finalize\n   validates and reports remaining issues.\n8. **Slot bounds → AST**: write FieldDef, ParamDef types from slot bounds
+7. Error checking: report unresolved TypeVars. Errors (type mismatches,
+   undefined methods, etc.) may be reported during solve if convenient,
+   or during finalization. Solve primarily tracks types; finalize
+   validates and reports remaining issues.
+8. **Slot bounds → AST**: write FieldDef, ParamDef types from slot bounds
 9. **DefaultInt/DefaultFloat sweep**: in the pass entry point, after
    `GlobalInfer::run()`
 
@@ -553,20 +880,22 @@ Tests are organized into 10 rings of increasing difficulty:
 
 Each ring should be a self-contained test (no external deps, no
 `use "_builtin"`, bitmask exit code pattern) under `testsuite/v/ring_*`.
-Create golden files with `ninja update-dump` after the relevant iteration
-passes.
+Ring tests are created incrementally as each iteration is implemented,
+not all upfront. Create golden files with `ninja update-dump` after the
+relevant iteration passes.
 
 ## Validation Strategy
 
 | Iteration | Validation |
 |-----------|------------|
 | 0 | `ninja install` succeeds, `vc build` runs without crash |
-| 1 | Same as 0 (stubs still active) |
-| 2 | `solve()` terminates, no infinite loop |
-| 3 | Simple forward-only tests pass |
-| 4 | Lambda cross-function tests pass |
-| 5 | Full test suite: all 1100 tests pass |
-| 6 | Profiling output matches expectations |
+| 1 | `solve()` terminates, no infinite loop |
+| 2 | Simple forward-only tests pass (Ring 1-2) |
+| 3a | Backward refinement works (Ring 3-4) |
+| 3b | Lambda cross-function tests pass (Ring 5-6) |
+| 4a | Basic type writes to AST correct |
+| 4b | Full test suite: all 1100 tests pass (Ring 7-10) |
+| 5 | Profiling output matches expectations |
 
 ## Key Findings from Implementation Attempts
 
@@ -609,6 +938,15 @@ the TypeArgs node itself.
 Removing individual AST mutations one at a time creates cascading failures.
 Each mutation depends on others. The clean-room rewrite approach (all
 transfer functions adapted simultaneously) is the only viable path.
+
+**Three prior incremental attempts have failed.** The AI agent does not
+make large enough structural changes when working incrementally — it
+patches around the existing architecture rather than restructuring.
+This produces half-ported states where some transfer functions use the
+new env while others still communicate through AST mutations, creating
+subtle ordering bugs that are nearly impossible to debug. The clean-room
+approach is not optional; it is the only path that has any chance of
+succeeding.
 
 ### Convergence Bug (Solved)
 
@@ -692,35 +1030,167 @@ Slight differences from the existing inference are expected and acceptable:
 - Some edge cases may resolve differently (likely bugs in the old
   algorithm's ordering sensitivity)
 
-## Design Decisions (Resolved)
+The following are **NOT** acceptable divergences:
+- Type narrowing changing for the same input (same program infers
+  different types)
+- Return types becoming less precise (e.g., concrete → Union → dyn)
+- Runtime type errors appearing that didn't appear before
+- Programs that compiled successfully now failing to compile
 
-Decisions made during plan review, recorded for reference:
+## Multi-Perspective Review Findings
 
-1. **Per-function def_stmts scoping**: `func_def_stmts` is per-function
-   (mathematically equivalent to indexing by `(function, location)` pair).
-   Prevents `Location` string-equality collisions across functions.
+The plan was evaluated through five lenses (theory, speed, security,
+usability, conservative) with adversarial review. Key findings
+incorporated below. The conservative recommendation for incremental
+extension was rejected — three prior attempts at incremental rewriting
+failed because the AI agent does not make large enough structural changes.
+Clean-room is the only viable path.
 
-2. **Bidirectional pub/sub slots**: Each slot stores upper bound (union of
-   writes via `merge_type`) and lower bound (intersection of read
-   constraints). May simplify to a single type if practice shows they
-   always converge.
+### Theory-lens: Confirmed Sound
 
-3. **Error reporting during solve**: Acceptable if it simplifies code.
-   May complicate future parallelization but not a concern for initial
-   implementation.
+1. **Monotonicity**: SOUND. Forward/backward analyses are individually
+   monotone. `merge_type` only widens or stays the same.
 
-4. **No skip optimization initially**: Every dequeued label is processed
-   (always `Direction::Both`). Convergence relies solely on change-based
-   requeueing. Skip optimizations (entry env comparison) deferred as a
-   later performance investigation.
+2. **Termination proof**: SOUND. Refinement fires at most once per
+   (label, location) because `merge_type`'s absorption property prevents
+   reintroduction of DefaultInt/TypeVar after refinement.
 
-5. **Call TypeArgs tracking**: `std::map<Node, Node> call_typeargs` in
-   `GlobalInfer`, keyed by Call/CallDyn statement node. Written to AST
-   once during finalization.
+3. **Push vs pull fixpoint equivalence**: SOUND. Both models reach the
+   same fixpoint (same inference result). Push has order-dependent
+   intermediate states but converges to the same answer.
 
-6. **Worklist ordering**: FIFO (`std::deque`) vs ordered (`std::set`)
-   is not initially important. FIFO chosen in the plan; measure later.
+4. **Union backward constraints not refining**: SOUND. Correct design —
+   ambiguous literals are genuine ambiguity, resolved by default sweep.
 
-7. **Ring tests**: Created incrementally per iteration, not all upfront.
+5. **Path-sensitive backward filtering**: SOUND but needs tightening.
+   The false-edge case with Union backward constraints should use
+   Option A (conservative skip of entire constraint) initially. More
+   precise filtering (intersect Union with complement of excluded type)
+   can be optimized later.
 
-8. **Line budget**: Target similar or smaller than current 6364 lines.
+6. **Cross-function flow via push_cross**: SOUND on monotonicity.
+   Lambda capture cycles don't cause non-termination because each
+   `push_cross` is monotone (`merge_type`), the worklist re-processes
+   affected labels, and refinement is bounded.
+
+7. **Bidirectional refinement cascade**: NOT explicitly proven in the
+   plan, but sound on analysis. The interaction between intra-label
+   and cross-label refinement is subtle — document it in the
+   architecture comment. The potential function
+   Φ = (# of unrefined DefaultInt/TypeVar locations) decreases
+   monotonically.
+
+### Security-lens: Non-Negotiable Fixes
+
+The following MUST be implemented:
+
+1. **Iteration cap → compilation error**: When `MAX_ITERS_PER_LABEL`
+   is exceeded, the compiler MUST fail with a non-zero exit code and
+   diagnostic listing affected labels. Do NOT silently truncate
+   inference — this hides bugs and produces wrong types.
+   ```cpp
+   if (wl_iters > cfg.size() * MAX_ITERS_PER_LABEL) {
+     // Emit error with affected label list; return non-zero.
+   }
+   ```
+
+2. **Static globals → instance variables**: Move `active_method_cache`,
+   `active_infer_profile`, `active_infer_transfer_epoch` into the
+   `GlobalInfer` struct. These are thread-unsafe data races. The
+   refactoring is the natural time to fix this.
+
+3. **Null checks on find_def()**: `find_def()` can return null nodes.
+   In `push_cross()` and all `find_def()` call sites, guard against
+   null with context-specific diagnostics rather than crashing.
+
+4. **Memory monitoring**: Add instrumentation (gated behind env var)
+   to track total labels, total env entries, and peak memory during
+   the infer pass. Log a warning if any function exceeds 10K
+   locations or 100K env entries.
+
+### Usability-lens: Required Improvements
+
+1. **Rename InferContext → LabelProcessor**: The old `InferContext`
+   struct has different semantics (shared state + scratchpad). The new
+   struct has pure I/O (fwd_entry/bwd_exit → fwd_exit/bwd_entry).
+   Different name avoids confusion during review.
+
+2. **80-line architecture comment**: Add at the top of the new
+   `infer.cc` in Iteration 0. Summarise: bidirectional bounds model,
+   push mechanism, Cond-aware backward compatibility, convergence
+   proof, termination bound. Future maintainers MUST understand why
+   `merge_type` checks exist and the refinement firing-once property
+   before modifying the algorithm.
+
+3. **Split Iteration 3**: The original plan bundles backward transfer
+   functions + full pub/sub system + cross-function adaptations. Split:
+   - **Iteration 3a**: Backward transfer functions (mechanical port)
+   - **Iteration 3b**: Pub/sub system + cross-function adaptations
+
+4. **Split Iteration 4**: The original plan bundles finalization +
+   TypeArgs + error checking + DefaultInt sweep. Split:
+   - **Iteration 4a**: Finalization (Const/TypeAssertion writes,
+     dependency cascade, TypeVar backprop, params/fields writes)
+   - **Iteration 4b**: Return type inference + TypeArgs re-derivation
+     + error checking + DefaultInt/DefaultFloat sweep
+
+5. **Error reporting policy**: Define upfront:
+   - Structural errors (undefined methods) → reported during solve
+     when first encountered; stop processing that label.
+   - Type mismatches and unresolved TypeVars → reported during
+     finalization, after the solver converges.
+   - Default literal ambiguity (Union backward for DefaultInt) →
+     silent; DefaultInt falls through to default sweep (u64).
+
+6. **Transfer function dependency table**: Each transfer function
+   group should list its helper dependencies so porting order is
+   unambiguous. (Already partially done in Iteration 2 description;
+   complete it for backward transfer functions too.)
+
+7. **Explicit acceptable divergence criteria**: Error message wording
+   and line numbers may differ. Type narrowing, return type precision,
+   and successfully-compiling programs must NOT change. Validate ring
+   tests produce identical exit codes.
+
+### Speed-lens: Deferred Optimizations
+
+These items are noted for Phase 2 (after correctness is validated):
+
+1. **RPO-ordered worklist**: Compute Reverse Post-Order on CFG at
+   startup. Process labels in RPO order for faster convergence
+   (~2-5x fewer iterations on real CFGs).
+
+2. **Bitset dedup**: Use two bitsets (`in_fwd_queue`, `in_bwd_queue`)
+   instead of `std::map<size_t, Direction>` for O(1) membership test.
+
+3. **Structural hashing for same_type_tree**: Hash type tree structure
+   at construction time. Use hash equality as fast path; only recurse
+   on hash mismatch. Reduces ~68K tree traversals to ~5K.
+
+4. **Lazy cloning**: During solve, store type pointers + substitution
+   deltas instead of cloned AST nodes. Defer cloning to finalization.
+   Reduces allocations from ~274K to ~685 (one per label).
+
+5. **Subtype memoization**: Cache `Subtype(ctx, A, B)` results in a
+   small LRU cache (~100 entries). Expected hit rate > 60%.
+
+6. **Global method cache key review**: Verify that the cache key
+   correctly includes type instantiation info. If type parameters vary
+   during inference for the same method, cache misses or stale results
+   will occur. Current key uses owner + name + hand + arity but NOT
+   TypeArgs — this may need augmentation.
+
+### Adversarial Review: Resolved Findings
+
+| Finding | Resolution |
+|---------|-----------|
+| `process_function()` reuse infeasible for finalization | Correct — plan already specifies ground-up `finalize()`. No reuse of `process_function()`. |
+| Path-sensitive backward is core, not deferrable | Agreed — it is part of the core algorithm (Iteration 1), not a Phase 2 optimization. |
+| Forward transfer functions should NOT read bwd | Agreed for cross-label. Intra-label refinement (Const checking bwd) is part of forward transfer by design. |
+| push_cross() needs concrete pseudocode | Addressed in the "When push_cross fires" section. Implementation follows directly. |
+| 1100 tests per iteration unrealistic for stubs | Correct — Iterations 0-1 will fail most tests. Reframed: "each iteration targets specific test tiers." |
+| Ring tests needed in Iteration 0 | Ring tests already exist (10 tests under `testsuite/v/ring_*`). Validate they pass progressively. |
+| Error handling model missing | Addressed in usability section above (error reporting policy). |
+| Profiling removal manual risk | Addressed by existing warning in plan. Template one function first, then replicate pattern. |
+
+
