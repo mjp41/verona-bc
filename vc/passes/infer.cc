@@ -1479,6 +1479,9 @@ namespace vc
     std::vector<TypeEnv> fwd; // fwd[i] = forward types at ENTRY of label i
     std::vector<TypeEnv> bwd; // bwd[i] = backward constraints at EXIT
 
+    // Forward exit envs: computed during solve, used by finalization.
+    std::vector<TypeEnv> fwd_exit; // fwd_exit[i] = types at EXIT of label i
+
     // Cross-function mappings.
     std::map<Node, size_t> func_entry; // Function -> entry label index
     std::map<Node, std::vector<size_t>>
@@ -2708,6 +2711,7 @@ namespace vc
 
       // Allocate per-label state.
       fwd.resize(n);
+      fwd_exit.resize(n);
       bwd.resize(n);
 
       // Build cross-function mappings.
@@ -2792,20 +2796,23 @@ namespace vc
           (dir == Direction::Backward || dir == Direction::Both);
 
         // Forward exit env — shared between forward and backward phases.
-        TypeEnv fwd_exit;
+        TypeEnv label_exit;
 
         // ---- Forward phase ----
         if (run_fwd)
         {
           // Copy entry env as starting point for forward processing.
           for (auto& [loc, info] : fwd[label])
-            fwd_exit[loc] = {clone(info.type), info.call_node};
+            label_exit[loc] = {clone(info.type), info.call_node};
 
           // Clear per-label tuple tracking.
           tuple_locals.clear();
 
           // Run forward transfer functions.
-          forward_pass(fwd_exit, body, li.function);
+          forward_pass(label_exit, body, li.function);
+
+          // Store exit env for finalization.
+          fwd_exit[label] = label_exit;
 
           // Push to successors.
           if (term == Cond)
@@ -2819,7 +2826,7 @@ namespace vc
               func_idx.find(std::string((term / Rhs)->location().view()));
 
             // Push non-narrowed locations to both successors.
-            for (auto& [loc, info] : fwd_exit)
+            for (auto& [loc, info] : label_exit)
             {
               if (trace && loc == trace->src->location())
                 continue; // Handled below with narrowing.
@@ -2835,8 +2842,8 @@ namespace vc
             if (trace)
             {
               auto src_loc = trace->src->location();
-              auto src_it = fwd_exit.find(src_loc);
-              if (src_it != fwd_exit.end())
+              auto src_it = label_exit.find(src_loc);
+              if (src_it != label_exit.end())
               {
                 auto true_succ = trace->negated ? f_it : t_it;
                 auto false_succ = trace->negated ? t_it : f_it;
@@ -2870,7 +2877,7 @@ namespace vc
               std::string((term / LabelId)->location().view()));
             if (t_it != func_idx.end())
             {
-              for (auto& [loc, info] : fwd_exit)
+              for (auto& [loc, info] : label_exit)
                 if (push(fwd[t_it->second], loc, info.type, info.call_node))
                   enqueue(t_it->second, Direction::Forward);
             }
@@ -2881,11 +2888,11 @@ namespace vc
         // ---- Backward phase ----
         if (run_bwd)
         {
-          // If forward didn't run, seed fwd_exit from fwd[label].
+          // If forward didn't run, seed label_exit from fwd[label].
           if (!run_fwd)
           {
             for (auto& [loc, info] : fwd[label])
-              fwd_exit[loc] = {clone(info.type), info.call_node};
+              label_exit[loc] = {clone(info.type), info.call_node};
           }
 
           // Build bwd_entry from backward transfer functions.
@@ -2894,7 +2901,7 @@ namespace vc
           for (auto& [loc, info] : bwd[label])
             bwd_entry[loc] = {clone(info.type), info.call_node};
 
-          backward_pass(fwd_exit, bwd_entry, bwd[label], body);
+          backward_pass(label_exit, bwd_entry, bwd[label], body);
 
           // Push to predecessors (path-sensitive).
           for (auto p : cfg.pred[label])
@@ -3002,8 +3009,440 @@ namespace vc
 
     void finalize()
     {
-      // TODO: Iteration 4a -- write converged types to AST
-      // TODO: Iteration 4b -- return types, TypeArgs, error checking
+      size_t n = cfg.size();
+      if (n == 0)
+        return;
+
+      // ---- 1. TypeVar backprop across aliases ----
+      {
+        bool tv_changed = true;
+        while (tv_changed)
+        {
+          tv_changed = false;
+          for (auto& [dst_loc, src_loc] : typevar_aliases)
+          {
+            for (auto& ee : fwd_exit)
+            {
+              auto d = ee.find(dst_loc);
+              auto s = ee.find(src_loc);
+              if (d == ee.end() || s == ee.end())
+                continue;
+              bool dtv = d->second.type->front() == TypeVar;
+              bool stv = s->second.type->front() == TypeVar;
+              if (!dtv && stv)
+              {
+                s->second.type = clone(d->second.type);
+                tv_changed = true;
+              }
+              else if (dtv && !stv)
+              {
+                d->second.type = clone(s->second.type);
+                tv_changed = true;
+              }
+            }
+          }
+        }
+      }
+
+      // ---- 2. Per-label: Const writes, TypeAssertion removal,
+      //         NewArrayConst updates ----
+      for (size_t i = 0; i < n; i++)
+      {
+        auto body = cfg.labels[i].label / Body;
+
+        // Build tuple tracking for this label.
+        struct FinalTupleInfo
+        {
+          size_t size;
+          bool is_array_lit;
+        };
+        std::map<Location, FinalTupleInfo> final_tuple_info;
+        std::map<Location, std::pair<Location, size_t>> final_tuple_refs;
+        std::map<Location, std::vector<Location>> final_tuple_values;
+        std::map<Location, Node> final_newarray_types;
+
+        for (auto& stmt : *body)
+        {
+          if (stmt == NewArrayConst)
+          {
+            auto loc = (stmt / LocalId)->location();
+            auto size = from_chars_sep_v<size_t>(stmt / Rhs);
+            bool is_array_lit =
+              loc.view().find("array") != std::string_view::npos;
+            final_tuple_info.emplace(loc, FinalTupleInfo{size, is_array_lit});
+            final_tuple_values.emplace(loc, std::vector<Location>(size));
+          }
+          else if (stmt == ArrayRefConst)
+          {
+            auto arg_loc = ((stmt / Arg) / Rhs)->location();
+            auto info = final_tuple_info.find(arg_loc);
+            if (info == final_tuple_info.end())
+              continue;
+            auto index = from_chars_sep_v<size_t>(stmt / Rhs);
+            if (index < info->second.size)
+              final_tuple_refs[(stmt / LocalId)->location()] = {
+                arg_loc, index};
+          }
+          else if (stmt == Store)
+          {
+            auto ref_it = final_tuple_refs.find((stmt / Rhs)->location());
+            if (ref_it == final_tuple_refs.end())
+              continue;
+            auto& [tuple_loc, index] = ref_it->second;
+            auto values_it = final_tuple_values.find(tuple_loc);
+            if (
+              values_it != final_tuple_values.end() &&
+              index < values_it->second.size())
+              values_it->second[index] = ((stmt / Arg) / Rhs)->location();
+          }
+        }
+
+        // Compute final tuple/array types from element types.
+        for (auto& [tuple_loc, info] : final_tuple_info)
+        {
+          auto values_it = final_tuple_values.find(tuple_loc);
+          if (values_it == final_tuple_values.end())
+            continue;
+
+          if (info.is_array_lit)
+          {
+            Node common;
+            bool uniform = true;
+            for (auto& value_loc : values_it->second)
+            {
+              if (value_loc.view().empty())
+              {
+                uniform = false;
+                break;
+              }
+              auto env_it = fwd_exit[i].find(value_loc);
+              if (env_it == fwd_exit[i].end())
+              {
+                uniform = false;
+                break;
+              }
+              auto prim = extract_primitive(env_it->second.type);
+              if (!prim)
+              {
+                uniform = false;
+                break;
+              }
+              if (!common)
+                common = clone(env_it->second.type);
+              else if (
+                env_it->second.type->front()->type() !=
+                common->front()->type())
+              {
+                uniform = false;
+                break;
+              }
+            }
+            if (uniform && common && info.size > 0)
+              final_newarray_types[tuple_loc] = clone(common);
+            continue;
+          }
+
+          bool complete = true;
+          std::vector<Node> elems;
+          elems.reserve(info.size);
+          for (auto& value_loc : values_it->second)
+          {
+            if (value_loc.view().empty())
+            {
+              complete = false;
+              break;
+            }
+            auto env_it = fwd_exit[i].find(value_loc);
+            if (env_it == fwd_exit[i].end())
+            {
+              complete = false;
+              break;
+            }
+            elems.push_back(clone(env_it->second.type));
+          }
+
+          if (!complete || elems.empty())
+            continue;
+
+          if (elems.size() == 1)
+            final_newarray_types[tuple_loc] = Type
+              << clone(elems.front()->front());
+          else
+          {
+            Node tup = TupleType;
+            for (auto& elem : elems)
+              tup << clone(elem->front());
+            final_newarray_types[tuple_loc] = Type << tup;
+          }
+        }
+
+        // Walk body: write Const types, remove TypeAssertions, update
+        // NewArrayConst.
+        auto it = body->begin();
+        while (it != body->end())
+        {
+          if (*it == TypeAssertion)
+          {
+            it = body->erase(it, std::next(it));
+            continue;
+          }
+
+          if (*it == Const)
+          {
+            auto dst = (*it)->front();
+            auto loc = dst->location();
+            auto env_it = fwd_exit[i].find(loc);
+            Node final_type;
+            if (
+              env_it != fwd_exit[i].end() &&
+              !is_default_type(env_it->second.type))
+              final_type = env_it->second.type;
+            if (!final_type)
+            {
+              auto bwd_it = bwd[i].find(loc);
+              if (
+                bwd_it != bwd[i].end() &&
+                !is_default_type(bwd_it->second.type))
+                final_type = bwd_it->second.type;
+            }
+            Node final_prim;
+            if (final_type)
+              final_prim = extract_primitive(final_type);
+
+            if (final_prim)
+            {
+              if ((*it)->size() == 3)
+              {
+                auto old_type = (*it)->at(1);
+                if (old_type->type() != final_prim->type())
+                  (*it)->replace(old_type, final_prim->type());
+              }
+              else if ((*it)->size() == 2)
+              {
+                auto lit = (*it)->back();
+                (*it)->erase((*it)->begin(), (*it)->end());
+                *it << dst << final_prim->type() << lit;
+              }
+            }
+            else if ((*it)->size() == 2)
+            {
+              auto lit = (*it)->back();
+              auto type_tok = default_literal_type(lit);
+              (*it)->erase((*it)->begin(), (*it)->end());
+              *it << dst << type_tok << lit;
+            }
+          }
+          else if (*it == NewArrayConst)
+          {
+            auto nloc = ((*it) / LocalId)->location();
+            auto final_it = final_newarray_types.find(nloc);
+            if (final_it != final_newarray_types.end())
+              (*it)->replace((*it) / Type, clone(final_it->second));
+
+            auto env_it = fwd_exit[i].find(nloc);
+            if (env_it != fwd_exit[i].end())
+            {
+              auto inner = env_it->second.type->front();
+              if (inner == TupleType)
+                (*it)->replace((*it) / Type, clone(env_it->second.type));
+              else
+              {
+                auto prim = extract_primitive(env_it->second.type);
+                if (
+                  prim &&
+                  !Subtype.invariant(
+                    top, (*it) / Type, env_it->second.type))
+                  (*it)->replace(
+                    (*it) / Type, clone(env_it->second.type));
+              }
+            }
+          }
+
+          ++it;
+        }
+      }
+
+      // ---- 3. Update params and fields from fwd_exit envs ----
+      for (auto& [func, range] : cfg.func_label_range)
+      {
+        auto parent_cls = func->parent(ClassDef);
+
+        for (auto& pd : *(func / Params))
+        {
+          auto type = pd / Type;
+          if (type->front() != TypeVar)
+            continue;
+          auto ident = pd / Ident;
+          for (size_t i = range.first; i < range.second; i++)
+          {
+            auto it = fwd_exit[i].find(ident->location());
+            if (it != fwd_exit[i].end() && it->second.type->front() != TypeVar)
+            {
+              pd->replace(type, clone(it->second.type));
+              if (parent_cls)
+              {
+                for (auto& child : *(parent_cls / ClassBody))
+                {
+                  if (child != FieldDef)
+                    continue;
+                  if (
+                    (child / Ident)->location().view() !=
+                    ident->location().view())
+                    continue;
+                  if (contains_typevar(child / Type))
+                    child->replace(child / Type, clone(it->second.type));
+                  break;
+                }
+              }
+              break;
+            }
+          }
+        }
+
+        // Update FieldDef types still at TypeVar.
+        if (parent_cls)
+        {
+          for (auto& child : *(parent_cls / ClassBody))
+          {
+            if (child != FieldDef || (child / Type)->front() != TypeVar)
+              continue;
+            auto fname = (child / Ident)->location();
+            for (size_t i = range.first; i < range.second; i++)
+            {
+              auto it = fwd_exit[i].find(fname);
+              if (
+                it != fwd_exit[i].end() &&
+                it->second.type->front() != TypeVar)
+              {
+                child->replace(child / Type, clone(it->second.type));
+                break;
+              }
+            }
+          }
+        }
+
+        // ---- 4. Return type inference ----
+        bool in_generic = (func / TypeParams)->size() > 0 ||
+          (func->parent({ClassDef}) != nullptr &&
+           (func->parent({ClassDef}) / TypeParams)->size() > 0);
+
+        auto func_ret = func / Type;
+        if (func_ret->front() == TypeVar)
+        {
+          SequentCtx ctx{top, {}, {}};
+          Nodes ret_types;
+          bool unresolved = false;
+
+          if (in_generic)
+          {
+            for (size_t i = range.first; i < range.second; i++)
+            {
+              auto lbl_body = cfg.labels[i].label / Body;
+              for (auto& stmt : *lbl_body)
+                if (stmt->in({CallDyn, TryCallDyn}))
+                {
+                  auto loc = (stmt / LocalId)->location();
+                  bool found = false;
+                  for (size_t j = range.first; j < range.second; j++)
+                    if (fwd_exit[j].find(loc) != fwd_exit[j].end())
+                    {
+                      found = true;
+                      break;
+                    }
+                  if (!found)
+                    unresolved = true;
+                }
+            }
+          }
+
+          auto ret_it = func_returns.find(func);
+          if (ret_it != func_returns.end())
+          {
+            for (auto idx : ret_it->second)
+            {
+              auto term = cfg.labels[idx].label / Return;
+              if (term != Return)
+                continue;
+              auto ret_loc = (term / LocalId)->location();
+              auto eit = fwd_exit[idx].find(ret_loc);
+              if (
+                eit == fwd_exit[idx].end() ||
+                eit->second.type->front() == TypeVar)
+              {
+                if (in_generic)
+                  unresolved = true;
+                continue;
+              }
+              bool covered = false;
+              for (auto& rt : ret_types)
+                if (Subtype(ctx, eit->second.type, rt))
+                {
+                  covered = true;
+                  break;
+                }
+              if (!covered)
+                ret_types.push_back(clone(eit->second.type));
+            }
+          }
+
+          if (!unresolved)
+          {
+            if (ret_types.size() == 1)
+              func->replace(func_ret, ret_types.front());
+            else if (ret_types.size() > 1)
+            {
+              Node u = Union;
+              for (auto& rt : ret_types)
+                u << clone(rt->front());
+              func->replace(func_ret, Type << u);
+            }
+            else
+            {
+              bool all_nonlocal = true;
+              for (size_t i = range.first; i < range.second; i++)
+              {
+                auto term = cfg.labels[i].label / Return;
+                if (term->in({Jump, Cond}))
+                  continue;
+                if (term != Raise)
+                {
+                  all_nonlocal = false;
+                  break;
+                }
+              }
+              if (all_nonlocal)
+                func->replace(
+                  func_ret,
+                  Type
+                    << (TypeName
+                        << (NameElement << (Ident ^ "_builtin") << TypeArgs)
+                        << (NameElement << (Ident ^ "none") << TypeArgs)));
+            }
+          }
+        }
+
+        // ---- 5. Error checking ----
+        if (!in_generic)
+        {
+          for (auto& pd : *(func / Params))
+          {
+            if ((pd / Type)->front() == TypeVar)
+            {
+              func->parent()->replace(
+                func,
+                err(pd / Ident, "Cannot infer type of parameter"));
+              break;
+            }
+          }
+          func_ret = func / Type;
+          if (func_ret->front() == TypeVar)
+          {
+            func->parent()->replace(
+              func,
+              err(func / Ident, "Cannot infer return type of function"));
+          }
+        }
+      }
     }
 
     void run()
