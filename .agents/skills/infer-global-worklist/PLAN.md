@@ -18,12 +18,13 @@ communicate state changes between functions. Instead:
 ## Current State (Updated April 14, 2026)
 
 The clean-room rewrite is substantially complete. `infer.cc` is ~3900
-lines (down from 6364). 960/1105 tests pass (87%). The architecture is:
+lines (down from 6364). 976/1105 tests pass (88%). The architecture is:
 
 - **Global worklist** with direction-aware scheduling (Forward/Backward/Both)
 - **No AST mutations during solve** (except local TypeArgs write)
 - **AngelicSubtype** node type for default literal inference
-- **Local refinement re-pass** after backward (replaces post-convergence cascade)
+- **Extended refinement** covers both entry AND exit envs (no re-pass needed)
+- **No post-convergence cascade** — all refinement is solve-time
 - **Backward CallDyn handler** resolves default receivers from backward constraints
 
 ### AngelicSubtype Design
@@ -45,23 +46,53 @@ never in `merge_type`. This prevents the forward-backward oscillation
 that caused convergence failures in earlier attempts. Forward joins are
 purely monotone (Angelic is a fixed point when both sides agree).
 
-**Refinement**: When `fwd[label]` has `Angelic(T)` and `bwd[label]` has
-concrete S where S is admitted by T, the refinement step narrows
-fwd to S and re-enqueues the label Forward.
+At forward joins, Angelic semantics are:
+- Angelic is "angelic" — context (backward) CHOOSES the subtype
+- Union is "demonic" — value COULD BE any member
+- At a join, both branches must agree: if both have `Angelic(T)`,
+  the join is `Angelic(T)` (intersection of bounds = same bound).
+  Treating Angelic as opaque achieves this via structural equality.
 
-**Finalization**: Unresolved `Angelic(DefaultInt)` → u64, 
+**Refinement**: The refinement step iterates BOTH `fwd[label]` (entry
+env) AND `fwd_exit[label]` (exit env with locally-defined variables).
+When an Angelic/Default/TypeVar type has a compatible backward
+constraint in `bwd[label]`, it is narrowed to the backward type.
+Both entry and exit envs are updated, and the label is re-enqueued.
+
+This replaces the earlier "local refinement re-pass" (~200 lines)
+with a ~10 line extension to the existing refinement loop.
+
+**Backward Copy handler**: Only pushes backward constraints when the
+expected type is concrete (not Angelic). This prevents Angelic types
+from flowing backward through Copy chains as uninformative noise.
+The backward constraint must come from a concrete source (e.g., a
+Call param type, a return type, a Store field type).
+
+**Finalization**: Unresolved `Angelic(DefaultInt)` → u64,
 `Angelic(DefaultFloat)` → f64, `Angelic(any)` → error.
 
-### Remaining Failures (40 real, categorized)
+### Theory-Lens Analysis (April 14, 2026)
+
+| Aspect | Status |
+|--------|--------|
+| Forward monotonicity | SOUND — Const handler preserves concrete types; Angelic never reintroduced |
+| Absorption | SOUND — `merge(concrete, Angelic) → {}` by design |
+| Convergence | SOUND — ~800 iterations for hello (685 labels), monotone lattice |
+| Path-sensitive backward | SOUND — typetest filtering correct |
+| Angelic nesting | GAP — no formal invariant preventing Angelic inside Union/Isect |
+| Refinement completeness | CONCERN — depends on backward constraints reaching all Const definitions via Copy chain traversal in backward_pass |
+
+### Remaining Failures (~35 real + golden mismatches)
 
 | Category | Count | Description |
 |----------|-------|-------------|
-| Default literal refinement (i32↔u64 conflict) | 25 | Backward constraint reaches some but not all copies of a literal across labels. The re-pass handles many cases but misses some multi-label Copy chain patterns. |
-| Callback/generic TypeArgs | 5 | Generic callback TypeArgs not inferred — lambda type mismatch. Needs backward TypeArg refinement through Call. |
+| Default literal refinement (i32↔u64) | ~20 | Backward constraint reaches variable but not the Const Location through Copy chain. Timing-dependent — backward constraint arrives after the label has already been processed. RPO ordering would likely fix. |
+| Callback/generic TypeArgs | 5 | Generic callback TypeArgs not inferred — lambda type mismatch. |
 | When param inference | 2 | Cown inner type not reaching lambda param at finalization. |
 | Generic backward TypeArgs | 2 | Generic wrapper TypeArgs not re-inferred from backward constraint. |
 | Return type inference | 2 | Lambda return type not resolved from shape/caller constraints. |
 | Other (crash, error msg, FFI, lambda cycle) | 4 | Miscellaneous. |
+| Golden file mismatches | ~60 | Tests compile correctly but intermediate dump output differs due to AngelicSubtype token in type nodes. Will resolve with golden file regeneration. |
 
 ### Failed Approaches (documented for posterity)
 
@@ -74,20 +105,31 @@ fwd to S and re-enqueues the label Forward.
    to refine remaining defaults. Worked (92%) but was architecturally
    unsound — post-convergence fixes can't trigger further backward
    propagation, leading to cases requiring multiple cascade passes.
+   A minimal example was found (`wrap[T] + consume`) where the cascade
+   could not re-infer TypeArgs from backward constraints.
 
 3. **Forward Lookup resolving on default representative**: Committed
    u64 too early in forward, causing forward-backward conflicts at
    joins (u64 vs i32 → Union(u64, i32) instead of narrowing).
 
 4. **merge_type with Angelic narrowing**: Added narrowing logic inside
-   merge_type. Caused oscillation because narrowing and widening
-   competed on every push, breaking monotonicity.
+   merge_type (Angelic(T) + concrete S where S <: T → S). Caused
+   oscillation because narrowing and widening competed on every push,
+   breaking monotonicity. Root cause: forward and backward both call
+   merge_type, so narrowing in merge_type fires in BOTH directions.
+   The fix: narrowing happens ONLY in the refinement step.
+
+5. **Local refinement re-pass** (~200 lines): After backward_pass,
+   walked the body forward refining locally-defined defaults from
+   bwd_entry, then re-ran forward_pass. Replaced by extending the
+   refinement step to cover `fwd_exit[label]` (10 lines).
 
 ### Next Steps
 
 1. **RPO worklist ordering**: Process labels in reverse post-order for
    faster convergence. Would reduce iterations from ~800 to ~100 and
-   may resolve some timing-dependent refinement failures.
+   should fix timing-dependent refinement failures where backward
+   constraints arrive after the source label has already been processed.
 
 2. **When param finalization**: Write cown inner types to lambda param
    AST nodes during finalization.
@@ -99,6 +141,9 @@ fwd to S and re-enqueues the label Forward.
 4. **AngelicSubtype for TypeVar**: Replace TypeVar with
    Angelic(any) to unify the DefaultInt/DefaultFloat/TypeVar
    special cases into one mechanism.
+
+5. **Angelic nesting invariant**: Add assertion that AngelicSubtype
+   never appears inside Union/Isect/container types.
 
 ## Original Plan
 
