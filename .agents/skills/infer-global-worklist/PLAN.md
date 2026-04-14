@@ -15,18 +15,94 @@ communicate state changes between functions. Instead:
 4. Placeholder nodes for inferred type arguments are maintained in the side
    structure, not injected into the AST during iteration.
 
-## Current State
+## Current State (Updated April 14, 2026)
 
-The code is in `vc/passes/infer.cc` (6364 lines, fully working). A backup
-exists at `vc/passes/infer.cc.old` (6780 lines, the pre-cleanup version).
-The refactoring should produce a replacement `infer.cc` that passes all
-existing tests. Target line count: similar or smaller than current.
+The clean-room rewrite is substantially complete. `infer.cc` is ~3900
+lines (down from 6364). 960/1105 tests pass (87%). The architecture is:
 
-An existing prototype `infer_global()` (~400 lines, gated behind
-`VC_INFER_GLOBAL` env var) already implements the basic structure:
-flat label collection, CFG construction, liveness, and an undirected
-worklist loop with `process_function` fallback for finalization. The new
-implementation replaces this prototype with the full architecture below.
+- **Global worklist** with direction-aware scheduling (Forward/Backward/Both)
+- **No AST mutations during solve** (except local TypeArgs write)
+- **AngelicSubtype** node type for default literal inference
+- **Local refinement re-pass** after backward (replaces post-convergence cascade)
+- **Backward CallDyn handler** resolves default receivers from backward constraints
+
+### AngelicSubtype Design
+
+`AngelicSubtype(T)` wraps an upper bound T, meaning "will become some
+S where S <: T, determined by backward constraints." Used for:
+- `Angelic(DefaultInt)` — unresolved integer literal
+- `Angelic(DefaultFloat)` — unresolved float literal
+- Future: `Angelic(any)` — unresolved type parameter (replaces TypeVar)
+
+**Merge semantics (forward joins)**: Angelic is opaque to `merge_type`
+— structural equality only. Angelic is less information than concrete,
+so `merge(concrete, Angelic(T))` → concrete wins (keeps concrete).
+`merge(Angelic(T), concrete)` → concrete wins (widens to concrete).
+Two angelics with same structure → no change.
+
+**Key insight**: Angelic narrowing happens ONLY in the refinement step,
+never in `merge_type`. This prevents the forward-backward oscillation
+that caused convergence failures in earlier attempts. Forward joins are
+purely monotone (Angelic is a fixed point when both sides agree).
+
+**Refinement**: When `fwd[label]` has `Angelic(T)` and `bwd[label]` has
+concrete S where S is admitted by T, the refinement step narrows
+fwd to S and re-enqueues the label Forward.
+
+**Finalization**: Unresolved `Angelic(DefaultInt)` → u64, 
+`Angelic(DefaultFloat)` → f64, `Angelic(any)` → error.
+
+### Remaining Failures (40 real, categorized)
+
+| Category | Count | Description |
+|----------|-------|-------------|
+| Default literal refinement (i32↔u64 conflict) | 25 | Backward constraint reaches some but not all copies of a literal across labels. The re-pass handles many cases but misses some multi-label Copy chain patterns. |
+| Callback/generic TypeArgs | 5 | Generic callback TypeArgs not inferred — lambda type mismatch. Needs backward TypeArg refinement through Call. |
+| When param inference | 2 | Cown inner type not reaching lambda param at finalization. |
+| Generic backward TypeArgs | 2 | Generic wrapper TypeArgs not re-inferred from backward constraint. |
+| Return type inference | 2 | Lambda return type not resolved from shape/caller constraints. |
+| Other (crash, error msg, FFI, lambda cycle) | 4 | Miscellaneous. |
+
+### Failed Approaches (documented for posterity)
+
+1. **Naive Union expansion**: Replaced DefaultInt with Union(i8,...,usize).
+   Convergence was fine (800 iterations) but initially appeared to hang
+   due to unrelated bugs. Abandoned prematurely. Later investigation
+   proved it was viable but superseded by AngelicSubtype.
+
+2. **Post-convergence cascade**: Forward dataflow pass after convergence
+   to refine remaining defaults. Worked (92%) but was architecturally
+   unsound — post-convergence fixes can't trigger further backward
+   propagation, leading to cases requiring multiple cascade passes.
+
+3. **Forward Lookup resolving on default representative**: Committed
+   u64 too early in forward, causing forward-backward conflicts at
+   joins (u64 vs i32 → Union(u64, i32) instead of narrowing).
+
+4. **merge_type with Angelic narrowing**: Added narrowing logic inside
+   merge_type. Caused oscillation because narrowing and widening
+   competed on every push, breaking monotonicity.
+
+### Next Steps
+
+1. **RPO worklist ordering**: Process labels in reverse post-order for
+   faster convergence. Would reduce iterations from ~800 to ~100 and
+   may resolve some timing-dependent refinement failures.
+
+2. **When param finalization**: Write cown inner types to lambda param
+   AST nodes during finalization.
+
+3. **Backward Call TypeArgs re-inference**: When a Call result has a
+   backward constraint, re-infer TypeArgs from return_type vs
+   backward_constraint and propagate to args.
+
+4. **AngelicSubtype for TypeVar**: Replace TypeVar with
+   Angelic(any) to unify the DefaultInt/DefaultFloat/TypeVar
+   special cases into one mechanism.
+
+## Original Plan
+
+(The original plan content follows below, retained for reference.)
 
 All 1100 tests currently pass. Ring tests (`testsuite/v/ring_*`) are
 planned as incremental validation targets but do not yet exist — they
@@ -1194,35 +1270,32 @@ These items are noted for Phase 2 (after correctness is validated):
    will occur. Current key uses owner + name + hand + arity but NOT
    TypeArgs — this may need augmentation.
 
-7. **Uniform bounded type variables**: Replace the three separate
-   concepts (DefaultInt, DefaultFloat, TypeVar) with a single
-   `BoundedVar { upper, lower, default }` representation:
+7. **AngelicSubtype for TypeVar** (PARTIALLY IMPLEMENTED):
+   `AngelicSubtype(T)` is now implemented for DefaultInt/DefaultFloat.
+   Extending to TypeVar (replacing TypeVar with `Angelic(any)`) would
+   unify all three concepts into one mechanism:
 
-   | Current      | Upper bound              | Lower bound | Default |
-   |--------------|--------------------------|-------------|---------|
-   | DefaultInt   | Union(i8,...,usize)       | bottom      | u64     |
-   | DefaultFloat | Union(f32, f64)           | bottom      | f64     |
-   | TypeVar      | top (any)                 | bottom      | error   |
+   | Current      | AngelicSubtype form      | Default |
+   |--------------|--------------------------|---------|
+   | DefaultInt   | Angelic(DefaultInt)       | u64     |
+   | DefaultFloat | Angelic(DefaultFloat)     | f64     |
+   | TypeVar      | Angelic(any) — TODO       | error   |
 
-   Then all merge/refinement logic becomes uniform:
-   - Forward merge = widen upper bound (union with incoming)
-   - Backward merge = widen lower bound (union with constraint)
-   - Refinement = when `lower ⊆ upper` and `lower ≠ bottom`,
-     resolved type = lower
-   - Finalization = if still `lower = bottom`, use default
-     (u64 / f64 / report error)
-   - `merge_type` compatibility = just `incoming <: upper`
+   The merge/refinement is uniform:
+   - `merge_type`: Angelic is opaque (structural equality). Concrete
+     wins over Angelic at forward joins.
+   - Refinement: when `fwd` is Angelic(T) and `bwd` is concrete S
+     admitted by T, narrow to S.
+   - Finalization: unresolved Angelic → default or error.
 
-   This eliminates all `is_default_type` / `extract_primitive` /
-   `integer_types` / `float_types` special-case machinery from
-   `merge_type`, the refinement step, and finalization. Estimated
-   ~30% code reduction in the type lattice and refinement logic.
-
-   Convergence is preserved: upper bounds only widen (monotone),
-   lower bounds only widen (monotone), and refinement fires at
-   most once per (label, location) because once lower is non-bottom
-   and compatible, the type becomes concrete and `merge_type`
-   absorbs further Default/TypeVar arrivals.
+   The key design distinction from the earlier BoundedVar proposal:
+   - `AngelicSubtype` is a SINGLE child node (the upper bound T),
+     not a pair of upper/lower bounds
+   - It is "angelic" — context (backward) CHOOSES the subtype,
+     rather than "demonic" Union where the value COULD BE any member
+   - Narrowing happens ONLY in refinement, never in merge_type
+   - This prevents forward-backward oscillation that caused
+     convergence failures with the BoundedVar approach
 
 ### Adversarial Review: Resolved Findings
 
