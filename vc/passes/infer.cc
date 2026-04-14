@@ -3100,6 +3100,258 @@ namespace vc
         }
       }
 
+      // ---- 1b. Dependency cascade: propagate concrete types through
+      //          Copy/Move/Lookup/CallDyn chains in fwd_exit, refining
+      //          remaining Default types from backward constraints. ----
+      for (size_t i = 0; i < n; i++)
+      {
+        auto body = cfg.labels[i].label / Body;
+        auto& env = fwd_exit[i];
+
+        // Build src index: map from source location to statements
+        // that read it.
+        using SrcIndex = std::multimap<Location, Node>;
+        SrcIndex src_index;
+        std::map<Location, Node> const_defs;
+        for (auto& stmt : *body)
+        {
+          if (stmt == Const)
+            const_defs[(stmt / LocalId)->location()] = stmt;
+          if (stmt->in({Copy, Move}))
+            src_index.emplace((stmt / Rhs)->location(), stmt);
+          else if (stmt == Lookup)
+            src_index.emplace((stmt / Rhs)->location(), stmt);
+          else if (stmt == Load)
+            src_index.emplace((stmt / Rhs)->location(), stmt);
+          else if (stmt->in({CallDyn, TryCallDyn}))
+          {
+            src_index.emplace((stmt / Rhs)->location(), stmt);
+            for (auto& arg : *(stmt / Args))
+              src_index.emplace((arg / Rhs)->location(), stmt);
+          }
+        }
+
+        // Seed worklist with concrete locations.
+        std::deque<Location> work;
+        std::set<Location> in_queue;
+        for (auto& [loc, info] : env)
+        {
+          if (
+            info.type && !info.type->empty() &&
+            !info.type->front()->in(
+              {TypeVar, DefaultInt, DefaultFloat, Union}))
+          {
+            if (in_queue.insert(loc).second)
+              work.push_back(loc);
+          }
+        }
+
+        // Also seed from backward constraints.
+        for (auto& [loc, info] : bwd[i])
+        {
+          auto env_it = env.find(loc);
+          if (env_it == env.end())
+            continue;
+          if (!is_default_type(env_it->second.type))
+            continue;
+          auto prim = extract_primitive(info.type);
+          if (!prim)
+            continue;
+          bool compat =
+            (env_it->second.type->front() == DefaultInt &&
+             prim->in(integer_types)) ||
+            (env_it->second.type->front() == DefaultFloat &&
+             prim->in(float_types));
+          if (compat)
+          {
+            env_it->second.type = clone(info.type);
+            if (in_queue.insert(loc).second)
+              work.push_back(loc);
+          }
+        }
+
+        // Also check cross-label backward constraints for this
+        // function.
+        auto [frange_begin, frange_end] =
+          cfg.func_label_range[cfg.labels[i].function];
+        for (size_t j = frange_begin; j < frange_end; j++)
+        {
+          if (j == i)
+            continue;
+          for (auto& [loc, binfo] : bwd[j])
+          {
+            auto env_it = env.find(loc);
+            if (env_it == env.end())
+              continue;
+            if (!is_default_type(env_it->second.type))
+              continue;
+            auto prim = extract_primitive(binfo.type);
+            if (!prim)
+              continue;
+            bool compat =
+              (env_it->second.type->front() == DefaultInt &&
+               prim->in(integer_types)) ||
+              (env_it->second.type->front() == DefaultFloat &&
+               prim->in(float_types));
+            if (compat)
+            {
+              env_it->second.type = clone(binfo.type);
+              if (in_queue.insert(loc).second)
+                work.push_back(loc);
+            }
+          }
+        }
+
+        // Cascade: propagate concrete types through data flow.
+        while (!work.empty())
+        {
+          auto loc = work.front();
+          work.pop_front();
+          in_queue.erase(loc);
+
+          auto [begin, end] = src_index.equal_range(loc);
+          for (auto sit = begin; sit != end; ++sit)
+          {
+            auto stmt = sit->second;
+
+            if (stmt->in({Copy, Move}))
+            {
+              auto src_loc = (stmt / Rhs)->location();
+              auto src_it = env.find(src_loc);
+              if (src_it == env.end())
+                continue;
+              auto dst_loc = (stmt / LocalId)->location();
+              if (push(env, dst_loc, src_it->second.type,
+                       src_it->second.call_node))
+              {
+                if (in_queue.insert(dst_loc).second)
+                  work.push_back(dst_loc);
+              }
+            }
+            else if (stmt == Lookup)
+            {
+              auto src_loc = (stmt / Rhs)->location();
+              auto src_it = env.find(src_loc);
+              if (src_it == env.end() ||
+                  is_default_type(src_it->second.type))
+                continue;
+              auto hand = (stmt / Lhs)->type();
+              auto method_ident = lookup_method_name(stmt);
+              auto method_ta = stmt / TypeArgs;
+              auto arity = from_chars_sep_v<size_t>(stmt / Int);
+              auto ret = resolve_method_return_type(
+                top,
+                src_it->second.type,
+                method_ident,
+                hand,
+                arity,
+                method_ta);
+              if (!ret)
+                continue;
+              auto dst_loc = (stmt / LocalId)->location();
+              if (push(env, dst_loc, ret))
+              {
+                if (in_queue.insert(dst_loc).second)
+                  work.push_back(dst_loc);
+              }
+            }
+            else if (stmt == Load)
+            {
+              auto src_it = env.find((stmt / Rhs)->location());
+              if (src_it == env.end())
+                continue;
+              auto inner = extract_ref_inner(src_it->second.type);
+              if (!inner)
+                continue;
+              auto dst_loc = (stmt / LocalId)->location();
+              if (push(env, dst_loc, inner))
+              {
+                if (in_queue.insert(dst_loc).second)
+                  work.push_back(dst_loc);
+              }
+            }
+            else if (stmt->in({CallDyn, TryCallDyn}))
+            {
+              auto dst_loc = (stmt / LocalId)->location();
+              auto src_loc = (stmt / Rhs)->location();
+              auto src_it = env.find(src_loc);
+              if (src_it != env.end())
+              {
+                if (push(env, dst_loc, src_it->second.type))
+                {
+                  if (in_queue.insert(dst_loc).second)
+                    work.push_back(dst_loc);
+                }
+              }
+
+              // Refine args from resolved method params.
+              auto lk_it = lookup_stmts.find(src_loc);
+              if (lk_it == lookup_stmts.end())
+                continue;
+              auto lookup_node = lk_it->second;
+              auto recv_it =
+                env.find((lookup_node / Rhs)->location());
+              if (
+                recv_it == env.end() ||
+                is_default_type(recv_it->second.type))
+                continue;
+              auto hand = (lookup_node / Lhs)->type();
+              auto method_ident = lookup_method_name(lookup_node);
+              auto method_ta = lookup_node / TypeArgs;
+              auto arity = from_chars_sep_v<size_t>(lookup_node / Int);
+              auto info = resolve_callable_method(
+                top,
+                recv_it->second.type,
+                method_ident,
+                hand,
+                arity,
+                method_ta);
+              if (!info.func)
+                continue;
+              auto params = info.func / Params;
+              auto args = stmt / Args;
+              for (
+                size_t k = 0;
+                k < params->size() && k < args->size();
+                k++)
+              {
+                auto expected =
+                  apply_subst(top, params->at(k) / Type, info.subst);
+                if (!expected || expected->front() == TypeVar)
+                  continue;
+                auto arg_loc = (args->at(k) / Rhs)->location();
+                // Refine default const.
+                auto c_it = const_defs.find(arg_loc);
+                if (c_it != const_defs.end())
+                {
+                  auto e_it = env.find(arg_loc);
+                  if (e_it != env.end() &&
+                      is_default_type(e_it->second.type))
+                  {
+                    auto ep = extract_primitive(expected);
+                    if (ep)
+                    {
+                      bool compat =
+                        (e_it->second.type->front() == DefaultInt &&
+                         ep->in(integer_types)) ||
+                        (e_it->second.type->front() == DefaultFloat &&
+                         ep->in(float_types));
+                      if (compat)
+                        e_it->second.type = clone(expected);
+                    }
+                  }
+                }
+                if (push(env, arg_loc, expected))
+                {
+                  if (in_queue.insert(arg_loc).second)
+                    work.push_back(arg_loc);
+                }
+              }
+            }
+          }
+        }
+      }
+
       // ---- 2. Per-label: Const writes, TypeAssertion removal,
       //         NewArrayConst updates ----
       for (size_t i = 0; i < n; i++)
@@ -3367,7 +3619,10 @@ namespace vc
           if (type->front() != TypeVar)
             continue;
           auto ident = pd / Ident;
-          for (size_t i = range.first; i < range.second; i++)
+          // Check fwd_exit first, then fwd[entry] (for params pushed
+          // via push_param_type that didn't get a final forward run).
+          bool found = false;
+          for (size_t i = range.first; i < range.second && !found; i++)
           {
             auto it = fwd_exit[i].find(ident->location());
             if (it != fwd_exit[i].end() && it->second.type->front() != TypeVar)
@@ -3388,7 +3643,37 @@ namespace vc
                   break;
                 }
               }
-              break;
+              found = true;
+            }
+          }
+          if (!found)
+          {
+            // Fallback: check fwd[entry_label] for cross-function pushes.
+            auto entry_it = func_entry.find(func);
+            if (entry_it != func_entry.end())
+            {
+              auto it = fwd[entry_it->second].find(ident->location());
+              if (
+                it != fwd[entry_it->second].end() &&
+                it->second.type->front() != TypeVar)
+              {
+                pd->replace(type, clone(it->second.type));
+                if (parent_cls)
+                {
+                  for (auto& child : *(parent_cls / ClassBody))
+                  {
+                    if (child != FieldDef)
+                      continue;
+                    if (
+                      (child / Ident)->location().view() !=
+                      ident->location().view())
+                      continue;
+                    if (contains_typevar(child / Type))
+                      child->replace(child / Type, clone(it->second.type));
+                    break;
+                  }
+                }
+              }
             }
           }
         }
