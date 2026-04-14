@@ -60,6 +60,7 @@ namespace vc
   // the infer pass — resolved to U64/F64 before the pass terminates.
   inline const auto DefaultInt = TokenDef("default_int");
   inline const auto DefaultFloat = TokenDef("default_float");
+  inline const auto AngelicSubtype = TokenDef("angelic_subtype");
 
   inline const auto WhereAnd = TokenDef("whereand");
   inline const auto WhereOr = TokenDef("whereor");

@@ -244,10 +244,56 @@ namespace vc
 
   // ===== Type predicates =====
 
+  Node angelic_int()
+  {
+    return Type << (AngelicSubtype << DefaultInt);
+  }
+
+  Node angelic_float()
+  {
+    return Type << (AngelicSubtype << DefaultFloat);
+  }
+
+  bool is_angelic(const Node& type)
+  {
+    return type && type == Type && !type->empty() &&
+      type->front() == AngelicSubtype;
+  }
+
+  // Check if a type is a default integer or default float,
+  // handling both old tokens and AngelicSubtype wrappers.
+  bool is_default_int(const Node& type)
+  {
+    if (!type || type->empty())
+      return false;
+    if (type->front() == DefaultInt)
+      return true;
+    if (type->front() == AngelicSubtype && !type->front()->empty())
+      return type->front()->front() == DefaultInt;
+    return false;
+  }
+
+  bool is_default_float(const Node& type)
+  {
+    if (!type || type->empty())
+      return false;
+    if (type->front() == DefaultFloat)
+      return true;
+    if (type->front() == AngelicSubtype && !type->front()->empty())
+      return type->front()->front() == DefaultFloat;
+    return false;
+  }
+
   bool is_default_type(const Node& type)
   {
-    return type && !type->empty() &&
-      type->front()->in({DefaultInt, DefaultFloat});
+    if (!type || type->empty())
+      return false;
+    if (type->front()->in({DefaultInt, DefaultFloat}))
+      return true;
+    // AngelicSubtype is semantically a default (unresolved).
+    if (type->front() == AngelicSubtype)
+      return true;
+    return false;
   }
 
   bool contains_default_type(const Node& type)
@@ -531,6 +577,23 @@ namespace vc
     // Structural equality fast path.
     if (same_type_tree(existing, incoming))
       return {};
+
+    // AngelicSubtype: opaque at forward joins.
+    // Angelic(T) is less info than concrete — concrete wins.
+    // Two angelics with same structure → no change (same_type_tree
+    // already caught this above).
+    if (is_angelic(existing))
+    {
+      if (is_angelic(incoming))
+        return {}; // Both angelic, same_type_tree already checked.
+      // existing is angelic, incoming is concrete → widen to concrete.
+      return clone(incoming);
+    }
+    if (is_angelic(incoming))
+    {
+      // incoming is angelic, existing is concrete → keep concrete.
+      return {};
+    }
 
     // Default yields to compatible concrete primitive.
     if (is_default_type(existing) && !is_default_type(incoming))
@@ -1551,23 +1614,36 @@ namespace vc
             type_tok = stmt->at(1);
           else
             type_tok = default_literal_type(stmt->back());
-          auto type = type_tok->in({DefaultInt, DefaultFloat}) ?
-            (Type << type_tok->type()) :
-            primitive_or_ffi_type(type_tok->type());
-
-          if (is_default_type(type))
+          Node type;
+          if (type_tok == DefaultInt)
           {
-            // Check existing env (from prior iteration).
             auto it = env.find(dst->location());
-            if (it != env.end() && !is_default_type(it->second.type))
+            if (it != env.end() && !is_angelic(it->second.type) &&
+                !is_default_type(it->second.type))
             {
               auto prim = extract_primitive(it->second.type);
-              if (
-                prim &&
-                ((type->front() == DefaultInt && prim->in(integer_types)) ||
-                 (type->front() == DefaultFloat && prim->in(float_types))))
+              if (prim && prim->in(integer_types))
                 type = clone(it->second.type);
             }
+            if (!type)
+              type = angelic_int();
+          }
+          else if (type_tok == DefaultFloat)
+          {
+            auto it = env.find(dst->location());
+            if (it != env.end() && !is_angelic(it->second.type) &&
+                !is_default_type(it->second.type))
+            {
+              auto prim = extract_primitive(it->second.type);
+              if (prim && prim->in(float_types))
+                type = clone(it->second.type);
+            }
+            if (!type)
+              type = angelic_float();
+          }
+          else
+          {
+            type = primitive_or_ffi_type(type_tok->type());
           }
           merge(dst->location(), type);
         }
@@ -1917,8 +1993,11 @@ namespace vc
           auto src_it = env.find((stmt / Rhs)->location());
           if (src_it != env.end())
           {
-            if (is_default_type(src_it->second.type))
+            if (is_default_type(src_it->second.type) ||
+                is_angelic(src_it->second.type))
             {
+              // Propagate angelic/default unchanged — method
+              // resolution happens when backward narrows it.
               merge(dst_loc, clone(src_it->second.type));
             }
             else
@@ -2902,6 +2981,9 @@ namespace vc
       while (dequeue(label, dir))
       {
         wl_iters++;
+        if (wl_iters % 100 == 0)
+          std::cerr << wl_iters << " q" << worklist.size()
+                    << " l" << label << "\n";
 
         if (wl_iters > n * MAX_ITERS_PER_LABEL)
         {
@@ -3084,7 +3166,8 @@ namespace vc
                 auto env_it = label_exit.find(loc);
                 if (env_it == label_exit.end())
                   continue;
-                if (!is_default_type(env_it->second.type))
+                if (!is_default_type(env_it->second.type) &&
+                    !is_angelic(env_it->second.type))
                   continue;
 
                 // Search for backward constraint: direct, then
@@ -3170,11 +3253,25 @@ namespace vc
                 if (!prim)
                   continue;
 
-                bool compat =
-                  (env_it->second.type->front() == DefaultInt &&
-                   prim->in(integer_types)) ||
-                  (env_it->second.type->front() == DefaultFloat &&
-                   prim->in(float_types));
+                bool compat = false;
+                if (is_angelic(env_it->second.type))
+                {
+                  auto bound = env_it->second.type->front()->front();
+                  if (bound == DefaultInt)
+                    compat = prim && prim->in(integer_types);
+                  else if (bound == DefaultFloat)
+                    compat = prim && prim->in(float_types);
+                  else
+                    compat = true;
+                }
+                else
+                {
+                  compat =
+                    (env_it->second.type->front() == DefaultInt &&
+                     prim->in(integer_types)) ||
+                    (env_it->second.type->front() == DefaultFloat &&
+                     prim->in(float_types));
+                }
                 if (!compat)
                   continue;
 
@@ -3235,7 +3332,8 @@ namespace vc
                 if (exit_it != fwd_exit[label].end())
                 {
                   if (
-                    is_default_type(exit_it->second.type) &&
+                    (is_default_type(exit_it->second.type) ||
+                     is_angelic(exit_it->second.type)) &&
                     !is_default_type(info.type))
                   {
                     exit_it->second.type = clone(info.type);
@@ -3319,45 +3417,63 @@ namespace vc
             if (!fwd_type || fwd_type->empty())
               continue;
             auto fwd_front = fwd_type->front();
-            if (!fwd_front->in({DefaultInt, DefaultFloat, TypeVar}))
+
+            // Check for unresolved forward types.
+            bool is_fwd_angelic = is_angelic(fwd_type);
+            bool is_fwd_default = fwd_front->in({DefaultInt, DefaultFloat});
+            bool is_fwd_typevar = fwd_front == TypeVar;
+            if (!is_fwd_angelic && !is_fwd_default && !is_fwd_typevar)
               continue;
 
             if (!bwd_type || bwd_type->empty())
               continue;
             auto bwd_front = bwd_type->front();
 
-            // DefaultInt/DefaultFloat: only refine from a single
-            // compatible concrete primitive (not Union — that's
-            // genuinely ambiguous, e.g. literal 42 used as both
-            // i32 and string).
-            // TypeVar: refine from ANY concrete type including
-            // Union/Isect — the backward constraint IS the inferred
-            // type for generic type parameters.
-            if (fwd_front->in({DefaultInt, DefaultFloat}))
+            // Skip if backward is also unresolved.
+            if (
+              is_angelic(bwd_type) || is_default_type(bwd_type) ||
+              bwd_front == TypeVar)
+              continue;
+
+            bool do_refine = false;
+
+            if (is_fwd_angelic)
             {
-              if (bwd_front->in(
-                    {DefaultInt, DefaultFloat, TypeVar, Union, Isect}))
-                continue;
+              // Angelic: any concrete type within the bound.
+              auto bound = fwd_type->front()->front();
+              if (bound == DefaultInt)
+              {
+                auto p = extract_primitive(bwd_type);
+                do_refine = p && p->in(integer_types);
+              }
+              else if (bound == DefaultFloat)
+              {
+                auto p = extract_primitive(bwd_type);
+                do_refine = p && p->in(float_types);
+              }
+              else
+              {
+                // General bound — any concrete.
+                do_refine = true;
+              }
             }
-            else
+            else if (is_fwd_default)
             {
-              // TypeVar: skip only if backward is also unresolved.
-              if (bwd_front->in({DefaultInt, DefaultFloat, TypeVar}))
+              if (bwd_front->in({Union, Isect}))
                 continue;
+              auto prim = extract_primitive(bwd_type);
+              if (prim)
+                do_refine =
+                  (fwd_front == DefaultInt && prim->in(integer_types)) ||
+                  (fwd_front == DefaultFloat && prim->in(float_types));
+            }
+            else if (is_fwd_typevar)
+            {
+              do_refine = true;
             }
 
-            if (fwd_front == DefaultInt)
-            {
-              auto prim = extract_primitive(bwd_type);
-              if (!prim || !prim->in(integer_types))
-                continue;
-            }
-            else if (fwd_front == DefaultFloat)
-            {
-              auto prim = extract_primitive(bwd_type);
-              if (!prim || !prim->in(float_types))
-                continue;
-            }
+            if (!do_refine)
+              continue;
 
             fwd_it->second.type = clone(bwd_type);
             enqueue(label, Direction::Forward);
@@ -3567,7 +3683,8 @@ namespace vc
             auto env_it = fwd_exit[i].find(loc);
             if (
               env_it != fwd_exit[i].end() &&
-              !is_default_type(env_it->second.type))
+              !is_default_type(env_it->second.type) &&
+              !is_angelic(env_it->second.type))
               final_type = env_it->second.type;
 
             if (!final_type)
@@ -3575,7 +3692,8 @@ namespace vc
               auto bwd_it = bwd[i].find(loc);
               if (
                 bwd_it != bwd[i].end() &&
-                !is_default_type(bwd_it->second.type))
+                !is_default_type(bwd_it->second.type) &&
+                !is_angelic(bwd_it->second.type))
                 final_type = bwd_it->second.type;
             }
 
@@ -3922,8 +4040,24 @@ namespace vc
       gi.top = top;
       gi.run();
 
-      // Sweep: DefaultInt -> u64, DefaultFloat -> f64.
+      // Sweep: AngelicSubtype -> default, DefaultInt -> u64,
+      // DefaultFloat -> f64.
       top->traverse([](Node& node) {
+        if (node == AngelicSubtype)
+        {
+          auto parent = node->parent();
+          if (parent && !node->empty())
+          {
+            auto bound = node->front();
+            if (bound == DefaultInt)
+              parent->replace(node, primitive_type(U64)->front());
+            else if (bound == DefaultFloat)
+              parent->replace(node, primitive_type(F64)->front());
+            else
+              parent->replace(node, clone(bound));
+          }
+          return false;
+        }
         if (node->in({DefaultInt, DefaultFloat}))
         {
           auto parent = node->parent();
