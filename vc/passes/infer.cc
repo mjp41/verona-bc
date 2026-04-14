@@ -1434,6 +1434,9 @@ namespace vc
         for (auto s : succ[i])
           pred[s].push_back(i);
 
+      // Compute RPO ordering for worklist scheduling.
+      compute_rpo();
+
       // Build per-function def stmts.
       for (auto& [func, range] : func_label_range)
       {
@@ -1446,6 +1449,40 @@ namespace vc
               defs[stmt->front()->location()] = stmt;
         }
       }
+    }
+
+    // RPO index for each label (lower = earlier in RPO).
+    std::vector<size_t> rpo_index;
+
+    void compute_rpo()
+    {
+      size_t n = labels.size();
+      rpo_index.resize(n, 0);
+      std::vector<bool> visited(n, false);
+      std::vector<size_t> post_order;
+      post_order.reserve(n);
+
+      // DFS from each function's entry label.
+      std::function<void(size_t)> dfs = [&](size_t u) {
+        if (visited[u])
+          return;
+        visited[u] = true;
+        for (auto s : succ[u])
+          dfs(s);
+        post_order.push_back(u);
+      };
+
+      for (auto& [func, range] : func_label_range)
+        dfs(range.first);
+
+      // Any unreachable labels.
+      for (size_t i = 0; i < n; i++)
+        if (!visited[i])
+          post_order.push_back(i);
+
+      // Reverse post-order: reverse the post_order list.
+      for (size_t i = 0; i < post_order.size(); i++)
+        rpo_index[post_order[post_order.size() - 1 - i]] = i;
     }
 
     size_t size() const
@@ -2643,8 +2680,11 @@ namespace vc
       return changed;
     }
 
-    // Direction-aware worklist.
-    std::deque<size_t> worklist;
+    // RPO-ordered worklist. Labels are processed in reverse
+    // post-order (lower RPO index first). This ensures forward
+    // types are computed before successors need them, and backward
+    // constraints reach predecessors before they process.
+    std::set<size_t> worklist_set; // ordered by RPO via comparator below
     std::map<size_t, Direction> worklist_dir;
 
     void enqueue(size_t label, Direction dir)
@@ -2652,13 +2692,11 @@ namespace vc
       auto it = worklist_dir.find(label);
       if (it == worklist_dir.end())
       {
-        worklist.push_back(label);
+        worklist_set.insert(label);
         worklist_dir[label] = dir;
       }
       else
       {
-        // Merge directions: if already queued in a different direction,
-        // upgrade to Both.
         if (it->second != dir)
           it->second = Direction::Both;
       }
@@ -2666,10 +2704,21 @@ namespace vc
 
     bool dequeue(size_t& label, Direction& dir)
     {
-      if (worklist.empty())
+      if (worklist_set.empty())
         return false;
-      label = worklist.front();
-      worklist.pop_front();
+      // Pick the label with the lowest RPO index.
+      size_t best = *worklist_set.begin();
+      size_t best_rpo = cfg.rpo_index[best];
+      for (auto l : worklist_set)
+      {
+        if (cfg.rpo_index[l] < best_rpo)
+        {
+          best = l;
+          best_rpo = cfg.rpo_index[l];
+        }
+      }
+      label = best;
+      worklist_set.erase(best);
       auto it = worklist_dir.find(label);
       dir = it->second;
       worklist_dir.erase(it);
