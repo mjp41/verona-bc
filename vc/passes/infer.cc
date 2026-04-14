@@ -2553,7 +2553,9 @@ namespace vc
                 }
               }
 
-              if (!is_default_type(resolve_type))
+              // Only resolve and push param types when we found
+              // a concrete target_prim. Otherwise leave unresolved.
+              if (resolve_type && !is_default_type(resolve_type))
               {
                 auto info = resolve_callable_method(
                   top,
