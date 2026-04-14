@@ -2935,6 +2935,21 @@ namespace vc
           for (auto& [loc, info] : fwd[label])
             label_exit[loc] = {clone(info.type), info.call_node};
 
+          // Also seed from fwd_exit[label] — locally-defined
+          // variables refined by a prior backward pass should
+          // survive the forward re-run.
+          for (auto& [loc, info] : fwd_exit[label])
+          {
+            if (!is_default_type(info.type))
+            {
+              auto it = label_exit.find(loc);
+              if (it == label_exit.end())
+                label_exit[loc] = {clone(info.type), info.call_node};
+              else if (is_default_type(it->second.type))
+                it->second.type = clone(info.type);
+            }
+          }
+
           // Clear per-label tuple tracking.
           tuple_locals.clear();
 
@@ -3039,8 +3054,7 @@ namespace vc
           TypeEnv bwd_entry;
           // Seed with existing bwd constraints for this label.
           for (auto& [loc, info] : bwd[label])
-            bwd_entry[loc] = {clone(info.type), info.call_node};
-
+            bwd_entry[loc] = {clone(info.type), info.call_node}; 
           backward_pass(label_exit, bwd_entry, bwd[label], body);
 
           // ---- Local refinement re-pass ----
@@ -3210,8 +3224,11 @@ namespace vc
             }
             else
             {
-              // No refinement — merge backward-refined env into
-              // fwd_exit for finalization.
+              // No re-pass refinement — merge backward-refined env
+              // into fwd_exit for finalization. If any defaults were
+              // refined, re-enqueue forward so the next run seeds
+              // from the refined fwd_exit.
+              bool bwd_refined = false;
               for (auto& [loc, info] : label_exit)
               {
                 auto exit_it = fwd_exit[label].find(loc);
@@ -3220,9 +3237,14 @@ namespace vc
                   if (
                     is_default_type(exit_it->second.type) &&
                     !is_default_type(info.type))
+                  {
                     exit_it->second.type = clone(info.type);
+                    bwd_refined = true;
+                  }
                 }
               }
+              if (bwd_refined)
+                enqueue(label, Direction::Forward);
             }
           }
 
