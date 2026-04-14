@@ -152,22 +152,36 @@ After processing forward and backward for a label, for each location
 in `fwd[i]` (the entry state):
 - If `fwd` is `DefaultInt`/`DefaultFloat` and `bwd` is a compatible
   **single concrete** type, refine `fwd` to `bwd`.
-- If `fwd` is `TypeVar` and `bwd` is a single concrete type, refine
-  `fwd` to `bwd`.
+- If `fwd` is `TypeVar` and `bwd` is any concrete type (including
+  Union/Isect), refine `fwd` to `bwd`. This handles generic type
+  parameters where multiple call sites constrain T to different
+  types — the Union IS the inferred type.
 - Refinement changes `fwd[i]`, which triggers forward requeueing.
 
-**Union backward constraints do NOT trigger refinement.** If backward
-derives `Union(i32, string)` for a DefaultInt location, refinement does
-not fire — the constraints are ambiguous. The DefaultInt will fall
-through to the default sweep (`DefaultInt → u64`) at the end. If a
-use site expects a specific type from that union, it will produce a
-type error during finalization. This is correct: a literal `42` used
-as both i32 and string is a genuine ambiguity.
+**Union backward constraints do NOT trigger refinement for
+DefaultInt/DefaultFloat.** If backward derives `Union(i32, string)`
+for a DefaultInt location, refinement does not fire — the constraints
+are ambiguous. The DefaultInt will fall through to the default sweep
+(`DefaultInt → u64`) at the end. However, Union backward constraints
+DO trigger refinement for TypeVar, because the union is the correct
+inferred type for a generic parameter.
 
-"Compatible single concrete" means: the backward type is a single
-primitive type (not a Union, not TypeVar, not DefaultInt/DefaultFloat),
-and the Default type is compatible with it (`DefaultInt` with integer
-types, `DefaultFloat` with float types).
+This distinction is a consequence of the asymmetric semantics of
+Default vs TypeVar: Defaults have a known fallback (u64/f64) and
+represent literals that should resolve to a single type. TypeVars
+represent genuinely unknown types that accumulate constraints.
+
+**Phase 2 note**: This distinction will be eliminated by the
+uniform bounded type variable representation (see "Uniform bounded
+type variables" in Deferred Optimizations). Under that model, the
+upper bound of DefaultInt constrains which backward types are
+compatible, and the check becomes simply `lower ⊆ upper`.
+
+"Compatible single concrete" (for DefaultInt/DefaultFloat) means:
+the backward type is a single primitive type (not a Union, not
+TypeVar, not DefaultInt/DefaultFloat), and the Default type is
+compatible with it (`DefaultInt` with integer types,
+`DefaultFloat` with float types).
 
 #### Intra-label refinement (local definitions)
 
@@ -1179,6 +1193,36 @@ These items are noted for Phase 2 (after correctness is validated):
    during inference for the same method, cache misses or stale results
    will occur. Current key uses owner + name + hand + arity but NOT
    TypeArgs — this may need augmentation.
+
+7. **Uniform bounded type variables**: Replace the three separate
+   concepts (DefaultInt, DefaultFloat, TypeVar) with a single
+   `BoundedVar { upper, lower, default }` representation:
+
+   | Current      | Upper bound              | Lower bound | Default |
+   |--------------|--------------------------|-------------|---------|
+   | DefaultInt   | Union(i8,...,usize)       | bottom      | u64     |
+   | DefaultFloat | Union(f32, f64)           | bottom      | f64     |
+   | TypeVar      | top (any)                 | bottom      | error   |
+
+   Then all merge/refinement logic becomes uniform:
+   - Forward merge = widen upper bound (union with incoming)
+   - Backward merge = widen lower bound (union with constraint)
+   - Refinement = when `lower ⊆ upper` and `lower ≠ bottom`,
+     resolved type = lower
+   - Finalization = if still `lower = bottom`, use default
+     (u64 / f64 / report error)
+   - `merge_type` compatibility = just `incoming <: upper`
+
+   This eliminates all `is_default_type` / `extract_primitive` /
+   `integer_types` / `float_types` special-case machinery from
+   `merge_type`, the refinement step, and finalization. Estimated
+   ~30% code reduction in the type lattice and refinement logic.
+
+   Convergence is preserved: upper bounds only widen (monotone),
+   lower bounds only widen (monotone), and refinement fires at
+   most once per (label, location) because once lower is non-bottom
+   and compatible, the type becomes concrete and `merge_type`
+   absorbs further Default/TypeVar arrivals.
 
 ### Adversarial Review: Resolved Findings
 
