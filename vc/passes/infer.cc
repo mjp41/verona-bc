@@ -2309,6 +2309,7 @@ namespace vc
 
           auto args = stmt / Args;
           auto params = func_def / Params;
+          auto ret_type = func_def / Type;
 
           NodeMap<Node> subst;
           for (auto& scope : scopes)
@@ -2318,6 +2319,54 @@ namespace vc
             if (!ta->empty() && ta->size() == tps->size())
               for (size_t i = 0; i < tps->size(); i++)
                 subst[tps->at(i)] = ta->at(i);
+          }
+
+          // Check if the Call result has a backward constraint
+          // that can refine TypeArgs.
+          auto dst_loc = (stmt / LocalId)->location();
+          {
+            Node bwd_result;
+            auto be_it = bwd_entry.find(dst_loc);
+            if (
+              be_it != bwd_entry.end() &&
+              !is_default_type(be_it->second.type) &&
+              !is_uninformative_backward_type(be_it->second.type))
+              bwd_result = be_it->second.type;
+            if (!bwd_result)
+            {
+              auto bx_it = bwd_exit.find(dst_loc);
+              if (
+                bx_it != bwd_exit.end() &&
+                !is_default_type(bx_it->second.type) &&
+                !is_uninformative_backward_type(bx_it->second.type))
+                bwd_result = bx_it->second.type;
+            }
+
+            if (bwd_result && ret_type->front() != TypeVar)
+            {
+              // Extract TypeParam constraints from return type
+              // vs backward constraint.
+              NodeMap<LocalTypeInfo> constraints;
+              extract_constraints(
+                top,
+                ret_type->front(),
+                bwd_result->front(),
+                constraints,
+                false);
+
+              // Update substitution with new constraints.
+              for (auto& scope : scopes)
+              {
+                auto tps = scope.def / TypeParams;
+                for (auto& tp : *tps)
+                {
+                  auto find = constraints.find(tp);
+                  if (find != constraints.end() &&
+                      !is_default_type(find->second.type))
+                    subst[tp] = find->second.type;
+                }
+              }
+            }
           }
 
           for (size_t i = 0; i < params->size() && i < args->size(); i++)
@@ -3121,6 +3170,16 @@ namespace vc
 
             fwd_it->second.type = clone(bwd_type);
             enqueue(label, Direction::Forward);
+
+            // If this location was produced by a Call/CallDyn,
+            // also enqueue the label backward so the backward
+            // handler can propagate the refined type through
+            // the call (e.g., re-infer TypeArgs from the now-
+            // concrete return type constraint).
+            if (fwd_it->second.call_node)
+            {
+              enqueue(label, Direction::Backward);
+            }
           }
         }
       }
