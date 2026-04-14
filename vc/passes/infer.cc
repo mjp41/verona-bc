@@ -2335,6 +2335,7 @@ namespace vc
         }
         else if (stmt->in({CallDyn, TryCallDyn}))
         {
+          auto dst_loc = (stmt / LocalId)->location();
           auto src_loc = (stmt / Rhs)->location();
           auto args = stmt / Args;
 
@@ -2342,39 +2343,101 @@ namespace vc
           if (lookup_it != lookup_stmts.end())
           {
             auto lookup_node = lookup_it->second;
-            auto recv_it = env.find((lookup_node / Rhs)->location());
-            if (
-              recv_it != env.end() &&
-              !is_default_type(recv_it->second.type))
+            auto recv_loc = (lookup_node / Rhs)->location();
+            auto recv_it = env.find(recv_loc);
+            if (recv_it != env.end())
             {
               auto hand = (lookup_node / Lhs)->type();
               auto method_ident = lookup_method_name(lookup_node);
               auto method_ta = lookup_node / TypeArgs;
               auto arity = from_chars_sep_v<size_t>(lookup_node / Int);
-              auto info = resolve_callable_method(
-                top,
-                recv_it->second.type,
-                method_ident,
-                hand,
-                arity,
-                method_ta);
-              if (info.func)
+
+              Node resolve_type = recv_it->second.type;
+
+              // If receiver is default-typed, try to determine the
+              // concrete type from backward constraints or args.
+              if (is_default_type(resolve_type))
               {
-                auto params = info.func / Params;
-                for (
-                  size_t i = 0;
-                  i < params->size() && i < args->size();
-                  i++)
+                // Check if the CallDyn result has a backward
+                // constraint (from a downstream Call param type).
+                Node target_prim;
+                auto be_it = bwd_entry.find(dst_loc);
+                if (be_it != bwd_entry.end())
+                  target_prim = extract_primitive(be_it->second.type);
+                if (!target_prim)
                 {
-                  auto expected =
-                    apply_subst(top, params->at(i) / Type, info.subst);
-                  if (
-                    expected && expected->front() != TypeVar &&
-                    !is_uninformative_backward_type(expected))
+                  auto bx_it = bwd_exit.find(dst_loc);
+                  if (bx_it != bwd_exit.end())
+                    target_prim = extract_primitive(bx_it->second.type);
+                }
+
+                // Check if any arg has a concrete type.
+                if (!target_prim)
+                {
+                  for (auto& arg_node : *args)
                   {
-                    auto arg_loc = (args->at(i) / Rhs)->location();
-                    snmalloc::UNUSED(refine_local_const(arg_loc, expected));
-                    snmalloc::UNUSED(merge_bwd(arg_loc, expected));
+                    auto arg_it =
+                      env.find((arg_node / Rhs)->location());
+                    if (
+                      arg_it != env.end() &&
+                      !is_default_type(arg_it->second.type))
+                    {
+                      target_prim =
+                        extract_callable_primitive(arg_it->second.type);
+                      if (target_prim)
+                        break;
+                    }
+                  }
+                }
+
+                if (target_prim)
+                {
+                  bool compat =
+                    (resolve_type->front() == DefaultInt &&
+                     target_prim->in(integer_types)) ||
+                    (resolve_type->front() == DefaultFloat &&
+                     target_prim->in(float_types));
+                  if (compat)
+                  {
+                    resolve_type =
+                      primitive_or_ffi_type(target_prim->type());
+                    // Refine the receiver and its Const.
+                    snmalloc::UNUSED(
+                      refine_local_const(recv_loc, resolve_type));
+                    snmalloc::UNUSED(
+                      merge_bwd(recv_loc, clone(resolve_type)));
+                  }
+                }
+              }
+
+              if (!is_default_type(resolve_type))
+              {
+                auto info = resolve_callable_method(
+                  top,
+                  resolve_type,
+                  method_ident,
+                  hand,
+                  arity,
+                  method_ta);
+                if (info.func)
+                {
+                  auto params = info.func / Params;
+                  for (
+                    size_t i = 0;
+                    i < params->size() && i < args->size();
+                    i++)
+                  {
+                    auto expected =
+                      apply_subst(top, params->at(i) / Type, info.subst);
+                    if (
+                      expected && expected->front() != TypeVar &&
+                      !is_uninformative_backward_type(expected))
+                    {
+                      auto arg_loc = (args->at(i) / Rhs)->location();
+                      snmalloc::UNUSED(
+                        refine_local_const(arg_loc, expected));
+                      snmalloc::UNUSED(merge_bwd(arg_loc, expected));
+                    }
                   }
                 }
               }
