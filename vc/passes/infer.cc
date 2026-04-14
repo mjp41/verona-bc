@@ -3153,212 +3153,9 @@ namespace vc
             bwd_entry[loc] = {clone(info.type), info.call_node}; 
           backward_pass(label_exit, bwd_entry, bwd[label], body);
 
-          // ---- Local refinement re-pass ----
-          // Refine locally-defined Default types from bwd_entry,
-          // then re-run forward and re-push to successors.
-          // Also traces backward through Copy/Move chains to
-          // propagate constraints to source Consts.
-          {
-            bool refined = false;
-
-            // Build a reverse Copy map: dst → src.
-            std::map<Location, Location> copy_src;
-            for (auto& stmt : *body)
-            {
-              if (stmt->in({Copy, Move}))
-                copy_src[(stmt / LocalId)->location()] =
-                  (stmt / Rhs)->location();
-            }
-
-            // For each locally-defined Default, trace backward
-            // through Copy chains to find a backward constraint.
-            for (auto& stmt : *body)
-            {
-              if (!stmt->empty() && stmt->front() == LocalId)
-              {
-                auto loc = stmt->front()->location();
-                auto env_it = label_exit.find(loc);
-                if (env_it == label_exit.end())
-                  continue;
-                if (!is_default_type(env_it->second.type) &&
-                    !is_angelic(env_it->second.type))
-                  continue;
-
-                // Search for backward constraint: direct, then
-                // through forward Copy chain destinations.
-                Node bwd_type;
-
-                // Direct check in bwd_entry.
-                auto be_it = bwd_entry.find(loc);
-                if (be_it != bwd_entry.end() &&
-                    !is_default_type(be_it->second.type))
-                  bwd_type = be_it->second.type;
-
-                // Walk forward through Copy destinations to find
-                // a backward constraint on any downstream location.
-                if (!bwd_type)
-                {
-                  // Build forward Copy map for this search.
-                  std::multimap<Location, Location> copy_dst;
-                  for (auto& s2 : *body)
-                  {
-                    if (s2->in({Copy, Move}))
-                      copy_dst.emplace(
-                        (s2 / Rhs)->location(),
-                        (s2 / LocalId)->location());
-                  }
-
-                  std::deque<Location> trace_work;
-                  std::set<Location> trace_seen;
-                  trace_work.push_back(loc);
-                  trace_seen.insert(loc);
-                  while (!trace_work.empty() && !bwd_type)
-                  {
-                    auto cur = trace_work.front();
-                    trace_work.pop_front();
-                    auto [tb, te] = copy_dst.equal_range(cur);
-                    for (auto ti = tb; ti != te; ++ti)
-                    {
-                      auto& dst = ti->second;
-                      if (!trace_seen.insert(dst).second)
-                        continue;
-                      auto be2 = bwd_entry.find(dst);
-                      if (be2 != bwd_entry.end() &&
-                          !is_default_type(be2->second.type))
-                      {
-                        bwd_type = be2->second.type;
-                        break;
-                      }
-                      trace_work.push_back(dst);
-                    }
-                  }
-                }
-
-                // Check bwd[label] and cross-label bwd.
-                if (!bwd_type)
-                {
-                  auto bl_it = bwd[label].find(loc);
-                  if (bl_it != bwd[label].end() &&
-                      !is_default_type(bl_it->second.type))
-                    bwd_type = bl_it->second.type;
-                }
-                if (!bwd_type)
-                {
-                  auto [fb, fe] =
-                    cfg.func_label_range[li.function];
-                  for (size_t j = fb; j < fe; j++)
-                  {
-                    if (j == label)
-                      continue;
-                    auto bj_it = bwd[j].find(loc);
-                    if (bj_it != bwd[j].end() &&
-                        !is_default_type(bj_it->second.type))
-                    {
-                      bwd_type = bj_it->second.type;
-                      break;
-                    }
-                  }
-                }
-
-                if (!bwd_type)
-                  continue;
-
-                auto prim = extract_primitive(bwd_type);
-                if (!prim)
-                  continue;
-
-                bool compat = false;
-                if (is_angelic(env_it->second.type))
-                {
-                  auto bound = env_it->second.type->front()->front();
-                  if (bound == DefaultInt)
-                    compat = prim && prim->in(integer_types);
-                  else if (bound == DefaultFloat)
-                    compat = prim && prim->in(float_types);
-                  else
-                    compat = true;
-                }
-                else
-                {
-                  compat =
-                    (is_default_int(env_it->second.type) &&
-                     prim->in(integer_types)) ||
-                    (is_default_float(env_it->second.type) &&
-                     prim->in(float_types));
-                }
-                if (!compat)
-                  continue;
-
-                env_it->second.type = clone(bwd_type);
-                refined = true;
-              }
-            }
-
-            if (refined)
-            {
-              // Re-run forward with refined types.
-              tuple_locals.clear();
-              forward_pass(label_exit, body, li.function);
-              fwd_exit[label] = label_exit;
-
-              // Re-push to successors.
-              if (term == Cond)
-              {
-                auto trace2 = trace_typetest(term / LocalId, body);
-                auto& fi = cfg.func_label_idx[li.function];
-                auto ti = fi.find(
-                  std::string((term / Lhs)->location().view()));
-                auto ffi = fi.find(
-                  std::string((term / Rhs)->location().view()));
-                for (auto& [l2, i2] : label_exit)
-                {
-                  if (trace2 && l2 == trace2->src->location())
-                    continue;
-                  if (ti != fi.end())
-                    if (push(fwd[ti->second], l2, i2.type, i2.call_node))
-                      enqueue(ti->second, Direction::Forward);
-                  if (ffi != fi.end())
-                    if (push(fwd[ffi->second], l2, i2.type, i2.call_node))
-                      enqueue(ffi->second, Direction::Forward);
-                }
-              }
-              else if (term == Jump)
-              {
-                auto& fi = cfg.func_label_idx[li.function];
-                auto ti = fi.find(
-                  std::string((term / LabelId)->location().view()));
-                if (ti != fi.end())
-                  for (auto& [l2, i2] : label_exit)
-                    if (push(fwd[ti->second], l2, i2.type, i2.call_node))
-                      enqueue(ti->second, Direction::Forward);
-              }
-            }
-            else
-            {
-              // No re-pass refinement — merge backward-refined env
-              // into fwd_exit for finalization. If any defaults were
-              // refined, re-enqueue forward so the next run seeds
-              // from the refined fwd_exit.
-              bool bwd_refined = false;
-              for (auto& [loc, info] : label_exit)
-              {
-                auto exit_it = fwd_exit[label].find(loc);
-                if (exit_it != fwd_exit[label].end())
-                {
-                  if (
-                    (is_default_type(exit_it->second.type) ||
-                     is_angelic(exit_it->second.type)) &&
-                    !is_default_type(info.type))
-                  {
-                    exit_it->second.type = clone(info.type);
-                    bwd_refined = true;
-                  }
-                }
-              }
-              if (bwd_refined)
-                enqueue(label, Direction::Forward);
-            }
-          }
+          // Update fwd_exit with backward-refined types so the
+          // refinement step (which reads fwd_exit) sees them.
+          fwd_exit[label] = label_exit;
 
           // Merge locally-derived backward constraints back into
           // bwd[label] so the refinement step can see them.
@@ -3408,24 +3205,36 @@ namespace vc
         }
 
         // ---- Refinement ----
-        // For each location in fwd[label] (entry env), check if bwd
-        // has a compatible concrete type that can refine Default/TypeVar.
+        // For each unresolved type in BOTH fwd[label] (entry env)
+        // AND fwd_exit[label] (locally-defined vars), check if bwd
+        // has a compatible concrete constraint.
         {
-          std::vector<Location> fwd_locs;
-          fwd_locs.reserve(fwd[label].size());
+          // Collect locations from both entry and exit envs.
+          std::set<Location> all_locs;
           for (auto& [loc, info] : fwd[label])
-            fwd_locs.push_back(loc);
+            all_locs.insert(loc);
+          for (auto& [loc, info] : fwd_exit[label])
+            all_locs.insert(loc);
 
-          for (auto& loc : fwd_locs)
+          for (auto& loc : all_locs)
           {
-            auto fwd_it = fwd[label].find(loc);
-            if (fwd_it == fwd[label].end())
+            // Find the type — prefer exit (has local defs), fall
+            // back to entry.
+            LocalTypeInfo* fwd_info = nullptr;
+            auto exit_it = fwd_exit[label].find(loc);
+            auto entry_it = fwd[label].find(loc);
+            if (exit_it != fwd_exit[label].end())
+              fwd_info = &exit_it->second;
+            else if (entry_it != fwd[label].end())
+              fwd_info = &entry_it->second;
+            if (!fwd_info)
               continue;
+
             auto bwd_it = bwd[label].find(loc);
             if (bwd_it == bwd[label].end())
               continue;
 
-            auto& fwd_type = fwd_it->second.type;
+            auto& fwd_type = fwd_info->type;
             auto& bwd_type = bwd_it->second.type;
 
             if (!fwd_type || fwd_type->empty())
@@ -3489,18 +3298,17 @@ namespace vc
             if (!do_refine)
               continue;
 
-            fwd_it->second.type = clone(bwd_type);
+            fwd_info->type = clone(bwd_type);
+            // Also update entry env if present.
+            if (entry_it != fwd[label].end())
+              entry_it->second.type = clone(bwd_type);
+            // Also update exit env if present.
+            if (exit_it != fwd_exit[label].end())
+              exit_it->second.type = clone(bwd_type);
             enqueue(label, Direction::Forward);
 
-            // If this location was produced by a Call/CallDyn,
-            // also enqueue the label backward so the backward
-            // handler can propagate the refined type through
-            // the call (e.g., re-infer TypeArgs from the now-
-            // concrete return type constraint).
-            if (fwd_it->second.call_node)
-            {
+            if (fwd_info->call_node)
               enqueue(label, Direction::Backward);
-            }
           }
         }
       }
