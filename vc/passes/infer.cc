@@ -2283,13 +2283,15 @@ namespace vc
           if (dst_it != env.end())
           {
             Node expected = dst_it->second.type;
-            // Check bwd_entry (locally accumulated), then bwd_exit.
+            // Check bwd_entry (locally accumulated), then bwd_exit
+            // for a concrete override.
             auto be_it = bwd_entry.find(dst_loc);
             if (
               be_it != bwd_entry.end() && be_it->second.type &&
               !be_it->second.type->empty() &&
               !be_it->second.type->front()->in(
-                {TypeVar, DefaultInt, DefaultFloat, Union}))
+                {TypeVar, DefaultInt, DefaultFloat,
+                 AngelicSubtype, Union}))
               expected = be_it->second.type;
             else
             {
@@ -2298,12 +2300,17 @@ namespace vc
                 bx_it != bwd_exit.end() && bx_it->second.type &&
                 !bx_it->second.type->empty() &&
                 !bx_it->second.type->front()->in(
-                  {TypeVar, DefaultInt, DefaultFloat, Union}))
+                  {TypeVar, DefaultInt, DefaultFloat,
+                   AngelicSubtype, Union}))
                 expected = bx_it->second.type;
             }
 
-            snmalloc::UNUSED(refine_local_const(src_loc, expected));
-            snmalloc::UNUSED(merge_bwd(src_loc, expected));
+            // Only push if expected is concrete (not Angelic/Default).
+            if (!is_default_type(expected) && !is_angelic(expected))
+            {
+              snmalloc::UNUSED(refine_local_const(src_loc, expected));
+              snmalloc::UNUSED(merge_bwd(src_loc, expected));
+            }
           }
         }
         else if (stmt == Load)
@@ -3305,7 +3312,9 @@ namespace vc
             // Also update exit env if present.
             if (exit_it != fwd_exit[label].end())
               exit_it->second.type = clone(bwd_type);
-            enqueue(label, Direction::Forward);
+
+            // Re-enqueue this label to re-run forward/backward.
+            enqueue(label, Direction::Both);
 
             if (fwd_info->call_node)
               enqueue(label, Direction::Backward);
