@@ -50,8 +50,12 @@
 //   After processing a label, for each location in fwd[i]:
 //   - If fwd is DefaultInt/DefaultFloat and bwd is a compatible single
 //     concrete type, refine fwd to bwd. Enqueue label Forward.
-//   - If fwd is TypeVar and bwd is a single concrete type, same.
-//   - Union backward constraints do NOT trigger refinement.
+//     Union backward constraints do NOT trigger refinement for Defaults
+//     (ambiguous literal: e.g. 42 used as both i32 and string).
+//   - If fwd is TypeVar and bwd is any concrete type (including Union),
+//     refine fwd to bwd. This handles generic type parameters where
+//     multiple call sites constrain T to different types — the Union
+//     IS the inferred type.
 //
 // Convergence:
 //   Forward and backward are individually monotone (merge_type only
@@ -3018,9 +3022,26 @@ namespace vc
             if (!bwd_type || bwd_type->empty())
               continue;
             auto bwd_front = bwd_type->front();
-            if (bwd_front->in(
-                  {DefaultInt, DefaultFloat, TypeVar, Union, Isect}))
-              continue;
+
+            // DefaultInt/DefaultFloat: only refine from a single
+            // compatible concrete primitive (not Union — that's
+            // genuinely ambiguous, e.g. literal 42 used as both
+            // i32 and string).
+            // TypeVar: refine from ANY concrete type including
+            // Union/Isect — the backward constraint IS the inferred
+            // type for generic type parameters.
+            if (fwd_front->in({DefaultInt, DefaultFloat}))
+            {
+              if (bwd_front->in(
+                    {DefaultInt, DefaultFloat, TypeVar, Union, Isect}))
+                continue;
+            }
+            else
+            {
+              // TypeVar: skip only if backward is also unresolved.
+              if (bwd_front->in({DefaultInt, DefaultFloat, TypeVar}))
+                continue;
+            }
 
             if (fwd_front == DefaultInt)
             {
