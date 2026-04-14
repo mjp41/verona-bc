@@ -321,6 +321,14 @@ namespace vc
       return primitive_type(U64);
     if (type->front() == DefaultFloat)
       return primitive_type(F64);
+    if (type->front() == AngelicSubtype && !type->front()->empty())
+    {
+      auto bound = type->front()->front();
+      if (bound == DefaultInt)
+        return primitive_type(U64);
+      if (bound == DefaultFloat)
+        return primitive_type(F64);
+    }
     return type;
   }
 
@@ -390,6 +398,13 @@ namespace vc
       return U64;
     if (inner == DefaultFloat)
       return F64;
+    if (inner == AngelicSubtype && !inner->empty())
+    {
+      if (inner->front() == DefaultInt)
+        return U64;
+      if (inner->front() == DefaultFloat)
+        return F64;
+    }
     if (inner != TypeName)
       return {};
     auto first = (inner->front() / Ident)->location().view();
@@ -602,8 +617,8 @@ namespace vc
       if (prim)
       {
         bool compat =
-          (existing->front() == DefaultInt && prim->in(integer_types)) ||
-          (existing->front() == DefaultFloat && prim->in(float_types));
+          (is_default_int(existing) && prim->in(integer_types)) ||
+          (is_default_float(existing) && prim->in(float_types));
         if (compat)
           return clone(incoming);
       }
@@ -615,8 +630,8 @@ namespace vc
       if (prim)
       {
         bool compat =
-          (incoming->front() == DefaultInt && prim->in(integer_types)) ||
-          (incoming->front() == DefaultFloat && prim->in(float_types));
+          (is_default_int(incoming) && prim->in(integer_types)) ||
+          (is_default_float(incoming) && prim->in(float_types));
         if (compat)
           return {};
       }
@@ -1903,9 +1918,9 @@ namespace vc
           {
             auto rhs_prim = extract_callable_primitive(rhs_it->second.type);
             bool compatible = rhs_prim &&
-              ((lhs_it->second.type->front() == DefaultInt &&
+              ((is_default_int(lhs_it->second.type) &&
                 rhs_prim->in(integer_types)) ||
-               (lhs_it->second.type->front() == DefaultFloat &&
+               (is_default_float(lhs_it->second.type) &&
                 rhs_prim->in(float_types)));
             if (compatible)
             {
@@ -2219,9 +2234,9 @@ namespace vc
         if (!expected_prim)
           return false;
         auto current_prim = extract_primitive(env_it->second.type);
-        bool compatible = (env_it->second.type->front() == DefaultInt &&
+        bool compatible = (is_default_int(env_it->second.type) &&
                            expected_prim->in(integer_types)) ||
-          (env_it->second.type->front() == DefaultFloat &&
+          (is_default_float(env_it->second.type) &&
            expected_prim->in(float_types)) ||
           (current_prim && current_prim->in(integer_types) &&
            expected_prim->in(integer_types)) ||
@@ -2238,7 +2253,7 @@ namespace vc
       // merge_bwd: merge a backward constraint into bwd_entry.
       auto merge_bwd = [&](const Location& loc, const Node& type) -> bool {
         if (!type || type->empty() ||
-            type->front()->in({TypeVar, DefaultInt, DefaultFloat}))
+            type->front()->in({TypeVar, DefaultInt, DefaultFloat, AngelicSubtype}))
           return false;
         auto it = bwd_entry.find(loc);
         if (it == bwd_entry.end())
@@ -2521,9 +2536,9 @@ namespace vc
                 if (target_prim)
                 {
                   bool compat =
-                    (resolve_type->front() == DefaultInt &&
+                    (is_default_int(resolve_type) &&
                      target_prim->in(integer_types)) ||
-                    (resolve_type->front() == DefaultFloat &&
+                    (is_default_float(resolve_type) &&
                      target_prim->in(float_types));
                   if (compat)
                   {
@@ -2981,9 +2996,6 @@ namespace vc
       while (dequeue(label, dir))
       {
         wl_iters++;
-        if (wl_iters % 100 == 0)
-          std::cerr << wl_iters << " q" << worklist.size()
-                    << " l" << label << "\n";
 
         if (wl_iters > n * MAX_ITERS_PER_LABEL)
         {
@@ -3267,9 +3279,9 @@ namespace vc
                 else
                 {
                   compat =
-                    (env_it->second.type->front() == DefaultInt &&
+                    (is_default_int(env_it->second.type) &&
                      prim->in(integer_types)) ||
-                    (env_it->second.type->front() == DefaultFloat &&
+                    (is_default_float(env_it->second.type) &&
                      prim->in(float_types));
                 }
                 if (!compat)
@@ -3420,7 +3432,7 @@ namespace vc
 
             // Check for unresolved forward types.
             bool is_fwd_angelic = is_angelic(fwd_type);
-            bool is_fwd_default = fwd_front->in({DefaultInt, DefaultFloat});
+            bool is_fwd_default = is_default_type(fwd_type);
             bool is_fwd_typevar = fwd_front == TypeVar;
             if (!is_fwd_angelic && !is_fwd_default && !is_fwd_typevar)
               continue;
@@ -3464,8 +3476,8 @@ namespace vc
               auto prim = extract_primitive(bwd_type);
               if (prim)
                 do_refine =
-                  (fwd_front == DefaultInt && prim->in(integer_types)) ||
-                  (fwd_front == DefaultFloat && prim->in(float_types));
+                  (is_default_int(fwd_type) && prim->in(integer_types)) ||
+                  (is_default_float(fwd_type) && prim->in(float_types));
             }
             else if (is_fwd_typevar)
             {
@@ -3717,9 +3729,9 @@ namespace vc
                   if (prim)
                   {
                     bool compat =
-                      (env_it->second.type->front() == DefaultInt &&
+                      (is_default_int(env_it->second.type) &&
                        prim->in(integer_types)) ||
-                      (env_it->second.type->front() == DefaultFloat &&
+                      (is_default_float(env_it->second.type) &&
                        prim->in(float_types));
                     if (compat)
                     {
