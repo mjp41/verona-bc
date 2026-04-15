@@ -593,42 +593,81 @@ both `w.f: i32` and `z.f: Union(u32, u64)`.
 
 ## 8. Cross-Function Flow
 
-Forward and backward constraints flow across function boundaries.
-All functions share a single worklist; cross-function pushes use
-the same `push_fwd` / `push_bwd` as intra-function flow.
+Type inference is inter-procedural: constraints flow between
+caller and callee in both directions. All functions share a
+single worklist and use the same `push_fwd` (join) and
+`push_bwd` (meet) as intra-function flow.
 
-### 8.1 Forward: Caller → Callee
+### 8.1 The Principle
 
-- **`push_args_to_callee(f, args)`**: for each arg with TypeVar
-  param, push `fwd[callee_entry][param] ⊔= fwd[arg]`.
-- **`push_shape_to_lambda(shape, lambda)`**: push shape method
-  param types into lambda params, shape return type as callee
-  return constraint.
-
-### 8.2 Backward: Call-Site → Callee
-
-- **`push_return_constraint(f, T)`**: push `ub[return_label][ret] ⊓= T`
-  for each return label in callee.
-- **Call arg backward**: `ub[arg] ⊓= param_type(f)` — handled by
-  the backward Call handler within the same function.
-
-### 8.3 Backward: Callee → Caller (NOT YET IMPLEMENTED)
-
-When a callee's parameter acquires a backward constraint (e.g.,
-from a TryCallDyn inside a match lambda that resolves `v.==(42)`
-and narrows param `42` to `i32`), that constraint should propagate
-back to the caller's argument:
+Every cross-function edge carries information in BOTH directions:
 
 ```
-ub[caller_arg] ⊓= ub[callee_param]
+        Forward (⊔)              Backward (⊓)
+        ─────────→               ←─────────
+Caller  arg type                 param constraint
+        ─────────→               ←─────────
+Callee  param type               arg constraint
+
+        Forward (⊔)              Backward (⊓)
+        ←─────────               ─────────→
+Callee  return type              return constraint
+        ←─────────               ─────────→
+Caller  result type              result constraint
 ```
 
-This is the reverse of `push_args_to_callee`. Without it, match
-value literals captured as lambda parameters don't get backward-
-refined from their use sites inside the lambda.
+The two analyses are independent — forward flows arg→param and
+return→result; backward flows param_ub→arg and result_ub→return.
+They interact only through refinement (§5).
 
-All cross-function flows use the same meet (⊓) operator for
-backward and join (⊔) for forward.
+### 8.2 Call Sites
+
+For `dst = f(arg₁, ..., argₙ)` where `f` has params `p₁,...,pₙ`
+and return type `R`:
+
+| Direction | Source | Target | Rule |
+|-----------|--------|--------|------|
+| Forward | `fwd[argᵢ]` | `fwd[pᵢ]` at callee entry | `fwd[pᵢ] ⊔= fwd[argᵢ]` |
+| Forward | `fwd[return]` at callee | `fwd[dst]` at caller | `fwd[dst] ⊔= return_type(f)` |
+| Backward | `ub[dst]` at caller | `ub[return]` at callee | `ub[return] ⊓= ub[dst]` |
+| Backward | `ub[pᵢ]` at callee | `ub[argᵢ]` at caller | `ub[argᵢ] ⊓= ub[pᵢ]` |
+
+The last row is the **callee→caller backward** flow. When a
+callee's parameter acquires a backward constraint (e.g., from a
+method call inside the callee that constrains the parameter to
+`i32`), that constraint propagates back to narrow the caller's
+argument.
+
+### 8.3 Dynamic Dispatch (CallDyn/TryCallDyn)
+
+Same as §8.2, but the callee is resolved at runtime. The method
+is determined by the receiver's type — use the cross-product rule
+(§3.1.1) to compute result types and arg constraints across all
+valid receiver members.
+
+### 8.4 Shape/Lambda Propagation
+
+When a lambda is passed where a shape type is expected:
+
+| Direction | Source | Target | Rule |
+|-----------|--------|--------|------|
+| Forward | Shape param types | Lambda params | `fwd[lambda_param] ⊔= shape_param_type` |
+| Backward | Shape return type | Lambda return | `ub[lambda_return] ⊓= shape_return_type` |
+| Backward | Lambda param ub | Shape arg | `ub[shape_arg] ⊓= ub[lambda_param]` |
+
+### 8.5 Why Both Directions are Needed
+
+Consider `match v { (42) -> body }` where `v: i32`:
+
+1. The match value `42` is captured as a lambda parameter `p`.
+2. Inside the lambda: `TryCallDyn v.==(p)` resolves to `i32::==`.
+3. `i32::==` takes `i32` param → backward pushes `ub[p] = i32`.
+4. **Callee→caller backward** (§8.2 row 4): `ub[42] ⊓= ub[p] = i32`.
+5. Refinement narrows the literal `42` from `Angelic(IntSet)` to
+   `Angelic({i32})`.
+
+Without step 4, the literal stays at `Angelic(IntSet)` and
+resolves to `u64` by default.
 
 
 ## 9. Summary
