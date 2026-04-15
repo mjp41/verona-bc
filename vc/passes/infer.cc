@@ -2825,14 +2825,6 @@ namespace vc
           auto dst_loc = (stmt / LocalId)->location();
           auto src_loc = (stmt / Rhs)->location();
           auto expected = best_ub(dst_loc);
-          if (!expected)
-          {
-            // Fall back to forward type of dst if concrete.
-            auto dst_it = env.find(dst_loc);
-            if (dst_it != env.end() && !is_angelic(dst_it->second.type) &&
-                dst_it->second.type->front() != TypeVar)
-              expected = dst_it->second.type;
-          }
           if (expected && !is_angelic(expected))
             push_bwd_local(src_loc, expected);
         }
