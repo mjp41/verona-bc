@@ -196,6 +196,36 @@ affects the inference result.
 | `x = y == z` | `fwd[x] = bool` |
 | TypeParam `T` | `fwd[T] = Angelic(Any)` |
 
+### 3.1.1 Angelic Method Resolution (Cross-Product Rule)
+
+When the receiver or arguments of a dynamic method call are Angelic,
+the result type is the Angelic set of all valid return types across
+the cross-product of member types:
+
+```
+recv : Angelic(T₁, ..., Tₙ)
+arg  : Angelic(S₁, ..., Sₘ)
+
+result = Angelic({ Rᵢⱼ | Tᵢ.method(Sⱼ) → Rᵢⱼ })
+```
+
+If either the receiver or an argument is concrete (not Angelic),
+that dimension has exactly one value in the cross-product.
+
+**Key properties**:
+- The receiver is NOT refined — it stays Angelic. Only the result
+  type is computed.
+- If all valid combinations produce the same return type (e.g., all
+  integer `==` returns `bool`), the result is that concrete type.
+- If valid combinations produce different return types, the result
+  is `Angelic({R₁, ..., Rₖ})` with the Concrete constraint
+  inherited from the receiver.
+- If no valid combination exists, the result is undefined (method
+  not found for any member).
+
+This rule also applies to binary operators like `+`, `==`, etc.,
+which are desugared to method calls via Lookup + CallDyn.
+
 ### 3.2 Forward Join
 
 **F1 — Bottom absorbs**: `⊔(TypeVar, X) = X`

@@ -948,9 +948,14 @@ Update the env based on definitions:
 - `Copy/Move`: env[dst] = env[src]
 - `New`: env[dst] = class_type
 - `Call`: env[dst] = return_type_of_callee
-- `CallDyn`: env[dst] = resolved_method_return_type
+- `CallDyn`: env[dst] = resolved_method_return_type (see cross-product rule)
 - `Binop/Unop`: env[dst] = result_type
 - etc.
+
+**Angelic cross-product rule for CallDyn/Lookup**: When the receiver
+or arguments are Angelic, compute `result = Angelic({ Rij | Ti.method(Sj) → Rij })`
+over the cross-product of receiver members × arg members. The receiver
+is NOT refined — only the result type is computed. See ALGORITHM.md §3.1.1.
 
 ### Backward transfer functions
 

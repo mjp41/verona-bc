@@ -2486,21 +2486,20 @@ namespace vc
           auto lhs_it = env.find(lhs_loc);
           auto rhs_it = env.find(rhs_loc);
 
-          // Forward cross-operand refinement: if LHS is Angelic and
-          // RHS is a compatible concrete primitive, refine LHS to
-          // match RHS. Homogeneous ops require both operands to have
-          // the same type, so a concrete RHS constrains the LHS.
+          // For homogeneous ops (T, T) → T: if LHS is Angelic and
+          // RHS is a compatible concrete primitive, use the RHS type
+          // as the result type WITHOUT refining the LHS. The LHS
+          // stays Angelic — backward will narrow it later.
           if (lhs_it != env.end() && rhs_it != env.end() &&
-              is_angelic(lhs_it->second.type))
+              is_angelic(lhs_it->second.type) &&
+              !is_angelic(rhs_it->second.type))
           {
             auto rhs_prim = extract_callable_primitive(rhs_it->second.type);
             if (rhs_prim &&
                 is_angelic_compatible(lhs_it->second.type, rhs_prim))
             {
-              auto refined = primitive_or_ffi_type(rhs_prim->type());
-              merge(lhs_loc, refined);
-              // Re-fetch after merge may have changed the iterator.
-              lhs_it = env.find(lhs_loc);
+              merge(dst_loc, clone(rhs_it->second.type));
+              continue;
             }
           }
 
@@ -2592,9 +2591,42 @@ namespace vc
           {
             if (is_angelic(src_it->second.type))
             {
-              // Propagate angelic unchanged — method resolution
-              // happens when backward narrows it.
-              merge(dst_loc, clone(src_it->second.type));
+              // Receiver is Angelic — resolve the method for all
+              // members and use the common return type. If all
+              // members agree (e.g., all integer ==  returns Bool),
+              // use that. Otherwise keep Angelic.
+              auto bound = src_it->second.type->front()->front();
+              auto mems = members(bound);
+              auto hand = (stmt / Lhs)->type();
+              auto method_ident = lookup_method_name(stmt);
+              auto method_ta = stmt / TypeArgs;
+              auto arity = from_chars_sep_v<size_t>(stmt / Int);
+
+              Node common_ret;
+              bool all_agree = !mems.empty();
+              for (auto& m : mems)
+              {
+                auto mtype = primitive_type(m);
+                auto ret = resolve_method_return_type(
+                  top, mtype, method_ident, hand, arity, method_ta);
+                if (!ret || ret->front() == TypeVar)
+                {
+                  all_agree = false;
+                  break;
+                }
+                if (!common_ret)
+                  common_ret = ret;
+                else if (!same_type_tree(common_ret, ret))
+                {
+                  all_agree = false;
+                  break;
+                }
+              }
+
+              if (all_agree && common_ret)
+                merge(dst_loc, common_ret);
+              else
+                merge(dst_loc, clone(src_it->second.type));
             }
             else
             {
@@ -2633,7 +2665,133 @@ namespace vc
           if (lookup_it != lookup_stmts.end())
           {
             auto lookup_node = lookup_it->second;
-            auto recv_it = env.find((lookup_node / Rhs)->location());
+            auto recv_loc = (lookup_node / Rhs)->location();
+            auto recv_it = env.find(recv_loc);
+
+            // Angelic cross-product resolution:
+            // recv: Angelic(T1,...,Tn), args: possibly Angelic
+            // result: Angelic({ Rij | Ti.method(Sj) → Rij })
+            // If recv or an arg is concrete, that dimension has
+            // only one value.
+            if (
+              recv_it != env.end() &&
+              is_angelic(recv_it->second.type))
+            {
+              auto hand = (lookup_node / Lhs)->type();
+              auto method_ident = lookup_method_name(lookup_node);
+              auto method_ta = lookup_node / TypeArgs;
+              auto arity = from_chars_sep_v<size_t>(lookup_node / Int);
+
+              auto recv_bound = recv_it->second.type->front()->front();
+              auto recv_mems = members(recv_bound);
+
+              // Collect arg member sets.
+              std::vector<std::vector<Token>> arg_mem_sets;
+              for (auto& arg_node : *args)
+              {
+                auto arg_it =
+                  env.find((arg_node / Rhs)->location());
+                std::vector<Token> arg_mems;
+                if (arg_it != env.end())
+                {
+                  if (is_angelic(arg_it->second.type))
+                  {
+                    arg_mems = members(
+                      arg_it->second.type->front()->front());
+                  }
+                  else
+                  {
+                    auto p = extract_callable_primitive(
+                      arg_it->second.type);
+                    if (p)
+                      arg_mems.push_back(p->type());
+                  }
+                }
+                arg_mem_sets.push_back(std::move(arg_mems));
+              }
+
+              // For each receiver member, resolve the method and
+              // check arg compatibility. Collect valid return types.
+              std::vector<Token> result_prims;
+              Node result_nonprim;
+              for (auto& ti : recv_mems)
+              {
+                auto ti_type = primitive_type(ti);
+                auto info = resolve_callable_method(
+                  top, ti_type, method_ident, hand, arity, method_ta);
+                if (!info.func)
+                  continue;
+
+                auto params = info.func / Params;
+                bool args_ok = true;
+                for (size_t j = 0;
+                     j < params->size() && j < arg_mem_sets.size();
+                     j++)
+                {
+                  auto pt =
+                    apply_subst(top, params->at(j) / Type, info.subst);
+                  if (!pt || pt->front() == TypeVar)
+                    continue;
+                  auto pt_prim = extract_primitive(pt);
+                  if (!pt_prim)
+                    continue;
+                  // Check if any arg member matches param type.
+                  bool found = false;
+                  for (auto& sj : arg_mem_sets[j])
+                    if (sj == pt_prim->type())
+                    {
+                      found = true;
+                      break;
+                    }
+                  if (!found && !arg_mem_sets[j].empty())
+                  {
+                    args_ok = false;
+                    break;
+                  }
+                }
+
+                if (!args_ok)
+                  continue;
+
+                auto ret = apply_subst(
+                  top, info.func / Type, info.subst);
+                if (!ret || ret->front() == TypeVar)
+                  continue;
+
+                auto ret_prim = extract_primitive(ret);
+                if (ret_prim)
+                {
+                  bool dup = false;
+                  for (auto& r : result_prims)
+                    if (r == ret_prim->type())
+                    {
+                      dup = true;
+                      break;
+                    }
+                  if (!dup)
+                    result_prims.push_back(ret_prim->type());
+                }
+                else if (!result_nonprim)
+                  result_nonprim = ret;
+              }
+
+              // Build result type from collected returns.
+              if (!result_prims.empty())
+              {
+                if (result_prims.size() == 1)
+                  merge(dst_loc, primitive_type(result_prims[0]));
+                else
+                {
+                  bool concrete = has_concrete(recv_bound);
+                  auto bound =
+                    make_angelic_bound(result_prims, concrete);
+                  merge(dst_loc, make_angelic(bound));
+                }
+              }
+              else if (result_nonprim)
+                merge(dst_loc, result_nonprim);
+            }
+
             if (
               recv_it != env.end() &&
               !is_angelic(recv_it->second.type))
