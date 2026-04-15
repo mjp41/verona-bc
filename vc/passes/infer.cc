@@ -1857,6 +1857,15 @@ namespace vc
     std::map<Node, size_t> func_entry;
     std::map<Node, std::vector<size_t>> func_returns;
 
+    // Reverse call-site map: callee → call sites that invoke it.
+    // Used for backward callee→caller flow (ALGORITHM.md §8.2 row 4).
+    struct CallSiteInfo
+    {
+      size_t caller_label;
+      std::vector<Location> arg_locs;
+    };
+    std::map<Node, std::vector<CallSiteInfo>> callee_call_sites;
+
     // Forward pass shared state (reset per-label or per-solve).
     std::map<Location, Node> lookup_stmts;
     std::map<Location, std::pair<Location, size_t>> ref_to_tuple;
@@ -3430,6 +3439,27 @@ namespace vc
       for (auto& [func, return_indices] : func_returns)
         for (auto idx : return_indices)
           enqueue(idx, Direction::Backward);
+
+      // Build reverse call-site map for callee→caller backward flow.
+      for (size_t i = 0; i < n; i++)
+      {
+        auto body = cfg.labels[i].label / Body;
+        for (auto& stmt : *body)
+        {
+          if (stmt == Call)
+          {
+            std::vector<ScopeInfo> scopes;
+            auto func_def = navigate_call(stmt, top, scopes);
+            if (!func_def)
+              continue;
+            auto args = stmt / Args;
+            std::vector<Location> arg_locs;
+            for (auto& arg : *args)
+              arg_locs.push_back((arg / Rhs)->location());
+            callee_call_sites[func_def].push_back({i, std::move(arg_locs)});
+          }
+        }
+      }
     }
 
     // ===== Solve (ALGORITHM.md §6) =====
@@ -3611,6 +3641,55 @@ namespace vc
               // tested variable, the constraint may be tighter than
               // necessary, but refinement handles contradictions.
               push_bwd(p, loc, info.type);
+            }
+          }
+
+          // Backward callee→caller flow (ALGORITHM.md §8.2 row 4):
+          // If this is a function entry label and params have ub
+          // constraints, push them back to caller args.
+          auto entry_func_it = std::find_if(
+            func_entry.begin(), func_entry.end(),
+            [&](auto& kv) { return kv.second == label; });
+          if (entry_func_it != func_entry.end())
+          {
+            auto& callee_func = entry_func_it->first;
+            // Skip generic functions — param constraints are
+            // per-instantiation, not per-definition.
+            bool in_generic =
+              (callee_func / TypeParams)->size() > 0 ||
+              (callee_func->parent({ClassDef}) != nullptr &&
+               (callee_func->parent({ClassDef}) / TypeParams)->size() > 0);
+            if (!in_generic)
+            {
+              auto params = callee_func / Params;
+              auto sites_it = callee_call_sites.find(callee_func);
+              if (sites_it != callee_call_sites.end())
+              {
+                for (auto& site : sites_it->second)
+                {
+                  for (
+                    size_t pi = 0;
+                    pi < params->size() && pi < site.arg_locs.size();
+                    pi++)
+                  {
+                    auto param_loc =
+                      (params->at(pi) / Ident)->location();
+                    auto ub_it = ub[label].find(param_loc);
+                    if (ub_it == ub[label].end())
+                      continue;
+                    if (is_angelic(ub_it->second.type) ||
+                        ub_it->second.type->front() == TypeVar)
+                      continue;
+                    if (is_uninformative_backward_type(
+                          ub_it->second.type))
+                      continue;
+                    push_bwd(
+                      site.caller_label,
+                      site.arg_locs[pi],
+                      ub_it->second.type);
+                  }
+                }
+              }
             }
           }
         }
