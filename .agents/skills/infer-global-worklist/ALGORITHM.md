@@ -223,6 +223,14 @@ that dimension has exactly one value in the cross-product.
 - If no valid combination exists, the result is undefined (method
   not found for any member).
 
+The cross-product also constrains **Angelic arguments**: an arg
+member `Sⱼ` is only valid if `∃ Tᵢ: Tᵢ.method(Sⱼ)` succeeds.
+This filtering is a **backward constraint** on the arg — it
+narrows the arg's Angelic bound via meet (§4), not by mutating
+the forward env. When the arg is a callee parameter (e.g., match
+lambda), this constraint propagates via cross-function backward
+flow (§8.3).
+
 This rule also applies to binary operators like `+`, `==`, etc.,
 which are desugared to method calls via Lookup + CallDyn.
 
@@ -585,14 +593,42 @@ both `w.f: i32` and `z.f: Union(u32, u64)`.
 
 ## 8. Cross-Function Flow
 
-Upper bounds flow across function boundaries:
+Forward and backward constraints flow across function boundaries.
+All functions share a single worklist; cross-function pushes use
+the same `push_fwd` / `push_bwd` as intra-function flow.
 
-- **Call f(x)**: `ub[x] ⊓= param_type(f)`
-- **Shape/lambda**: shape method signatures become upper bounds
-  on lambda parameters and return types.
-- **Return**: call result's upper bound pushes to callee return.
+### 8.1 Forward: Caller → Callee
 
-All use the same meet (⊓) operator.
+- **`push_args_to_callee(f, args)`**: for each arg with TypeVar
+  param, push `fwd[callee_entry][param] ⊔= fwd[arg]`.
+- **`push_shape_to_lambda(shape, lambda)`**: push shape method
+  param types into lambda params, shape return type as callee
+  return constraint.
+
+### 8.2 Backward: Call-Site → Callee
+
+- **`push_return_constraint(f, T)`**: push `ub[return_label][ret] ⊓= T`
+  for each return label in callee.
+- **Call arg backward**: `ub[arg] ⊓= param_type(f)` — handled by
+  the backward Call handler within the same function.
+
+### 8.3 Backward: Callee → Caller (NOT YET IMPLEMENTED)
+
+When a callee's parameter acquires a backward constraint (e.g.,
+from a TryCallDyn inside a match lambda that resolves `v.==(42)`
+and narrows param `42` to `i32`), that constraint should propagate
+back to the caller's argument:
+
+```
+ub[caller_arg] ⊓= ub[callee_param]
+```
+
+This is the reverse of `push_args_to_callee`. Without it, match
+value literals captured as lambda parameters don't get backward-
+refined from their use sites inside the lambda.
+
+All cross-function flows use the same meet (⊓) operator for
+backward and join (⊔) for forward.
 
 
 ## 9. Summary

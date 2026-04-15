@@ -1218,6 +1218,21 @@ that reference it, and pushes the type into the appropriate `fwd` or
 `bwd` env at those labels. If anything changed, those labels are
 enqueued.
 
+#### Implementation status
+
+| Flow | Direction | Implemented | Function |
+|------|-----------|-------------|----------|
+| Call arg → callee param | Forward | Yes | `push_args_to_callee` |
+| Shape → lambda param/return | Forward+Backward | Yes | `push_shape_to_lambda` |
+| Call result ub → callee return | Backward | Yes | `push_return_constraint` |
+| Callee param ub → caller arg | Backward | **No** | — |
+| Lambda capture → outer scope | Bidirectional | **No** | — |
+
+The missing "callee param ub → caller arg" flow is the primary
+cause of remaining test failures (91% → target 92%+). Match value
+literals captured as lambda parameters don't get backward-refined.
+See ALGORITHM.md §8.3.
+
 **Concrete mappings** (built during `GlobalInfer::build()`):
 - `func_entry[Function] → label_index` — entry label of each function
 - `func_returns[Function] → [label_indices]` — labels with Return terminators
