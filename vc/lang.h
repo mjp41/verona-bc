@@ -62,6 +62,13 @@ namespace vc
   inline const auto DefaultFloat = TokenDef("default_float");
   inline const auto AngelicSubtype = TokenDef("angelic_subtype");
 
+  // Angelic type system tokens (ALGORITHM.md §1.2–1.3).
+  // Concrete: constraint meaning "must resolve to exactly one type."
+  // IntSet/FloatSet: named angelic sets with partial preference orders.
+  inline const auto Concrete = TokenDef("concrete");
+  inline const auto IntSet = TokenDef("intset");
+  inline const auto FloatSet = TokenDef("floatset");
+
   inline const auto WhereAnd = TokenDef("whereand");
   inline const auto WhereOr = TokenDef("whereor");
   inline const auto WhereNot = TokenDef("wherenot");

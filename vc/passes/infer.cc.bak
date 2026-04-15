@@ -1,77 +1,78 @@
-// ===== Bidirectional Type Inference with Angelic Constraints =====
+// ===== Global Worklist Type Inference =====
 //
-// Architecture (ALGORITHM.md §2): Product Lattice with Forward Join +
-// Backward Meet
+// Architecture: Bidirectional Bounds with Push-Based Data Flow
 //
-// Type inference operates on a product lattice with two independent
-// components per location:
+// Type inference is two independent analyses that interact through
+// refinement:
 //
-//   fwd[x]  — Forward (lower bound): what the value IS
-//   ub[x]   — Backward (upper bound): what the value must SATISFY
+// 1. FORWARD ANALYSIS computes what each variable *could be* (upper
+//    bounds). Flows from definitions toward uses. Merges widen (union
+//    at control-flow joins).
 //
-// Forward:  join (⊔) — ascending. Angelic bounds tighten (F2),
-//           concrete absorbs Angelic (F3). Both upward in info order.
-// Backward: meet (⊓) — descending. Meet only tightens. Always
-//           intersection — every use-site constraint must be satisfied.
+// 2. BACKWARD ANALYSIS collects use-site constraints on each variable.
+//    Flows from uses toward definitions. Merges also widen (a variable
+//    flowing to multiple uses must satisfy all of them).
 //
-// Angelic types (ALGORITHM.md §1.1):
-//   Angelic(Concrete ∩ IntSet) — integer literal, compiler chooses type
-//   Angelic(Concrete ∩ FloatSet) — float literal, compiler chooses type
-//   Angelic(Any) — type parameter, may resolve to Union
+// 3. REFINEMENT resolves unresolved types (DefaultInt, DefaultFloat,
+//    TypeVar) when a backward constraint provides a compatible single
+//    concrete type. Fires inline during the solve loop, not as a
+//    separate post-fixpoint phase.
 //
-// The Concrete constraint (ALGORITHM.md §1.2):
-//   Not a runtime type — a constraint meaning "must resolve to exactly
-//   one concrete type." Present in literals (must pick ONE integer),
-//   absent in type parameters (may resolve to Union).
-//
-// Refinement (ALGORITHM.md §5):
-//   candidates = members(fwd[x]) ∩ ub[x]
-//   R1: |candidates| = 1 → commit to concrete
-//   R2: candidates ⊂ members(fwd) → tighten Angelic bound
-//   R3: no change → skip
-//   R4: candidates = ∅ → contradiction flag
-//
-// Resolution (ALGORITHM.md §1.4):
-//   Concrete → pick max under partial ≤ preference order
-//   Non-Concrete → Union(candidates)
-//
-// Forward Join Rules (ALGORITHM.md §3.2):
-//   F1: ⊔(TypeVar, X) = X
-//   F2: ⊔(Angelic(T₁), Angelic(T₂)) = Angelic(T₁ ∩ T₂)
-//   F2a: ⊔(Angelic(Concrete∩T₁), Angelic(T₂)) = Union(...)
-//   F3: ⊔(Angelic(T), concrete S) = S
-//   F4: ⊔(S₁, S₂) = Union(S₁, S₂)
-//   F5: ⊔(S₁, S₂) = S₂ when S₁ <: S₂
-//
-// Backward Meet (ALGORITHM.md §4):
-//   Always intersection. Only applies to Angelic locations.
+// Key design: labels store their INPUTS, and processing a label pushes
+// outputs directly into successor/predecessor inputs via merge_type.
+// No "build entry env" phase — the entry IS the stored state.
 //
 // Per-label state:
-//   fwd[i]  = forward types at ENTRY of label i
-//   ub[i]   = upper bound constraints at EXIT of label i
-//   fwd_exit[i] = forward types at EXIT of label i (computed by
-//                 transfer functions)
+//   fwd[i] = forward types at ENTRY of label i
+//   bwd[i] = backward constraints at EXIT of label i
 //
 // Forward processing of label i:
-//   1. Read fwd[i], run forward transfer functions → fwd_exit
-//   2. Push fwd_exit into fwd[succ] via join_type
-//   3. Cond: typetest narrowing on true/false successors
+//   1. Read fwd[i] (populated by predecessors pushing into it)
+//   2. Run forward transfer functions: fwd[i] -> fwd_exit
+//   3. Push fwd_exit into fwd[succ] via merge_type
+//   4. Cond terminators: push narrowed type to true successor,
+//      excluded type to false successor
 //
 // Backward processing of label i:
-//   1. Read ub[i], run backward transfer functions → ub_entry
-//   2. Push ub_entry into ub[pred] via meet_type
-//   3. Path-sensitive filtering on Cond edges
+//   1. Read bwd[i] (populated by successors pushing into it)
+//   2. Run backward transfer functions in reverse: bwd[i] -> bwd_entry
+//   3. Push bwd_entry into bwd[pred] -- but only if compatible with
+//      the forward type on that edge (path-sensitive backward push)
 //
-// Refinement after processing a label:
-//   For each Angelic location: candidates = members(fwd) ∩ ub
-//   R1-R4 dispatch. Re-enqueue on change.
+// Path-sensitive backward push:
+//   When pushing backward to a predecessor whose terminator is a Cond
+//   that narrowed the same variable, check compatibility:
+//   - True edge: backward type must be subtype of narrowed type
+//   - False edge: backward type must be disjoint from excluded type
+//   If incompatible, skip the push for that (predecessor, location).
+//
+// Refinement:
+//   After processing a label, for each location in fwd[i]:
+//   - If fwd is DefaultInt/DefaultFloat and bwd is a compatible single
+//     concrete type, refine fwd to bwd. Enqueue label Forward.
+//     Union backward constraints do NOT trigger refinement for Defaults
+//     (ambiguous literal: e.g. 42 used as both i32 and string).
+//   - If fwd is TypeVar and bwd is any concrete type (including Union),
+//     refine fwd to bwd. This handles generic type parameters where
+//     multiple call sites constrain T to different types — the Union
+//     IS the inferred type.
 //
 // Convergence:
-//   Forward monotone ascending, backward monotone descending,
-//   refinement bounded by |members| per location. Product lattice
-//   guarantees fixpoint in finite steps.
+//   Forward and backward are individually monotone (merge_type only
+//   widens). Refinement fires at most once per (label, location) due
+//   to merge_type's absorption property: once a location is concrete,
+//   merge_type absorbs incoming DefaultInt/TypeVar without change.
+//   Total refinement events bounded by labels x locations.
+//   Safety net: MAX_ITERS_PER_LABEL = 200 with compilation error.
 //
-// The AST is mutated exactly once, at finalization, after convergence.
+// The AST is mutated exactly once, at finalization, after the fixpoint
+// is reached. During the solve loop, all type state lives in the
+// fwd/bwd side-structures -- no AST mutations.
+//
+// Cross-function flow:
+//   push_cross() maps AST nodes (ParamDef, FieldDef, Function) to
+//   label indices and pushes types into the appropriate fwd/bwd env.
+//   Called by transfer functions during normal processing.
 
 #include "../lang.h"
 #include "../subtype.h"
@@ -241,315 +242,68 @@ namespace vc
                                    << (TypeArgs << clone(inner))));
   }
 
-  // ===== Angelic type system (ALGORITHM.md §1.2–1.3) =====
+  // ===== Type predicates =====
 
-  // Named angelic sets with preference orders.
-  // IntSet: all integer primitives. Partial order with u64 as top.
-  // FloatSet: f32, f64. Total order with f64 as top.
-
-  static const std::vector<Token>& intset_members()
-  {
-    static const std::vector<Token> m = {
-      I8, I16, I32, I64, U8, U16, U32, U64, ILong, ULong, ISize, USize};
-    return m;
-  }
-
-  static const std::vector<Token>& floatset_members()
-  {
-    static const std::vector<Token> m = {F32, F64};
-    return m;
-  }
-
-  // Partial preference order for IntSet (ALGORITHM.md §1.3).
-  // Returns true if a ≤ b (a is less preferred than b).
-  // u64 is the top (most preferred / default).
-  [[maybe_unused]]
-  static bool int_pref_leq(Token a, Token b)
-  {
-    if (a == b)
-      return true;
-    // Everything ≤ u64.
-    if (b == U64)
-      return true;
-    // Signed chain: i8 ≤ i16 ≤ i32 ≤ i64.
-    if (a == I8 && (b == I16 || b == I32 || b == I64))
-      return true;
-    if (a == I16 && (b == I32 || b == I64))
-      return true;
-    if (a == I32 && b == I64)
-      return true;
-    // Unsigned chain: u8 ≤ u16 ≤ u32.
-    if (a == U8 && (b == U16 || b == U32))
-      return true;
-    if (a == U16 && b == U32)
-      return true;
-    // All else incomparable (isize, usize, ilong, ulong vs fixed-width).
-    return false;
-  }
-
-  // Float preference: f32 ≤ f64 (total order).
-  [[maybe_unused]]
-  static bool float_pref_leq(Token a, Token b)
-  {
-    if (a == b)
-      return true;
-    if (a == F32 && b == F64)
-      return true;
-    return false;
-  }
-
-  // Construct Angelic(Concrete ∩ IntSet) — default integer literal.
   Node angelic_int()
   {
-    return Type << (AngelicSubtype << (Isect << Concrete << IntSet));
+    return Type << (AngelicSubtype << DefaultInt);
   }
 
-  // Construct Angelic(Concrete ∩ FloatSet) — default float literal.
   Node angelic_float()
   {
-    return Type << (AngelicSubtype << (Isect << Concrete << FloatSet));
+    return Type << (AngelicSubtype << DefaultFloat);
   }
 
-  // Check if a type is Angelic (AngelicSubtype wrapper).
   bool is_angelic(const Node& type)
   {
     return type && type == Type && !type->empty() &&
       type->front() == AngelicSubtype;
   }
 
-  // Check if an Angelic bound contains the Concrete constraint.
-  // The bound is the child of AngelicSubtype.
-  bool has_concrete(const Node& angelic_bound)
+  // Check if a type is a default integer or default float,
+  // handling both old tokens and AngelicSubtype wrappers.
+  bool is_default_int(const Node& type)
   {
-    if (!angelic_bound)
+    if (!type || type->empty())
       return false;
-    if (angelic_bound == Concrete)
+    if (type->front() == DefaultInt)
       return true;
-    if (angelic_bound == Isect)
-    {
-      for (auto& child : *angelic_bound)
-        if (child == Concrete)
-          return true;
-    }
+    if (type->front() == AngelicSubtype && !type->front()->empty())
+      return type->front()->front() == DefaultInt;
     return false;
   }
 
-  // Extract the concrete member set from an Angelic bound.
-  // Strips Concrete and Angelic wrappers, expands IntSet/FloatSet,
-  // and returns a flat set of primitive tokens.
-  // ALGORITHM.md §5: "members(T) strips Concrete from the bound
-  // and returns the set of concrete types."
-  std::vector<Token> members(const Node& angelic_bound)
+  bool is_default_float(const Node& type)
   {
-    if (!angelic_bound)
-      return {};
-
-    // Single named set.
-    if (angelic_bound == IntSet)
-      return intset_members();
-    if (angelic_bound == FloatSet)
-      return floatset_members();
-
-    // Concrete alone — no member info.
-    if (angelic_bound == Concrete)
-      return {};
-
-    // Isect: intersect the member sets of all non-Concrete children.
-    if (angelic_bound == Isect)
-    {
-      std::vector<Token> result;
-      bool first = true;
-      for (auto& child : *angelic_bound)
-      {
-        if (child == Concrete)
-          continue;
-        auto child_members = members(child);
-        if (first)
-        {
-          result = std::move(child_members);
-          first = false;
-        }
-        else
-        {
-          // Set intersection.
-          std::vector<Token> isect;
-          for (auto& t : result)
-            for (auto& u : child_members)
-              if (t == u)
-                isect.push_back(t);
-          result = std::move(isect);
-        }
-      }
-      return result;
-    }
-
-    // Union: union of member sets.
-    if (angelic_bound == Union)
-    {
-      std::vector<Token> result;
-      for (auto& child : *angelic_bound)
-      {
-        auto child_members = members(child);
-        for (auto& t : child_members)
-        {
-          bool found = false;
-          for (auto& r : result)
-            if (r == t)
-            {
-              found = true;
-              break;
-            }
-          if (!found)
-            result.push_back(t);
-        }
-      }
-      return result;
-    }
-
-    // TypeName — a single concrete type. Extract its primitive token.
-    if (angelic_bound == TypeName)
-    {
-      // Check if it's a _builtin primitive.
-      if (angelic_bound->size() >= 2)
-      {
-        auto first = (angelic_bound->front() / Ident)->location().view();
-        if (first == "_builtin")
-        {
-          auto name = (angelic_bound->back() / Ident)->location().view();
-          auto it = primitive_from_name.find(name);
-          if (it != primitive_from_name.end())
-            return {it->second};
-        }
-      }
-      return {};
-    }
-
-    return {};
-  }
-
-  // Build an Angelic bound node from a set of tokens, preserving
-  // Concrete if requested.
-  Node make_angelic_bound(const std::vector<Token>& toks, bool concrete)
-  {
-    if (toks.empty())
-      return concrete ? Node{Concrete} : Node{};
-
-    // Check if toks equals full IntSet or FloatSet.
-    auto& ints = intset_members();
-    auto& floats = floatset_members();
-    bool is_full_intset = (toks.size() == ints.size());
-    if (is_full_intset)
-      for (auto& t : ints)
-      {
-        bool found = false;
-        for (auto& u : toks)
-          if (t == u)
-          {
-            found = true;
-            break;
-          }
-        if (!found)
-        {
-          is_full_intset = false;
-          break;
-        }
-      }
-    bool is_full_floatset = (toks.size() == floats.size());
-    if (is_full_floatset)
-      for (auto& t : floats)
-      {
-        bool found = false;
-        for (auto& u : toks)
-          if (t == u)
-          {
-            found = true;
-            break;
-          }
-        if (!found)
-        {
-          is_full_floatset = false;
-          break;
-        }
-      }
-
-    Node set_node;
-    if (is_full_intset)
-      set_node = IntSet;
-    else if (is_full_floatset)
-      set_node = FloatSet;
-    else if (toks.size() == 1)
-      set_node = primitive_type(toks[0])->front(); // TypeName
-    else
-    {
-      // Build Union of TypeName nodes.
-      Node u = Union;
-      for (auto& t : toks)
-        u << primitive_type(t)->front();
-      set_node = u;
-    }
-
-    if (concrete)
-      return Isect << Concrete << set_node;
-    return set_node;
-  }
-
-  // Build an Angelic type from a bound node.
-  Node make_angelic(const Node& bound)
-  {
-    return Type << (AngelicSubtype << clone(bound));
-  }
-
-  // Check if a type is an Angelic integer (Concrete ∩ IntSet).
-  bool is_angelic_int(const Node& type)
-  {
-    if (!is_angelic(type))
+    if (!type || type->empty())
       return false;
-    auto bound = type->front()->front();
-    if (bound == Isect)
-    {
-      for (auto& child : *bound)
-        if (child == IntSet)
-          return true;
-    }
+    if (type->front() == DefaultFloat)
+      return true;
+    if (type->front() == AngelicSubtype && !type->front()->empty())
+      return type->front()->front() == DefaultFloat;
     return false;
   }
 
-  // Check if a type is an Angelic float (Concrete ∩ FloatSet).
-  bool is_angelic_float(const Node& type)
+  bool is_default_type(const Node& type)
   {
-    if (!is_angelic(type))
+    if (!type || type->empty())
       return false;
-    auto bound = type->front()->front();
-    if (bound == Isect)
-    {
-      for (auto& child : *bound)
-        if (child == FloatSet)
-          return true;
-    }
+    if (type->front()->in({DefaultInt, DefaultFloat}))
+      return true;
+    // AngelicSubtype is semantically a default (unresolved).
+    if (type->front() == AngelicSubtype)
+      return true;
     return false;
   }
 
-  // Check if a backward primitive is compatible with an Angelic forward type.
-  // Returns true if prim is in members(angelic_bound).
-  bool is_angelic_compatible(const Node& angelic_type, const Node& prim)
-  {
-    if (!is_angelic(angelic_type) || !prim)
-      return false;
-    auto fwd_mems = members(angelic_type->front()->front());
-    for (auto& m : fwd_mems)
-      if (m == prim->type())
-        return true;
-    return false;
-  }
-
-  // Check if a type contains any Angelic sub-nodes.
-  bool contains_angelic(const Node& type)
+  bool contains_default_type(const Node& type)
   {
     if (!type)
       return false;
+
     bool found = false;
     type->traverse([&](auto node) {
-      if (node == AngelicSubtype)
+      if (node->in({DefaultInt, DefaultFloat}))
       {
         found = true;
         return false;
@@ -557,6 +311,25 @@ namespace vc
       return !found;
     });
     return found;
+  }
+
+  Node resolve_default(const Node& type)
+  {
+    if (!type || type->empty())
+      return type;
+    if (type->front() == DefaultInt)
+      return primitive_type(U64);
+    if (type->front() == DefaultFloat)
+      return primitive_type(F64);
+    if (type->front() == AngelicSubtype && !type->front()->empty())
+    {
+      auto bound = type->front()->front();
+      if (bound == DefaultInt)
+        return primitive_type(U64);
+      if (bound == DefaultFloat)
+        return primitive_type(F64);
+    }
+    return type;
   }
 
   bool is_any_type(const Node& type)
@@ -621,6 +394,17 @@ namespace vc
     if (type_node != Type)
       return {};
     auto inner = type_node->front();
+    if (inner == DefaultInt)
+      return U64;
+    if (inner == DefaultFloat)
+      return F64;
+    if (inner == AngelicSubtype && !inner->empty())
+    {
+      if (inner->front() == DefaultInt)
+        return U64;
+      if (inner->front() == DefaultFloat)
+        return F64;
+    }
     if (inner != TypeName)
       return {};
     auto first = (inner->front() / Ident)->location().view();
@@ -700,20 +484,18 @@ namespace vc
     return inner ? extract_callable_primitive(inner) : Node{};
   }
 
-  // Returns the fallback concrete token for a literal that wasn't
-  // resolved during inference. Used in finalize only.
-  Token literal_fallback_token(const Node& lit)
+  Node default_literal_type(const Node& lit)
   {
     if (lit->in({True, False}))
       return Bool;
     if (lit == None)
       return None;
     if (lit->in({Bin, Oct, Int, Hex, Char}))
-      return U64;
+      return DefaultInt;
     if (lit->in({Float, HexFloat}))
-      return F64;
+      return DefaultFloat;
     assert(false && "unhandled literal type");
-    return U64;
+    return {};
   }
 
   static bool contains_typevar(const Node& type_node)
@@ -791,15 +573,12 @@ namespace vc
     return true;
   }
 
-  // ===== Forward Join (ALGORITHM.md §3.2) =====
-  //
-  // Returns the joined type, or {} if no change from existing.
-  // Rules F1-F5 + F2a.
-  static Node join_type(const Node& existing, const Node& incoming, Node top)
+  // Returns the merged type, or {} if no change from existing.
+  static Node merge_type(const Node& existing, const Node& incoming, Node top)
   {
-    // F1: ⊔(TypeVar, X) = X — bottom absorbs.
     if (!existing || existing->empty() || existing->front() == TypeVar)
     {
+      // Both TypeVar -> no change.
       if (incoming && !incoming->empty() && incoming->front() == TypeVar)
         return {};
       return clone(incoming);
@@ -814,61 +593,50 @@ namespace vc
     if (same_type_tree(existing, incoming))
       return {};
 
-    bool ex_angelic = is_angelic(existing);
-    bool in_angelic = is_angelic(incoming);
-
-    // F2/F2a: Both Angelic.
-    if (ex_angelic && in_angelic)
+    // AngelicSubtype: opaque at forward joins.
+    // Angelic(T) is less info than concrete — concrete wins.
+    // Two angelics with same structure → no change (same_type_tree
+    // already caught this above).
+    if (is_angelic(existing))
     {
-      auto ex_bound = existing->front()->front();
-      auto in_bound = incoming->front()->front();
-      bool ex_concrete = has_concrete(ex_bound);
-      bool in_concrete = has_concrete(in_bound);
-
-      // F2a: Mixed Concrete — one has Concrete, other doesn't.
-      // Fall back to demonic Union (different resolution semantics).
-      if (ex_concrete != in_concrete)
-      {
-        Node u = Union;
-        u << clone(existing->front());
-        u << clone(incoming->front());
-        return Type << u;
-      }
-
-      // F2: Same Concrete status — intersect bounds.
-      auto ex_members = members(ex_bound);
-      auto in_members = members(in_bound);
-
-      // Intersect member sets.
-      std::vector<Token> isect;
-      for (auto& t : ex_members)
-        for (auto& u : in_members)
-          if (t == u)
-            isect.push_back(t);
-
-      if (isect.empty())
-      {
-        // Empty intersection — R4 will catch this.
-        // Return Angelic with empty bound.
-        if (ex_concrete)
-          return make_angelic(Isect << Concrete);
-        // Non-Concrete empty intersection is also a contradiction.
-        // Return Angelic with empty Isect bound so members() = {}.
-        return make_angelic(Isect);
-      }
-
-      // Build tightened Angelic bound.
-      auto new_bound = make_angelic_bound(isect, ex_concrete);
-      return make_angelic(new_bound);
+      if (is_angelic(incoming))
+        return {}; // Both angelic, same_type_tree already checked.
+      // existing is angelic, incoming is concrete → widen to concrete.
+      return clone(incoming);
+    }
+    if (is_angelic(incoming))
+    {
+      // incoming is angelic, existing is concrete → keep concrete.
+      return {};
     }
 
-    // F3: ⊔(Angelic(T), concrete S) = S — concrete absorbs Angelic.
-    if (ex_angelic && !in_angelic)
-      return clone(incoming);
-    if (!ex_angelic && in_angelic)
-      return {}; // existing is concrete, keep it.
+    // Default yields to compatible concrete primitive.
+    if (is_default_type(existing) && !is_default_type(incoming))
+    {
+      auto prim = extract_primitive(incoming);
+      if (prim)
+      {
+        bool compat =
+          (is_default_int(existing) && prim->in(integer_types)) ||
+          (is_default_float(existing) && prim->in(float_types));
+        if (compat)
+          return clone(incoming);
+      }
+    }
 
-    // Self type handling.
+    if (is_default_type(incoming) && !is_default_type(existing))
+    {
+      auto prim = extract_primitive(existing);
+      if (prim)
+      {
+        bool compat =
+          (is_default_int(incoming) && prim->in(integer_types)) ||
+          (is_default_float(incoming) && prim->in(float_types));
+        if (compat)
+          return {};
+      }
+    }
+
     bool existing_has_self = contains_self_type(existing);
     bool incoming_has_self = contains_self_type(incoming);
     if (existing_has_self != incoming_has_self)
@@ -878,7 +646,6 @@ namespace vc
       return {};
     }
 
-    // F5: Subtype absorption.
     SequentCtx ctx{top, {}, {}};
 
     if (Subtype.invariant(ctx, existing, incoming))
@@ -889,7 +656,7 @@ namespace vc
     if (Subtype(ctx, existing, incoming))
       return clone(incoming);
 
-    // F4: Build union.
+    // Build union.
     auto e_inner = existing->front();
     auto i_inner = incoming->front();
     Node u = Union;
@@ -899,6 +666,25 @@ namespace vc
         u << clone(c);
     else
       u << clone(e_inner);
+
+    // If incoming is a concrete primitive, replace compatible Default
+    // members in the union.
+    auto inc_prim = extract_primitive(incoming);
+    if (inc_prim && !is_default_type(incoming))
+    {
+      auto it = u->begin();
+      while (it != u->end())
+      {
+        bool is_def_int = (*it) == DefaultInt;
+        bool is_def_float = (*it) == DefaultFloat;
+        if (
+          (is_def_int && inc_prim->in(integer_types)) ||
+          (is_def_float && inc_prim->in(float_types)))
+          it = u->erase(it, std::next(it));
+        else
+          ++it;
+      }
+    }
 
     bool covered = false;
     for (auto& m : *u)
@@ -926,104 +712,7 @@ namespace vc
     return (u->size() == 1) ? Type << clone(u->front()) : Type << u;
   }
 
-  // ===== Backward Meet (ALGORITHM.md §4) =====
-  //
-  // meet_type computes the intersection of two upper bounds.
-  // Used for backward constraint merging. Returns the tightened
-  // type, or {} if no change from existing.
-  //
-  // Upper bounds are always concrete types or Unions/Isects of
-  // concrete types. Angelic does NOT appear in the backward lattice.
-  static Node meet_type(const Node& existing, const Node& incoming, Node top)
-  {
-    // Top absorbs: no existing constraint means incoming is the result.
-    if (!existing || existing->empty() || existing->front() == TypeVar)
-      return clone(incoming);
-    if (!incoming || incoming->empty() || incoming->front() == TypeVar)
-      return {};
-
-    // Pointer/structural equality fast paths.
-    if (existing == incoming)
-      return {};
-    if (same_type_tree(existing, incoming))
-      return {};
-
-    // Skip uninformative backward types (any, dyn, TypeSelf).
-    if (is_uninformative_backward_type(incoming))
-      return {};
-    if (is_uninformative_backward_type(existing))
-      return clone(incoming);
-
-    // Subtype checks: if existing <: incoming, existing is already tighter.
-    SequentCtx ctx{top, {}, {}};
-
-    if (Subtype(ctx, existing, incoming))
-      return {}; // existing already satisfies incoming.
-    if (Subtype(ctx, incoming, existing))
-      return clone(incoming); // incoming is tighter.
-
-    // General intersection: extract concrete members from both,
-    // compute set intersection.
-    auto extract_members = [](const Node& type) -> Nodes {
-      Nodes result;
-      if (type->front() == Union)
-      {
-        for (auto& child : *(type->front()))
-          result.push_back(Type << clone(child));
-      }
-      else
-      {
-        result.push_back(clone(type));
-      }
-      return result;
-    };
-
-    auto ex_members = extract_members(existing);
-    auto in_members = extract_members(incoming);
-
-    Nodes isect;
-    for (auto& e : ex_members)
-    {
-      for (auto& i : in_members)
-      {
-        bool e_sub_i = Subtype(ctx, e, i);
-        bool i_sub_e = !e_sub_i && Subtype(ctx, i, e);
-        if (e_sub_i || i_sub_e || same_type_tree(e, i))
-        {
-          // Keep the more specific one.
-          isect.push_back(e_sub_i ? clone(e) : clone(i));
-          break;
-        }
-      }
-    }
-
-    if (isect.empty())
-    {
-      // Empty intersection — contradictory constraints.
-      // Return bottom of the backward lattice: empty Union (∅).
-      // This ensures the ub is tightened to ∅, so R4 will detect
-      // via members(fwd) ∩ ub = ∅. ALGORITHM.md §10.4.
-      return Type << Union;
-    }
-
-    if (isect.size() == 1)
-    {
-      if (same_type_tree(isect[0], existing))
-        return {};
-      return isect[0];
-    }
-
-    // Build union of intersection results.
-    Node u = Union;
-    for (auto& m : isect)
-      u << clone(m->front());
-    Node result = Type << u;
-    if (same_type_tree(result, existing))
-      return {};
-    return result;
-  }
-
-  // ===== TypetestTrace =====
+  // ===== Typetest trace =====
 
   struct TypetestTrace
   {
@@ -1159,7 +848,7 @@ namespace vc
         auto existing = constraints.find(def);
         if (existing == constraints.end())
           constraints[def] = {actual_type, {}};
-        else if (is_angelic(existing->second.type) && !is_default)
+        else if (is_default_type(existing->second.type) && !is_default)
           constraints[def] = {actual_type, {}};
         return;
       }
@@ -1323,21 +1012,6 @@ namespace vc
     Node>*
     active_method_cache = nullptr;
 
-  // RAII guard for active_method_cache — ensures cleanup on exception.
-  struct MethodCacheGuard
-  {
-    MethodCacheGuard(decltype(active_method_cache) cache)
-    {
-      active_method_cache = cache;
-    }
-    ~MethodCacheGuard()
-    {
-      active_method_cache = nullptr;
-    }
-    MethodCacheGuard(const MethodCacheGuard&) = delete;
-    MethodCacheGuard& operator=(const MethodCacheGuard&) = delete;
-  };
-
   static Node resolve_class_method_cached(
     const MethodOwner& owner,
     std::string_view method_name,
@@ -1480,7 +1154,7 @@ namespace vc
     return info;
   }
 
-  // ===== Shape propagation helpers =====
+  // ===== Shape propagation =====
 
   static bool replace_if_changed(
     const Node& owner, const Node& old_child, const Node& new_child)
@@ -1575,12 +1249,12 @@ namespace vc
         (params->at(i) / Type)->front(),
         arg_it->second.type->front(),
         constraints,
-        is_angelic(arg_it->second.type));
+        is_default_type(arg_it->second.type));
     }
 
     bool all_default = !constraints.empty();
     for (auto& [tp, info] : constraints)
-      if (!is_angelic(info.type))
+      if (!is_default_type(info.type))
         all_default = false;
 
     for (auto& scope : scopes)
@@ -1621,7 +1295,6 @@ namespace vc
 
     return all_default;
   }
-
   // ===== Tuple tracking =====
 
   struct TupleTracking
@@ -1674,7 +1347,6 @@ namespace vc
       tup << clone(et->front());
     return Type << tup;
   }
-
   // ===== CFG (immutable after construction) =====
 
   struct CFG
@@ -1826,33 +1498,125 @@ namespace vc
     }
   };
 
+  // ===== Liveness =====
+
+  struct Liveness
+  {
+    std::vector<std::set<Location>> defs, uses, kills;
+    std::vector<std::set<Location>> live_in, live_out;
+
+    void build(const CFG& cfg)
+    {
+      size_t n = cfg.size();
+      defs.resize(n);
+      uses.resize(n);
+      kills.resize(n);
+      live_in.resize(n);
+      live_out.resize(n);
+
+      for (size_t i = 0; i < n; i++)
+      {
+        auto body = cfg.labels[i].label / Body;
+        auto term = cfg.labels[i].label / Return;
+
+        // Collect defs and kills.
+        for (auto& stmt : *body)
+        {
+          if (!stmt->empty() && stmt->front() == LocalId)
+          {
+            auto loc = stmt->front()->location();
+            kills[i].insert(loc);
+            if (loc.view().starts_with("local$"))
+              defs[i].insert(loc);
+          }
+        }
+
+        // Collect uses (from body and terminator).
+        auto collect_uses = [&](const Node& root) {
+          if (!root)
+            return;
+          root->traverse([&](auto& node) {
+            if (node == LocalId)
+              uses[i].insert(node->location());
+            return true;
+          });
+        };
+        collect_uses(body);
+        collect_uses(term);
+
+        // Remove defs from uses.
+        for (auto& d : defs[i])
+          uses[i].erase(d);
+      }
+
+      // Fixpoint liveness.
+      bool changed = true;
+      while (changed)
+      {
+        changed = false;
+        for (size_t j = n; j-- > 0;)
+        {
+          std::set<Location> next_out;
+          for (auto s : cfg.succ[j])
+            next_out.insert(live_in[s].begin(), live_in[s].end());
+
+          std::set<Location> next_in = uses[j];
+          for (auto& loc : next_out)
+            if (kills[j].count(loc) == 0)
+              next_in.insert(loc);
+
+          if (next_out != live_out[j] || next_in != live_in[j])
+          {
+            live_out[j] = std::move(next_out);
+            live_in[j] = std::move(next_in);
+            changed = true;
+          }
+        }
+      }
+    }
+
+    bool is_live_in(size_t label, const Location& loc) const
+    {
+      return live_in[label].count(loc) > 0;
+    }
+
+    bool is_defined(size_t label, const Location& loc) const
+    {
+      return defs[label].count(loc) > 0;
+    }
+  };
+
   // ===== GlobalInfer (orchestrator) =====
-  //
-  // Product lattice per location (ALGORITHM.md §2):
-  //   fwd[x]  — forward type (lower bound, ascending via join)
-  //   ub[x]   — upper bound (backward constraint, descending via meet)
-  //
-  // Forward and backward are independent analyses that interact
-  // through refinement. The AST is mutated only at finalization.
 
   struct GlobalInfer
   {
     Node top;
     CFG cfg;
+    Liveness liveness;
 
     // Per-label state: stored INPUTS in each direction.
-    std::vector<TypeEnv> fwd;      // fwd[i] = forward types at ENTRY
-    std::vector<TypeEnv> ub;       // ub[i] = upper bound constraints at EXIT
-    std::vector<TypeEnv> fwd_exit; // fwd_exit[i] = forward types at EXIT
+    std::vector<TypeEnv> fwd; // fwd[i] = forward types at ENTRY of label i
+    std::vector<TypeEnv> bwd; // bwd[i] = backward constraints at EXIT
+
+    // Forward exit envs: computed during solve, used by finalization.
+    std::vector<TypeEnv> fwd_exit; // fwd_exit[i] = types at EXIT of label i
 
     // Cross-function mappings.
-    std::map<Node, size_t> func_entry;
-    std::map<Node, std::vector<size_t>> func_returns;
+    std::map<Node, size_t> func_entry; // Function -> entry label index
+    std::map<Node, std::vector<size_t>>
+      func_returns; // Function -> return label indices
 
-    // Forward pass shared state (reset per-label or per-solve).
+    // Shared mutable state.
     std::map<Location, Node> lookup_stmts;
+    std::set<std::pair<Location, Location>> typevar_aliases;
     std::map<Location, std::pair<Location, size_t>> ref_to_tuple;
-    std::map<Location, TupleTracking> tuple_locals;
+
+    // Inferred TypeArgs tracked in side-structure (not AST).
+    // Key is the call statement's LocalId location; value is the
+    // inferred TypeArgs for each scope in the FuncName path.
+    // Written to AST at finalization.
+    std::map<Node, std::vector<std::pair<Node, Node>>>
+      call_typeargs; // stmt -> [(name_elem, TypeArgs)]
 
     // Method resolution cache.
     std::map<
@@ -1860,291 +1624,15 @@ namespace vc
       Node>
       method_cache_storage;
 
-    // Worklist of (label, direction) pairs, ordered so that:
-    //   Forward entries come before Backward (forward-first priority)
-    //   Forward: ascending RPO (predecessors first)
-    //   Backward: descending RPO (successors first)
-    // enqueue(label, Both) inserts two entries.
-    struct WorkItem
-    {
-      size_t label;
-      Direction dir;
-    };
-    struct WorkItemCompare
-    {
-      const std::vector<size_t>& rpo;
-      bool operator()(const WorkItem& a, const WorkItem& b) const
-      {
-        // Forward (0) before Backward (1).
-        if (a.dir != b.dir)
-          return a.dir < b.dir;
-        auto ra = rpo[a.label];
-        auto rb = rpo[b.label];
-        if (a.dir == Direction::Forward)
-          return (ra != rb) ? (ra < rb) : (a.label < b.label);
-        else
-          return (ra != rb) ? (ra > rb) : (a.label > b.label);
-      }
-    };
-    WorkItemCompare wi_cmp{cfg.rpo_index};
-    std::set<WorkItem, WorkItemCompare> worklist{wi_cmp};
+    // Per-label tuple tracking state.
+    std::map<Location, TupleTracking> tuple_locals;
 
-    void enqueue(size_t label, Direction dir)
-    {
-      if (dir == Direction::Both)
-      {
-        worklist.insert({label, Direction::Forward});
-        worklist.insert({label, Direction::Backward});
-      }
-      else
-      {
-        worklist.insert({label, dir});
-      }
-    }
-
-    bool dequeue(size_t& label, Direction& dir)
-    {
-      if (worklist.empty())
-        return false;
-      auto it = worklist.begin();
-      label = it->label;
-      dir = it->dir;
-      worklist.erase(it);
-      return true;
-    }
-
-    // ===== Push helpers =====
-
-    // Forward push: join into target env. Returns true if changed.
-    bool push_fwd(
-      TypeEnv& target,
-      const Location& loc,
-      const Node& type,
-      Node call_node = {})
-    {
-      auto it = target.find(loc);
-      if (it == target.end())
-      {
-        target[loc] = {clone(type), call_node};
-        return true;
-      }
-      if (it->second.type == type)
-        return false;
-      auto joined = join_type(it->second.type, type, top);
-      if (!joined)
-        return false;
-      it->second.type = joined;
-      if (call_node && !it->second.call_node)
-        it->second.call_node = call_node;
-      return true;
-    }
-
-    // Backward push: meet into target env. Returns true if changed.
-    // ALGORITHM.md §4: "ub[x] ⊓= T — always intersection."
-    bool push_ub(
-      TypeEnv& target,
-      const Location& loc,
-      const Node& type)
-    {
-      auto it = target.find(loc);
-      if (it == target.end())
-      {
-        target[loc] = {clone(type), {}};
-        return true;
-      }
-      auto met = meet_type(it->second.type, type, top);
-      if (!met)
-        return false;
-      it->second.type = met;
-      return true;
-    }
-
-    // ===== Cross-function push =====
-
-    bool push_param_type(
-      const Node& func_def,
-      const Location& param_loc,
-      const Node& type)
-    {
-      auto entry_it = func_entry.find(func_def);
-      if (entry_it == func_entry.end())
-        return false;
-      bool changed = push_fwd(fwd[entry_it->second], param_loc, type);
-      if (changed)
-        enqueue(entry_it->second, Direction::Forward);
-      return changed;
-    }
-
-    bool push_return_constraint(
-      const Node& func_def,
-      const Node& type)
-    {
-      auto ret_it = func_returns.find(func_def);
-      if (ret_it == func_returns.end())
-        return false;
-      bool changed = false;
-      for (auto idx : ret_it->second)
-      {
-        auto term = cfg.labels[idx].label / Return;
-        if (term == Return)
-        {
-          auto ret_loc = (term / LocalId)->location();
-          if (push_ub(ub[idx], ret_loc, type))
-          {
-            enqueue(idx, Direction::Backward);
-            changed = true;
-          }
-        }
-      }
-      return changed;
-    }
-
-    void push_args_to_callee(
-      const Node& func_def,
-      const Node& args,
-      TypeEnv& caller_env)
-    {
-      auto params = func_def / Params;
-      auto parent_cls = func_def->parent(ClassDef);
-
-      for (size_t i = 0; i < params->size() && i < args->size(); i++)
-      {
-        auto param = params->at(i);
-        auto formal_type = param / Type;
-        if (!contains_typevar(formal_type))
-          continue;
-
-        Node resolved;
-        bool allow_default = false;
-        if (parent_cls)
-        {
-          auto pname = (param / Ident)->location().view();
-          for (auto& child : *(parent_cls / ClassBody))
-          {
-            if (child != FieldDef)
-              continue;
-            if ((child / Ident)->location().view() != pname)
-              continue;
-            if (!contains_typevar(child / Type))
-              resolved = child / Type;
-            else if (is_lambda_function(func_def))
-              allow_default = true;
-            break;
-          }
-        }
-
-        if (!resolved)
-        {
-          auto arg_loc = (args->at(i) / Rhs)->location();
-          auto arg_it = caller_env.find(arg_loc);
-          if (
-            arg_it == caller_env.end() ||
-            contains_typevar(arg_it->second.type))
-            continue;
-          if (
-            contains_angelic(arg_it->second.type) && !allow_default)
-            continue;
-          resolved = arg_it->second.type;
-        }
-
-        push_param_type(
-          func_def, (param / Ident)->location(), resolved);
-      }
-    }
-
-    bool push_shape_to_lambda(
-      const Node& shape_type,
-      const Node& actual_type)
-    {
-      if (shape_type != Type || actual_type != Type)
-        return false;
-      auto shape_inner = shape_type->front();
-      auto actual_inner = actual_type->front();
-      if (shape_inner != TypeName || actual_inner != TypeName)
-        return false;
-      auto shape_def = find_def(top, shape_inner);
-      auto actual_def = find_def(top, actual_inner);
-      if (!shape_def || !actual_def)
-        return false;
-
-      while (shape_def == TypeAlias)
-      {
-        auto alias_type = shape_def / Type;
-        if (alias_type->front() != TypeName)
-          break;
-        shape_def = find_def(top, alias_type->front());
-        if (!shape_def)
-          return false;
-      }
-
-      if (shape_def != ClassDef || actual_def != ClassDef)
-        return false;
-      if ((shape_def / Shape) != Shape)
-        return false;
-
-      bool changed = false;
-      auto shape_subst = build_class_subst(shape_def, shape_inner);
-      for (auto& sf : *(shape_def / ClassBody))
-      {
-        if (sf != Function)
-          continue;
-        auto mname = (sf / Ident)->location().view();
-        auto hand = (sf / Lhs)->type();
-
-        for (auto& af : *(actual_def / ClassBody))
-        {
-          if (af != Function)
-            continue;
-          if ((af / Ident)->location().view() != mname)
-            continue;
-          if ((af / Lhs)->type() != hand)
-            continue;
-          if ((af / Params)->size() != (sf / Params)->size())
-            continue;
-
-          auto shape_params = sf / Params;
-          auto actual_params = af / Params;
-          for (size_t j = 0; j < shape_params->size(); j++)
-          {
-            auto ap = actual_params->at(j);
-            auto apt = ap / Type;
-            if (apt->front() != TypeVar)
-              continue;
-            auto spt =
-              apply_subst(top, shape_params->at(j) / Type, shape_subst);
-            if (!spt || spt->front() == TypeVar || spt->front() == TypeSelf)
-              continue;
-            if (push_param_type(
-                  af->parent(Function) ? af->parent(Function) : af,
-                  (ap / Ident)->location(),
-                  spt))
-              changed = true;
-          }
-
-          auto shape_ret = apply_subst(top, sf / Type, shape_subst);
-          if (shape_ret && shape_ret->front() != TypeVar)
-          {
-            auto actual_ret = af / Type;
-            if (
-              actual_ret->front() == TypeVar ||
-              (is_lambda_function(af) && lambda_return_was_omitted(af)))
-            {
-              auto lambda_func =
-                af->parent(Function) ? af->parent(Function) : af;
-              if (push_return_constraint(lambda_func, shape_ret))
-                changed = true;
-            }
-          }
-          break;
-        }
-      }
-      return changed;
-    }
-
-    // ===== Forward Transfer Functions (ALGORITHM.md §3.1) =====
-
+    // Run forward transfer functions over a label body.
+    // Reads from env (starts as copy of fwd[label]).
+    // Returns true if any type was produced/changed.
     bool forward_pass(
-      TypeEnv& env, const Node& body, const Node& /*func*/)
+      TypeEnv& env, const Node& body,
+      const Node& /*func*/)
     {
       bool changed = false;
       auto merge = [&](const Location& loc, const Node& type,
@@ -2156,10 +1644,12 @@ namespace vc
           changed = true;
           return true;
         }
-        auto joined = join_type(it->second.type, type, top);
-        if (!joined)
+        if (it->second.type == type)
           return false;
-        it->second.type = joined;
+        auto merged = merge_type(it->second.type, type, top);
+        if (!merged)
+          return false;
+        it->second.type = merged;
         if (call_node && !it->second.call_node)
           it->second.call_node = call_node;
         changed = true;
@@ -2171,49 +1661,41 @@ namespace vc
         if (stmt == Const)
         {
           auto dst = stmt->front();
-          Node type;
+          Node type_tok;
           if (stmt->size() == 3)
+            type_tok = stmt->at(1);
+          else
+            type_tok = default_literal_type(stmt->back());
+          Node type;
+          if (type_tok == DefaultInt)
           {
-            // Explicitly typed literal.
-            type = primitive_or_ffi_type(stmt->at(1)->type());
+            auto it = env.find(dst->location());
+            if (it != env.end() && !is_angelic(it->second.type) &&
+                !is_default_type(it->second.type))
+            {
+              auto prim = extract_primitive(it->second.type);
+              if (prim && prim->in(integer_types))
+                type = clone(it->second.type);
+            }
+            if (!type)
+              type = angelic_int();
+          }
+          else if (type_tok == DefaultFloat)
+          {
+            auto it = env.find(dst->location());
+            if (it != env.end() && !is_angelic(it->second.type) &&
+                !is_default_type(it->second.type))
+            {
+              auto prim = extract_primitive(it->second.type);
+              if (prim && prim->in(float_types))
+                type = clone(it->second.type);
+            }
+            if (!type)
+              type = angelic_float();
           }
           else
           {
-            // Untyped literal — produce Angelic.
-            auto lit = stmt->back();
-            if (lit->in({Bin, Oct, Int, Hex, Char}))
-            {
-              // If forward env already has a concrete integer for
-              // this location (from a prior iteration's refinement),
-              // preserve it.
-              auto it = env.find(dst->location());
-              if (it != env.end() && !is_angelic(it->second.type))
-              {
-                auto prim = extract_primitive(it->second.type);
-                if (prim && prim->in(integer_types))
-                  type = clone(it->second.type);
-              }
-              if (!type)
-                type = angelic_int();
-            }
-            else if (lit->in({Float, HexFloat}))
-            {
-              auto it = env.find(dst->location());
-              if (it != env.end() && !is_angelic(it->second.type))
-              {
-                auto prim = extract_primitive(it->second.type);
-                if (prim && prim->in(float_types))
-                  type = clone(it->second.type);
-              }
-              if (!type)
-                type = angelic_float();
-            }
-            else if (lit->in({True, False}))
-              type = primitive_type(Bool);
-            else if (lit == None)
-              type = primitive_type(None);
-            else
-              type = make_type(); // Fallback.
+            type = primitive_or_ffi_type(type_tok->type());
           }
           merge(dst->location(), type);
         }
@@ -2230,8 +1712,22 @@ namespace vc
           auto dst_loc = (stmt / LocalId)->location();
           auto src_loc = (stmt / Rhs)->location();
           auto src_it = env.find(src_loc);
+          auto dst_it = env.find(dst_loc);
+
+          if (src_it != env.end() && dst_it != env.end())
+          {
+            bool dst_tv = dst_it->second.type->front() == TypeVar;
+            bool src_tv = src_it->second.type->front() == TypeVar;
+            if (dst_tv != src_tv)
+              typevar_aliases.insert({dst_loc, src_loc});
+          }
+
           if (src_it != env.end())
             merge(dst_loc, src_it->second.type, src_it->second.call_node);
+
+          auto tuple_ref = ref_to_tuple.find(src_loc);
+          if (tuple_ref != ref_to_tuple.end())
+            ref_to_tuple[dst_loc] = tuple_ref->second;
         }
         else if (stmt == RegisterRef)
         {
@@ -2435,11 +1931,11 @@ namespace vc
         }
         else if (stmt == TypeAssertion)
         {
-          // TypeAssertion is a hard constraint — overwrite directly,
-          // not via join. This is idempotent and bounded.
           auto loc = (stmt / LocalId)->location();
-          env[loc] = {clone(stmt / Type), {}};
-          changed = true;
+          merge(loc, clone(stmt / Type));
+          auto it = env.find(loc);
+          if (it != env.end())
+            it->second.type = clone(stmt / Type); // Fixed.
         }
         else if (stmt->in({New, Stack}))
         {
@@ -2449,7 +1945,28 @@ namespace vc
         {
           auto dst_loc = (stmt / LocalId)->location();
           auto lhs_loc = (stmt / Lhs)->location();
+          auto rhs_loc = (stmt / Rhs)->location();
           auto lhs_it = env.find(lhs_loc);
+          auto rhs_it = env.find(rhs_loc);
+
+          if (
+            lhs_it != env.end() && rhs_it != env.end() &&
+            is_default_type(lhs_it->second.type))
+          {
+            auto rhs_prim = extract_callable_primitive(rhs_it->second.type);
+            bool compatible = rhs_prim &&
+              ((is_default_int(lhs_it->second.type) &&
+                rhs_prim->in(integer_types)) ||
+               (is_default_float(lhs_it->second.type) &&
+                rhs_prim->in(float_types)));
+            if (compatible)
+            {
+              auto refined = primitive_or_ffi_type(rhs_prim->type());
+              merge(dst_loc, clone(refined));
+              lhs_it = env.find(lhs_loc);
+            }
+          }
+
           if (lhs_it != env.end())
             merge(dst_loc, clone(lhs_it->second.type));
         }
@@ -2488,7 +2005,7 @@ namespace vc
           auto args = stmt / Args;
           auto params = func_def / Params;
 
-          bool all_angelic =
+          bool all_default =
             infer_typeargs(stmt, func_def, scopes, env, top);
 
           NodeMap<Node> subst;
@@ -2506,7 +2023,7 @@ namespace vc
             merge(
               (stmt / LocalId)->location(),
               ret,
-              all_angelic ? stmt : Node{});
+              all_default ? stmt : Node{});
 
           for (size_t i = 0; i < params->size() && i < args->size(); i++)
           {
@@ -2528,10 +2045,11 @@ namespace vc
           auto src_it = env.find((stmt / Rhs)->location());
           if (src_it != env.end())
           {
-            if (is_angelic(src_it->second.type))
+            if (is_default_type(src_it->second.type) ||
+                is_angelic(src_it->second.type))
             {
-              // Propagate angelic unchanged — method resolution
-              // happens when backward narrows it.
+              // Propagate angelic/default unchanged — method
+              // resolution happens when backward narrows it.
               merge(dst_loc, clone(src_it->second.type));
             }
             else
@@ -2574,7 +2092,7 @@ namespace vc
             auto recv_it = env.find((lookup_node / Rhs)->location());
             if (
               recv_it != env.end() &&
-              !is_angelic(recv_it->second.type))
+              !is_default_type(recv_it->second.type))
             {
               auto hand = (lookup_node / Lhs)->type();
               auto method_ident = lookup_method_name(lookup_node);
@@ -2648,9 +2166,13 @@ namespace vc
           auto dst_loc = (stmt / LocalId)->location();
           auto src_it = env.find((stmt / Rhs)->location());
           if (src_it != env.end())
-            merge(dst_loc, cown_type(src_it->second.type));
+          {
+            auto apply_ret = src_it->second.type;
+            // Track When return type in env, not AST.
+            merge(dst_loc, cown_type(apply_ret));
+          }
 
-          // Push cown inner types into lambda params.
+          // Push cown inner types into lambda params via fwd envs.
           auto l_it = lookup_stmts.find((stmt / Rhs)->location());
           if (l_it != lookup_stmts.end())
           {
@@ -2691,10 +2213,12 @@ namespace vc
                       auto ci = extract_cown_inner(arg_it->second.type);
                       if (!ci || contains_typevar(ci) || is_any_type(ci))
                         continue;
+                      auto new_type = ref_type(ci);
+                      // Push into lambda's entry env, not AST.
                       push_param_type(
                         apply_func,
                         (param / Ident)->location(),
-                        ref_type(ci));
+                        new_type);
                     }
                   }
                 }
@@ -2711,27 +2235,749 @@ namespace vc
       return changed;
     }
 
-    // Backward transfer: runs backward transfer functions over a label body.
-    // Populates ub_entry with upper bound constraints.
-    // Iteration 2 will implement the full transfer functions.
+    // Run backward transfer functions over a label body (reverse order).
+    // Reads from env (forward types) and bwd_exit (backward constraints
+    // from successors). Produces bwd_entry (constraints to push to preds).
     bool backward_pass(
-      TypeEnv& /*env*/,
-      TypeEnv& /*ub_entry*/,
-      const TypeEnv& /*ub_exit*/,
-      const Node& /*body*/)
+      TypeEnv& env,
+      TypeEnv& bwd_entry,
+      const TypeEnv& bwd_exit,
+      const Node& body)
     {
-      // Stub: no backward constraints generated.
+      bool changed = false;
+
+      // Build const_defs and def_stmts for this body.
+      std::map<Location, Node> const_defs;
+      std::map<Location, Node> def_stmts;
+      for (auto& stmt : *body)
+      {
+        if (!stmt->empty() && stmt->front() == LocalId)
+          def_stmts[stmt->front()->location()] = stmt;
+        if (stmt == Const)
+          const_defs[(stmt / LocalId)->location()] = stmt;
+      }
+
+      // refine_local_const: refine default-typed Const literals in env
+      // only. AST writes are deferred to finalization.
+      auto refine_local_const =
+        [&](const Location& loc, const Node& expected) -> bool {
+        auto const_it = const_defs.find(loc);
+        if (const_it == const_defs.end())
+          return false;
+        auto env_it = env.find(loc);
+        if (env_it == env.end())
+          return false;
+        auto expected_prim = extract_primitive(expected);
+        if (!expected_prim)
+          return false;
+        auto current_prim = extract_primitive(env_it->second.type);
+        bool compatible = (is_default_int(env_it->second.type) &&
+                           expected_prim->in(integer_types)) ||
+          (is_default_float(env_it->second.type) &&
+           expected_prim->in(float_types)) ||
+          (current_prim && current_prim->in(integer_types) &&
+           expected_prim->in(integer_types)) ||
+          (current_prim && current_prim->in(float_types) &&
+           expected_prim->in(float_types));
+        if (!compatible)
+          return false;
+        env_it->second.type = primitive_or_ffi_type(expected_prim->type());
+        // No AST mutation here — deferred to finalize().
+        changed = true;
+        return true;
+      };
+
+      // merge_bwd: merge a backward constraint into bwd_entry.
+      auto merge_bwd = [&](const Location& loc, const Node& type) -> bool {
+        if (!type || type->empty() ||
+            type->front()->in({TypeVar, DefaultInt, DefaultFloat, AngelicSubtype}))
+          return false;
+        auto it = bwd_entry.find(loc);
+        if (it == bwd_entry.end())
+        {
+          bwd_entry[loc] = {clone(type), {}};
+          changed = true;
+          return true;
+        }
+        auto merged = merge_type(it->second.type, type, top);
+        if (!merged)
+          return false;
+        it->second.type = merged;
+        changed = true;
+        return true;
+      };
+
+      // Walk body in reverse.
+      for (auto it = body->rbegin(); it != body->rend(); ++it)
+      {
+        auto& stmt = *it;
+
+        if (stmt->in({Copy, Move}))
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto src_loc = (stmt / Rhs)->location();
+          auto dst_it = env.find(dst_loc);
+          if (dst_it != env.end())
+          {
+            Node expected = dst_it->second.type;
+            // Check bwd_entry (locally accumulated), then bwd_exit
+            // for a concrete override.
+            auto be_it = bwd_entry.find(dst_loc);
+            if (
+              be_it != bwd_entry.end() && be_it->second.type &&
+              !be_it->second.type->empty() &&
+              !be_it->second.type->front()->in(
+                {TypeVar, DefaultInt, DefaultFloat,
+                 AngelicSubtype, Union}))
+              expected = be_it->second.type;
+            else
+            {
+              auto bx_it = bwd_exit.find(dst_loc);
+              if (
+                bx_it != bwd_exit.end() && bx_it->second.type &&
+                !bx_it->second.type->empty() &&
+                !bx_it->second.type->front()->in(
+                  {TypeVar, DefaultInt, DefaultFloat,
+                   AngelicSubtype, Union}))
+                expected = bx_it->second.type;
+            }
+
+            // Only push if expected is concrete (not Angelic/Default).
+            if (!is_default_type(expected) && !is_angelic(expected))
+            {
+              snmalloc::UNUSED(refine_local_const(src_loc, expected));
+              snmalloc::UNUSED(merge_bwd(src_loc, expected));
+            }
+          }
+        }
+        else if (stmt == Load)
+        {
+          auto src_loc = (stmt / Rhs)->location();
+          auto dst_loc = (stmt / LocalId)->location();
+          auto dst_it = env.find(dst_loc);
+          if (dst_it != env.end() && !is_default_type(dst_it->second.type))
+            snmalloc::UNUSED(
+              merge_bwd(src_loc, ref_type(clone(dst_it->second.type))));
+        }
+        else if (stmt == Store)
+        {
+          auto ref_loc = (stmt / Rhs)->location();
+          auto val_loc = ((stmt / Arg) / Rhs)->location();
+          auto ref_it = env.find(ref_loc);
+          if (ref_it != env.end())
+          {
+            auto inner = extract_ref_inner(ref_it->second.type);
+            if (inner && !is_any_type(inner))
+            {
+              snmalloc::UNUSED(refine_local_const(val_loc, inner));
+              snmalloc::UNUSED(merge_bwd(val_loc, clone(inner)));
+            }
+          }
+        }
+        else if (stmt->in({New, Stack}))
+        {
+          auto new_type = stmt / Type;
+          auto inner = new_type->front();
+          if (inner == TypeName)
+          {
+            auto class_def = find_def(top, inner);
+            if (class_def && class_def == ClassDef)
+            {
+              auto subst = build_class_subst(class_def, inner);
+              for (auto& na : *(stmt / NewArgs))
+              {
+                auto arg_loc = (na / Rhs)->location();
+                auto fname = (na / Ident)->location().view();
+                for (auto& f : *(class_def / ClassBody))
+                {
+                  if (f != FieldDef)
+                    continue;
+                  if ((f / Ident)->location().view() != fname)
+                    continue;
+                  auto ft = apply_subst(top, f / Type, subst);
+                  if (ft && !contains_typevar(ft))
+                  {
+                    snmalloc::UNUSED(refine_local_const(arg_loc, ft));
+                    snmalloc::UNUSED(merge_bwd(arg_loc, ft));
+                  }
+                  // FieldDef TypeVar → concrete: tracked via env,
+                  // written at finalization.
+                  break;
+                }
+              }
+            }
+          }
+        }
+        else if (stmt->in(propagate_lhs_ops))
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto lhs_loc = (stmt / Lhs)->location();
+          auto rhs_loc = (stmt / Rhs)->location();
+          auto lhs_it = env.find(lhs_loc);
+          if (lhs_it != env.end())
+            snmalloc::UNUSED(merge_bwd(rhs_loc, clone(lhs_it->second.type)));
+          auto dst_it = env.find(dst_loc);
+          if (dst_it != env.end() && !is_default_type(dst_it->second.type))
+          {
+            snmalloc::UNUSED(merge_bwd(lhs_loc, clone(dst_it->second.type)));
+            snmalloc::UNUSED(merge_bwd(rhs_loc, clone(dst_it->second.type)));
+          }
+        }
+        else if (stmt->in(propagate_rhs_ops))
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto src_loc = (stmt / Rhs)->location();
+          auto dst_it = env.find(dst_loc);
+          if (dst_it != env.end() && !is_default_type(dst_it->second.type))
+            snmalloc::UNUSED(merge_bwd(src_loc, clone(dst_it->second.type)));
+        }
+        else if (stmt == FFIStore)
+        {
+          auto value_loc = (stmt / ValueSrc)->location();
+          auto expected = clone(stmt / Type);
+          snmalloc::UNUSED(refine_local_const(value_loc, expected));
+          snmalloc::UNUSED(merge_bwd(value_loc, expected));
+        }
+        else if (stmt == Call)
+        {
+          std::vector<ScopeInfo> scopes;
+          auto func_def = navigate_call(stmt, top, scopes);
+          if (!func_def)
+            continue;
+
+          auto args = stmt / Args;
+          auto params = func_def / Params;
+          auto ret_type = func_def / Type;
+
+          NodeMap<Node> subst;
+          for (auto& scope : scopes)
+          {
+            auto ta = scope.name_elem / TypeArgs;
+            auto tps = scope.def / TypeParams;
+            if (!ta->empty() && ta->size() == tps->size())
+              for (size_t i = 0; i < tps->size(); i++)
+                subst[tps->at(i)] = ta->at(i);
+          }
+
+          // Check if the Call result has a backward constraint
+          // that can refine TypeArgs.
+          auto dst_loc = (stmt / LocalId)->location();
+          {
+            Node bwd_result;
+            auto be_it = bwd_entry.find(dst_loc);
+            if (
+              be_it != bwd_entry.end() &&
+              !is_default_type(be_it->second.type) &&
+              !is_uninformative_backward_type(be_it->second.type))
+              bwd_result = be_it->second.type;
+            if (!bwd_result)
+            {
+              auto bx_it = bwd_exit.find(dst_loc);
+              if (
+                bx_it != bwd_exit.end() &&
+                !is_default_type(bx_it->second.type) &&
+                !is_uninformative_backward_type(bx_it->second.type))
+                bwd_result = bx_it->second.type;
+            }
+
+            if (bwd_result && ret_type->front() != TypeVar)
+            {
+              // Extract TypeParam constraints from return type
+              // vs backward constraint.
+              NodeMap<LocalTypeInfo> constraints;
+              extract_constraints(
+                top,
+                ret_type->front(),
+                bwd_result->front(),
+                constraints,
+                false);
+
+              // Update substitution with new constraints.
+              for (auto& scope : scopes)
+              {
+                auto tps = scope.def / TypeParams;
+                for (auto& tp : *tps)
+                {
+                  auto find = constraints.find(tp);
+                  if (find != constraints.end() &&
+                      !is_default_type(find->second.type))
+                    subst[tp] = find->second.type;
+                }
+              }
+            }
+          }
+
+          for (size_t i = 0; i < params->size() && i < args->size(); i++)
+          {
+            auto expected = apply_subst(top, params->at(i) / Type, subst);
+            if (
+              expected && expected->front() != TypeVar &&
+              !is_uninformative_backward_type(expected))
+            {
+              auto arg_loc = (args->at(i) / Rhs)->location();
+              snmalloc::UNUSED(refine_local_const(arg_loc, expected));
+              snmalloc::UNUSED(merge_bwd(arg_loc, expected));
+            }
+          }
+        }
+        else if (stmt->in({CallDyn, TryCallDyn}))
+        {
+          auto dst_loc = (stmt / LocalId)->location();
+          auto src_loc = (stmt / Rhs)->location();
+          auto args = stmt / Args;
+
+          auto lookup_it = lookup_stmts.find(src_loc);
+          if (lookup_it != lookup_stmts.end())
+          {
+            auto lookup_node = lookup_it->second;
+            auto recv_loc = (lookup_node / Rhs)->location();
+            auto recv_it = env.find(recv_loc);
+            if (recv_it != env.end())
+            {
+              auto hand = (lookup_node / Lhs)->type();
+              auto method_ident = lookup_method_name(lookup_node);
+              auto method_ta = lookup_node / TypeArgs;
+              auto arity = from_chars_sep_v<size_t>(lookup_node / Int);
+
+              Node resolve_type = recv_it->second.type;
+
+              // If receiver is default-typed, try to determine the
+              // concrete type from backward constraints or args.
+              if (is_default_type(resolve_type))
+              {
+                // Check if the CallDyn result has a backward
+                // constraint (from a downstream Call param type).
+                Node target_prim;
+                auto be_it = bwd_entry.find(dst_loc);
+                if (be_it != bwd_entry.end())
+                  target_prim = extract_primitive(be_it->second.type);
+                if (!target_prim)
+                {
+                  auto bx_it = bwd_exit.find(dst_loc);
+                  if (bx_it != bwd_exit.end())
+                    target_prim = extract_primitive(bx_it->second.type);
+                }
+
+                // Check if any arg has a concrete type.
+                if (!target_prim)
+                {
+                  for (auto& arg_node : *args)
+                  {
+                    auto arg_it =
+                      env.find((arg_node / Rhs)->location());
+                    if (
+                      arg_it != env.end() &&
+                      !is_default_type(arg_it->second.type))
+                    {
+                      target_prim =
+                        extract_callable_primitive(arg_it->second.type);
+                      if (target_prim)
+                        break;
+                    }
+                  }
+                }
+
+                if (target_prim)
+                {
+                  bool compat =
+                    (is_default_int(resolve_type) &&
+                     target_prim->in(integer_types)) ||
+                    (is_default_float(resolve_type) &&
+                     target_prim->in(float_types));
+                  if (compat)
+                  {
+                    resolve_type =
+                      primitive_or_ffi_type(target_prim->type());
+                    // Refine the receiver and its Const.
+                    snmalloc::UNUSED(
+                      refine_local_const(recv_loc, resolve_type));
+                    snmalloc::UNUSED(
+                      merge_bwd(recv_loc, clone(resolve_type)));
+                  }
+                }
+              }
+
+              // Only resolve and push param types when we found
+              // a concrete target_prim. Otherwise leave unresolved.
+              if (resolve_type && !is_default_type(resolve_type))
+              {
+                auto info = resolve_callable_method(
+                  top,
+                  resolve_type,
+                  method_ident,
+                  hand,
+                  arity,
+                  method_ta);
+                if (info.func)
+                {
+                  auto params = info.func / Params;
+                  for (
+                    size_t i = 0;
+                    i < params->size() && i < args->size();
+                    i++)
+                  {
+                    auto expected =
+                      apply_subst(top, params->at(i) / Type, info.subst);
+                    if (
+                      expected && expected->front() != TypeVar &&
+                      !is_uninformative_backward_type(expected))
+                    {
+                      auto arg_loc = (args->at(i) / Rhs)->location();
+                      snmalloc::UNUSED(
+                        refine_local_const(arg_loc, expected));
+                      snmalloc::UNUSED(merge_bwd(arg_loc, expected));
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        else if (stmt == FFI)
+        {
+          auto sym_name = (stmt / SymbolId)->location();
+          auto cls = body->parent(Function)->parent(ClassDef);
+          while (cls)
+          {
+            bool found = false;
+            for (auto& child : *(cls / ClassBody))
+            {
+              if (child != Lib)
+                continue;
+              for (auto& sym : *(child / Symbols))
+              {
+                if (sym != Symbol)
+                  continue;
+                if ((sym / SymbolId)->location() != sym_name)
+                  continue;
+                auto ffi_params = sym / FFIParams;
+                auto ffi_args = stmt / Args;
+                auto fp = ffi_params->begin();
+                auto fa = ffi_args->begin();
+                while (fp != ffi_params->end() && fa != ffi_args->end())
+                {
+                  snmalloc::UNUSED(
+                    refine_local_const((*fa)->location(), clone(*fp)));
+                  snmalloc::UNUSED(
+                    merge_bwd((*fa)->location(), clone(*fp)));
+                  ++fp;
+                  ++fa;
+                }
+                found = true;
+                break;
+              }
+              if (found)
+                break;
+            }
+            if (found)
+              break;
+            cls = cls->parent(ClassDef);
+          }
+        }
+        // When backward is a no-op.
+      }
+
+      return changed;
+    }
+
+    // RPO-ordered worklist. Labels are processed in reverse
+    // post-order (lower RPO index first). This ensures forward
+    // types are computed before successors need them, and backward
+    // constraints reach predecessors before they process.
+    std::set<size_t> worklist_set; // ordered by RPO via comparator below
+    std::map<size_t, Direction> worklist_dir;
+
+    void enqueue(size_t label, Direction dir)
+    {
+      auto it = worklist_dir.find(label);
+      if (it == worklist_dir.end())
+      {
+        worklist_set.insert(label);
+        worklist_dir[label] = dir;
+      }
+      else
+      {
+        if (it->second != dir)
+          it->second = Direction::Both;
+      }
+    }
+
+    bool dequeue(size_t& label, Direction& dir)
+    {
+      if (worklist_set.empty())
+        return false;
+      // Pick the label with the lowest RPO index.
+      size_t best = *worklist_set.begin();
+      size_t best_rpo = cfg.rpo_index[best];
+      for (auto l : worklist_set)
+      {
+        if (cfg.rpo_index[l] < best_rpo)
+        {
+          best = l;
+          best_rpo = cfg.rpo_index[l];
+        }
+      }
+      label = best;
+      worklist_set.erase(best);
+      auto it = worklist_dir.find(label);
+      dir = it->second;
+      worklist_dir.erase(it);
+      return true;
+    }
+
+    // Merge a type into a target env at a location. Returns true if
+    // the env changed.
+    bool push(
+      TypeEnv& target,
+      const Location& loc,
+      const Node& type,
+      Node call_node = {})
+    {
+      auto it = target.find(loc);
+      if (it == target.end())
+      {
+        target[loc] = {clone(type), call_node};
+        return true;
+      }
+
+      // Pointer equality fast path.
+      if (it->second.type == type)
+      {
+        if (call_node && !it->second.call_node)
+        {
+          it->second.call_node = call_node;
+          return true;
+        }
+        return false;
+      }
+
+      auto merged = merge_type(it->second.type, type, top);
+      if (!merged)
+      {
+        if (call_node && !it->second.call_node)
+        {
+          it->second.call_node = call_node;
+          return true;
+        }
+        return false;
+      }
+
+      it->second.type = merged;
+      if (call_node && !it->second.call_node)
+        it->second.call_node = call_node;
+      return true;
+    }
+
+    // Cross-function constraint push.
+    bool push_cross(
+      const Node& /*target*/, const Node& /*type*/, Direction /*dir*/)
+    {
+      // Generic push_cross — unused, specific methods below.
       return false;
     }
 
-    // ===== Build =====
+    // Push a concrete arg type into a callee function's entry env
+    // at the param location. Replaces push_arg_types_to_params AST
+    // mutation.
+    bool push_param_type(
+      const Node& func_def,
+      const Location& param_loc,
+      const Node& type)
+    {
+      auto entry_it = func_entry.find(func_def);
+      if (entry_it == func_entry.end())
+        return false;
+      bool changed = push(fwd[entry_it->second], param_loc, type);
+      if (changed)
+        enqueue(entry_it->second, Direction::Forward);
+      return changed;
+    }
+
+    // Push a backward constraint on a callee function's return type.
+    // Used to propagate shape return type expectations.
+    bool push_return_constraint(
+      const Node& func_def,
+      const Node& type)
+    {
+      auto ret_it = func_returns.find(func_def);
+      if (ret_it == func_returns.end())
+        return false;
+      bool changed = false;
+      for (auto idx : ret_it->second)
+      {
+        auto term = cfg.labels[idx].label / Return;
+        if (term == Return)
+        {
+          auto ret_loc = (term / LocalId)->location();
+          if (push(bwd[idx], ret_loc, type))
+          {
+            enqueue(idx, Direction::Backward);
+            changed = true;
+          }
+        }
+      }
+      return changed;
+    }
+
+    // Push concrete arg types into callee param locations via fwd envs.
+    // Replaces the old push_arg_types_to_params that mutated AST.
+    void push_args_to_callee(
+      const Node& func_def,
+      const Node& args,
+      TypeEnv& caller_env)
+    {
+      auto params = func_def / Params;
+      auto parent_cls = func_def->parent(ClassDef);
+
+      for (size_t i = 0; i < params->size() && i < args->size(); i++)
+      {
+        auto param = params->at(i);
+        auto formal_type = param / Type;
+        if (!contains_typevar(formal_type))
+          continue;
+
+        // Check if FieldDef has a concrete type already.
+        Node resolved;
+        bool allow_default = false;
+        if (parent_cls)
+        {
+          auto pname = (param / Ident)->location().view();
+          for (auto& child : *(parent_cls / ClassBody))
+          {
+            if (child != FieldDef)
+              continue;
+            if ((child / Ident)->location().view() != pname)
+              continue;
+            if (!contains_typevar(child / Type))
+              resolved = child / Type;
+            else if (is_lambda_function(func_def))
+              allow_default = true;
+            break;
+          }
+        }
+
+        if (!resolved)
+        {
+          auto arg_loc = (args->at(i) / Rhs)->location();
+          auto arg_it = caller_env.find(arg_loc);
+          if (
+            arg_it == caller_env.end() ||
+            contains_typevar(arg_it->second.type))
+            continue;
+          if (
+            contains_default_type(arg_it->second.type) && !allow_default)
+            continue;
+          resolved = arg_it->second.type;
+        }
+
+        push_param_type(
+          func_def, (param / Ident)->location(), resolved);
+      }
+    }
+
+    // Push shape type constraints into a lambda's params/return via
+    // fwd/bwd envs. Replaces AST-mutating propagate_shape_to_lambda.
+    bool push_shape_to_lambda(
+      const Node& shape_type,
+      const Node& actual_type)
+    {
+      if (shape_type != Type || actual_type != Type)
+        return false;
+      auto shape_inner = shape_type->front();
+      auto actual_inner = actual_type->front();
+      if (shape_inner != TypeName || actual_inner != TypeName)
+        return false;
+      auto shape_def = find_def(top, shape_inner);
+      auto actual_def = find_def(top, actual_inner);
+      if (!shape_def || !actual_def)
+        return false;
+
+      while (shape_def == TypeAlias)
+      {
+        auto alias_type = shape_def / Type;
+        if (alias_type->front() != TypeName)
+          break;
+        shape_def = find_def(top, alias_type->front());
+        if (!shape_def)
+          return false;
+      }
+
+      if (shape_def != ClassDef || actual_def != ClassDef)
+        return false;
+      if ((shape_def / Shape) != Shape)
+        return false;
+
+      bool changed = false;
+      auto shape_subst = build_class_subst(shape_def, shape_inner);
+      for (auto& sf : *(shape_def / ClassBody))
+      {
+        if (sf != Function)
+          continue;
+        auto mname = (sf / Ident)->location().view();
+        auto hand = (sf / Lhs)->type();
+
+        for (auto& af : *(actual_def / ClassBody))
+        {
+          if (af != Function)
+            continue;
+          if ((af / Ident)->location().view() != mname)
+            continue;
+          if ((af / Lhs)->type() != hand)
+            continue;
+          if ((af / Params)->size() != (sf / Params)->size())
+            continue;
+
+          auto shape_params = sf / Params;
+          auto actual_params = af / Params;
+          for (size_t j = 0; j < shape_params->size(); j++)
+          {
+            auto ap = actual_params->at(j);
+            auto apt = ap / Type;
+            if (apt->front() != TypeVar)
+              continue;
+            auto spt =
+              apply_subst(top, shape_params->at(j) / Type, shape_subst);
+            if (!spt || spt->front() == TypeVar || spt->front() == TypeSelf)
+              continue;
+            // Push into lambda's entry env instead of mutating AST.
+            if (push_param_type(
+                  af->parent(Function) ? af->parent(Function) : af,
+                  (ap / Ident)->location(),
+                  spt))
+              changed = true;
+          }
+
+          auto shape_ret = apply_subst(top, sf / Type, shape_subst);
+          if (shape_ret && shape_ret->front() != TypeVar)
+          {
+            auto actual_ret = af / Type;
+            if (
+              actual_ret->front() == TypeVar ||
+              (is_lambda_function(af) && lambda_return_was_omitted(af)))
+            {
+              // Push as backward constraint on lambda returns.
+              auto lambda_func =
+                af->parent(Function) ? af->parent(Function) : af;
+              if (push_return_constraint(lambda_func, shape_ret))
+                changed = true;
+            }
+          }
+          break;
+        }
+      }
+      return changed;
+    }
 
     void build()
     {
+      // Build CFG from AST.
       cfg.build(top);
       size_t n = cfg.size();
       if (n == 0)
         return;
+
+      // Compute liveness.
+      liveness.build(cfg);
 
       // Track lambda functions with omitted return types.
       auto& lro = get_lambda_returns_omitted();
@@ -2747,12 +2993,13 @@ namespace vc
       // Allocate per-label state.
       fwd.resize(n);
       fwd_exit.resize(n);
-      ub.resize(n);
+      bwd.resize(n);
 
       // Build cross-function mappings.
       for (auto& [func, range] : cfg.func_label_range)
       {
         func_entry[func] = range.first;
+
         for (size_t i = range.first; i < range.second; i++)
         {
           auto term = cfg.labels[i].label / Return;
@@ -2771,18 +3018,17 @@ namespace vc
         }
       }
 
-      // Seed ub[return_labels] with declared return types.
-      // ALGORITHM.md §4: "return: ub[ret] ⊓= func_return_type"
+      // Seed bwd[return_labels] with declared return types.
       for (auto& [func, return_indices] : func_returns)
       {
         auto func_ret = func / Type;
-        if (!contains_typevar(func_ret) && !is_angelic(func_ret))
+        if (!contains_typevar(func_ret) && !is_default_type(func_ret))
         {
           for (auto idx : return_indices)
           {
             auto term = cfg.labels[idx].label / Return;
             auto ret_loc = (term / LocalId)->location();
-            ub[idx][ret_loc] = {clone(func_ret), {}};
+            bwd[idx][ret_loc] = {clone(func_ret), {}};
           }
         }
       }
@@ -2794,8 +3040,6 @@ namespace vc
         for (auto idx : return_indices)
           enqueue(idx, Direction::Backward);
     }
-
-    // ===== Solve (ALGORITHM.md §6) =====
 
     void solve()
     {
@@ -2813,6 +3057,7 @@ namespace vc
 
         if (wl_iters > n * MAX_ITERS_PER_LABEL)
         {
+          // Convergence failure -- emit compilation error.
           auto& li = cfg.labels[label];
           li.function->parent()->replace(
             li.function,
@@ -2832,31 +3077,33 @@ namespace vc
         bool run_bwd =
           (dir == Direction::Backward || dir == Direction::Both);
 
+        // Forward exit env — shared between forward and backward phases.
         TypeEnv label_exit;
 
         // ---- Forward phase ----
         if (run_fwd)
         {
-          // Copy entry env as starting point.
+          // Copy entry env as starting point for forward processing.
           for (auto& [loc, info] : fwd[label])
             label_exit[loc] = {clone(info.type), info.call_node};
 
-          // Preserve locally-defined variables from prior iteration.
+          // Also seed from fwd_exit[label] — locally-defined
+          // variables refined by a prior backward pass should
+          // survive the forward re-run.
           for (auto& [loc, info] : fwd_exit[label])
           {
-            if (!is_angelic(info.type))
+            if (!is_default_type(info.type))
             {
               auto it = label_exit.find(loc);
               if (it == label_exit.end())
                 label_exit[loc] = {clone(info.type), info.call_node};
-              else if (is_angelic(it->second.type))
+              else if (is_default_type(it->second.type))
                 it->second.type = clone(info.type);
             }
           }
 
-          // Clear per-label state for forward pass.
+          // Clear per-label tuple tracking.
           tuple_locals.clear();
-          ref_to_tuple.clear();
 
           // Run forward transfer functions.
           forward_pass(label_exit, body, li.function);
@@ -2867,6 +3114,7 @@ namespace vc
           // Push to successors.
           if (term == Cond)
           {
+            // Typetest narrowing on Cond.
             auto trace = trace_typetest(term / LocalId, body);
             auto& func_idx = cfg.func_label_idx[li.function];
             auto t_it =
@@ -2874,19 +3122,20 @@ namespace vc
             auto f_it =
               func_idx.find(std::string((term / Rhs)->location().view()));
 
+            // Push non-narrowed locations to both successors.
             for (auto& [loc, info] : label_exit)
             {
               if (trace && loc == trace->src->location())
-                continue;
+                continue; // Handled below with narrowing.
               if (t_it != func_idx.end())
-                if (push_fwd(fwd[t_it->second], loc, info.type, info.call_node))
+                if (push(fwd[t_it->second], loc, info.type, info.call_node))
                   enqueue(t_it->second, Direction::Forward);
               if (f_it != func_idx.end())
-                if (push_fwd(fwd[f_it->second], loc, info.type, info.call_node))
+                if (push(fwd[f_it->second], loc, info.type, info.call_node))
                   enqueue(f_it->second, Direction::Forward);
             }
 
-            // Typetest narrowing (ALGORITHM.md §3.3).
+            // Push narrowed/excluded types.
             if (trace)
             {
               auto src_loc = trace->src->location();
@@ -2896,21 +3145,19 @@ namespace vc
                 auto true_succ = trace->negated ? f_it : t_it;
                 auto false_succ = trace->negated ? t_it : f_it;
 
+                // True branch: narrowed to tested type.
                 if (true_succ != func_idx.end())
-                  if (push_fwd(
-                        fwd[true_succ->second],
-                        src_loc,
-                        trace->type,
-                        src_it->second.call_node))
+                  if (push(fwd[true_succ->second], src_loc, trace->type))
                     enqueue(true_succ->second, Direction::Forward);
 
+                // False branch: excluded type.
                 if (false_succ != func_idx.end())
                 {
                   auto excluded = exclude_tested_type(
                     top, src_it->second.type, trace->type);
                   auto& push_type =
                     excluded ? excluded : src_it->second.type;
-                  if (push_fwd(
+                  if (push(
                         fwd[false_succ->second],
                         src_loc,
                         push_type,
@@ -2928,15 +3175,19 @@ namespace vc
             if (t_it != func_idx.end())
             {
               for (auto& [loc, info] : label_exit)
-                if (push_fwd(fwd[t_it->second], loc, info.type, info.call_node))
+                if (push(fwd[t_it->second], loc, info.type, info.call_node))
                   enqueue(t_it->second, Direction::Forward);
             }
           }
+          // Return: no forward successors.
         }
 
         // ---- Backward phase ----
         if (run_bwd)
         {
+          // If forward didn't run, seed label_exit from fwd_exit[label]
+          // (which has locally-defined types from the last forward run).
+          // Fall back to fwd[label] if fwd_exit is empty.
           if (!run_fwd)
           {
             if (!fwd_exit[label].empty())
@@ -2951,15 +3202,21 @@ namespace vc
             }
           }
 
-          TypeEnv ub_entry;
-          for (auto& [loc, info] : ub[label])
-            ub_entry[loc] = {clone(info.type), info.call_node};
-          backward_pass(label_exit, ub_entry, ub[label], body);
+          // Build bwd_entry from backward transfer functions.
+          TypeEnv bwd_entry;
+          // Seed with existing bwd constraints for this label.
+          for (auto& [loc, info] : bwd[label])
+            bwd_entry[loc] = {clone(info.type), info.call_node}; 
+          backward_pass(label_exit, bwd_entry, bwd[label], body);
 
+          // Update fwd_exit with backward-refined types so the
+          // refinement step (which reads fwd_exit) sees them.
           fwd_exit[label] = label_exit;
 
-          for (auto& [loc, info] : ub_entry)
-            push_ub(ub[label], loc, info.type);
+          // Merge locally-derived backward constraints back into
+          // bwd[label] so the refinement step can see them.
+          for (auto& [loc, info] : bwd_entry)
+            push(bwd[label], loc, info.type);
 
           // Push to predecessors (path-sensitive).
           for (auto p : cfg.pred[label])
@@ -2967,15 +3224,17 @@ namespace vc
             auto& pred_li = cfg.labels[p];
             auto pred_term = pred_li.label / Return;
 
-            for (auto& [loc, info] : ub_entry)
+            for (auto& [loc, info] : bwd_entry)
             {
-              // Path-sensitive backward push (ALGORITHM.md §4.4).
+              // Path-sensitive check for Cond predecessors.
               if (pred_term == Cond)
               {
                 auto trace =
                   trace_typetest(pred_term / LocalId, pred_li.label / Body);
                 if (trace && loc == trace->src->location())
                 {
+                  // Determine which edge (true/false) connects p to
+                  // label.
                   auto& pred_func_idx = cfg.func_label_idx[pred_li.function];
                   auto t_it = pred_func_idx.find(
                     std::string((pred_term / Lhs)->location().view()));
@@ -2986,32 +3245,27 @@ namespace vc
 
                   if (is_true_edge)
                   {
-                    // True edge: intersect backward type with
-                    // tested type (ALGORITHM.md §4.4).
-                    auto intersected =
-                      meet_type(info.type, trace->type, top);
-                    if (intersected)
-                    {
-                      if (push_ub(ub[p], loc, intersected))
-                        enqueue(p, Direction::Backward);
-                    }
-                    else if (push_ub(ub[p], loc, info.type))
-                    {
-                      enqueue(p, Direction::Backward);
-                    }
-                    continue;
+                    // True edge: backward must be subtype of narrowed.
+                    SequentCtx ctx{top, {}, {}};
+                    if (!Subtype(ctx, info.type, trace->type))
+                      continue; // Skip incompatible.
                   }
+                  // False edge: push unconditionally (conservative).
                 }
               }
 
-              if (push_ub(ub[p], loc, info.type))
+              if (push(bwd[p], loc, info.type))
                 enqueue(p, Direction::Backward);
             }
           }
         }
 
-        // ---- Refinement (ALGORITHM.md §5) ----
+        // ---- Refinement ----
+        // For each unresolved type in BOTH fwd[label] (entry env)
+        // AND fwd_exit[label] (locally-defined vars), check if bwd
+        // has a compatible concrete constraint.
         {
+          // Collect locations from both entry and exit envs.
           std::set<Location> all_locs;
           for (auto& [loc, info] : fwd[label])
             all_locs.insert(loc);
@@ -3020,6 +3274,8 @@ namespace vc
 
           for (auto& loc : all_locs)
           {
+            // Find the type — prefer exit (has local defs), fall
+            // back to entry.
             LocalTypeInfo* fwd_info = nullptr;
             auto exit_it = fwd_exit[label].find(loc);
             auto entry_it = fwd[label].find(loc);
@@ -3030,50 +3286,65 @@ namespace vc
             if (!fwd_info)
               continue;
 
-            auto ub_it = ub[label].find(loc);
-            if (ub_it == ub[label].end())
+            auto bwd_it = bwd[label].find(loc);
+            if (bwd_it == bwd[label].end())
               continue;
 
             auto& fwd_type = fwd_info->type;
-            auto& ub_type = ub_it->second.type;
+            auto& bwd_type = bwd_it->second.type;
 
             if (!fwd_type || fwd_type->empty())
               continue;
             auto fwd_front = fwd_type->front();
 
-            // Only refine Angelic/TypeVar forward types.
+            // Check for unresolved forward types.
             bool is_fwd_angelic = is_angelic(fwd_type);
+            bool is_fwd_default = is_default_type(fwd_type);
             bool is_fwd_typevar = fwd_front == TypeVar;
-            if (!is_fwd_angelic && !is_fwd_typevar)
+            if (!is_fwd_angelic && !is_fwd_default && !is_fwd_typevar)
               continue;
 
-            if (!ub_type || ub_type->empty())
+            if (!bwd_type || bwd_type->empty())
               continue;
-            auto ub_front = ub_type->front();
+            auto bwd_front = bwd_type->front();
 
             // Skip if backward is also unresolved.
-            if (is_angelic(ub_type) || ub_front == TypeVar)
+            if (
+              is_angelic(bwd_type) || is_default_type(bwd_type) ||
+              bwd_front == TypeVar)
               continue;
 
-            // ALGORITHM.md §5: candidates = members(fwd) ∩ ub
-            // For now (Iteration 0), use the simpler compatible-check.
-            // Iteration 3 replaces with full R1-R4 dispatch.
             bool do_refine = false;
 
             if (is_fwd_angelic)
             {
+              // Angelic: any concrete type within the bound.
               auto bound = fwd_type->front()->front();
-              auto p = extract_primitive(ub_type);
-              if (p)
+              if (bound == DefaultInt)
               {
-                do_refine = is_angelic_compatible(fwd_type, p);
+                auto p = extract_primitive(bwd_type);
+                do_refine = p && p->in(integer_types);
               }
-              else if (!has_concrete(bound))
+              else if (bound == DefaultFloat)
               {
-                // Non-Concrete Angelic (e.g., type param) — any
-                // concrete backward type refines.
+                auto p = extract_primitive(bwd_type);
+                do_refine = p && p->in(float_types);
+              }
+              else
+              {
+                // General bound — any concrete.
                 do_refine = true;
               }
+            }
+            else if (is_fwd_default)
+            {
+              if (bwd_front->in({Union, Isect}))
+                continue;
+              auto prim = extract_primitive(bwd_type);
+              if (prim)
+                do_refine =
+                  (is_default_int(fwd_type) && prim->in(integer_types)) ||
+                  (is_default_float(fwd_type) && prim->in(float_types));
             }
             else if (is_fwd_typevar)
             {
@@ -3083,20 +3354,23 @@ namespace vc
             if (!do_refine)
               continue;
 
-            fwd_info->type = clone(ub_type);
+            fwd_info->type = clone(bwd_type);
+            // Also update entry env if present.
             if (entry_it != fwd[label].end())
-              entry_it->second.type = clone(ub_type);
+              entry_it->second.type = clone(bwd_type);
+            // Also update exit env if present.
             if (exit_it != fwd_exit[label].end())
-              exit_it->second.type = clone(ub_type);
+              exit_it->second.type = clone(bwd_type);
 
+            // Re-enqueue this label to re-run forward/backward.
             enqueue(label, Direction::Both);
+
+            if (fwd_info->call_node)
+              enqueue(label, Direction::Backward);
           }
         }
       }
     }
-
-    // ===== Finalize (stub for Iteration 0) =====
-    // Iteration 4 will implement the full finalization logic.
 
     void finalize()
     {
@@ -3104,12 +3378,44 @@ namespace vc
       if (n == 0)
         return;
 
-      // ---- 1. Per-label: Const writes, TypeAssertion removal ----
+      // ---- 1. TypeVar backprop across aliases ----
+      {
+        bool tv_changed = true;
+        while (tv_changed)
+        {
+          tv_changed = false;
+          for (auto& [dst_loc, src_loc] : typevar_aliases)
+          {
+            for (auto& ee : fwd_exit)
+            {
+              auto d = ee.find(dst_loc);
+              auto s = ee.find(src_loc);
+              if (d == ee.end() || s == ee.end())
+                continue;
+              bool dtv = d->second.type->front() == TypeVar;
+              bool stv = s->second.type->front() == TypeVar;
+              if (!dtv && stv)
+              {
+                s->second.type = clone(d->second.type);
+                tv_changed = true;
+              }
+              else if (dtv && !stv)
+              {
+                d->second.type = clone(s->second.type);
+                tv_changed = true;
+              }
+            }
+          }
+        }
+      }
+
+      // ---- 2. Per-label: Const writes, TypeAssertion removal,
+      //         NewArrayConst updates ----
       for (size_t i = 0; i < n; i++)
       {
         auto body = cfg.labels[i].label / Body;
 
-        // Compute final tuple/array types.
+        // Build tuple tracking for this label.
         struct FinalTupleInfo
         {
           size_t size;
@@ -3156,6 +3462,7 @@ namespace vc
           }
         }
 
+        // Compute final tuple/array types from element types.
         for (auto& [tuple_loc, info] : final_tuple_info)
         {
           auto values_it = final_tuple_values.find(tuple_loc);
@@ -3234,7 +3541,8 @@ namespace vc
           }
         }
 
-        // Walk body: write Const types, remove TypeAssertions.
+        // Walk body: write Const types, remove TypeAssertions, update
+        // NewArrayConst.
         auto it = body->begin();
         while (it != body->end())
         {
@@ -3249,46 +3557,59 @@ namespace vc
             auto dst = (*it)->front();
             auto loc = dst->location();
 
+            // Find the best type: prefer concrete fwd_exit, then bwd,
+            // then default fwd_exit refined by bwd.
             Node final_type;
             auto env_it = fwd_exit[i].find(loc);
             if (
               env_it != fwd_exit[i].end() &&
+              !is_default_type(env_it->second.type) &&
               !is_angelic(env_it->second.type))
               final_type = env_it->second.type;
 
             if (!final_type)
             {
-              auto ub_it = ub[i].find(loc);
+              auto bwd_it = bwd[i].find(loc);
               if (
-                ub_it != ub[i].end() &&
-                !is_angelic(ub_it->second.type))
-                final_type = ub_it->second.type;
+                bwd_it != bwd[i].end() &&
+                !is_default_type(bwd_it->second.type) &&
+                !is_angelic(bwd_it->second.type))
+                final_type = bwd_it->second.type;
             }
 
+            // Also check: if fwd_exit has Default and bwd has
+            // compatible concrete, use bwd.
             if (
               !final_type && env_it != fwd_exit[i].end() &&
-              is_angelic(env_it->second.type))
+              is_default_type(env_it->second.type))
             {
+              // Check all bwd labels in this function for a constraint.
               auto [frange_begin, frange_end] =
                 cfg.func_label_range[cfg.labels[i].function];
               for (size_t j = frange_begin; j < frange_end; j++)
               {
-                auto ub_it = ub[j].find(loc);
+                auto bwd_it = bwd[j].find(loc);
                 if (
-                  ub_it != ub[j].end() &&
-                  !is_angelic(ub_it->second.type))
+                  bwd_it != bwd[j].end() &&
+                  !is_default_type(bwd_it->second.type))
                 {
-                  auto prim = extract_primitive(ub_it->second.type);
-                  if (prim &&
-                      is_angelic_compatible(env_it->second.type, prim))
+                  auto prim = extract_primitive(bwd_it->second.type);
+                  if (prim)
                   {
-                    final_type = ub_it->second.type;
-                    break;
+                    bool compat =
+                      (is_default_int(env_it->second.type) &&
+                       prim->in(integer_types)) ||
+                      (is_default_float(env_it->second.type) &&
+                       prim->in(float_types));
+                    if (compat)
+                    {
+                      final_type = bwd_it->second.type;
+                      break;
+                    }
                   }
                 }
               }
             }
-
             Node final_prim;
             if (final_type)
               final_prim = extract_primitive(final_type);
@@ -3311,7 +3632,7 @@ namespace vc
             else if ((*it)->size() == 2)
             {
               auto lit = (*it)->back();
-              auto type_tok = literal_fallback_token(lit);
+              auto type_tok = default_literal_type(lit);
               (*it)->erase((*it)->begin(), (*it)->end());
               *it << dst << type_tok << lit;
             }
@@ -3357,6 +3678,8 @@ namespace vc
           if (type->front() != TypeVar)
             continue;
           auto ident = pd / Ident;
+          // Check fwd_exit first, then fwd[entry] (for params pushed
+          // via push_param_type that didn't get a final forward run).
           bool found = false;
           for (size_t i = range.first; i < range.second && !found; i++)
           {
@@ -3384,6 +3707,7 @@ namespace vc
           }
           if (!found)
           {
+            // Fallback: check fwd[entry_label] for cross-function pushes.
             auto entry_it = func_entry.find(func);
             if (entry_it != func_entry.end())
             {
@@ -3456,14 +3780,14 @@ namespace vc
                 if (stmt->in({CallDyn, TryCallDyn}))
                 {
                   auto loc = (stmt / LocalId)->location();
-                  bool f = false;
+                  bool found = false;
                   for (size_t j = range.first; j < range.second; j++)
                     if (fwd_exit[j].find(loc) != fwd_exit[j].end())
                     {
-                      f = true;
+                      found = true;
                       break;
                     }
-                  if (!f)
+                  if (!found)
                     unresolved = true;
                 }
             }
@@ -3538,7 +3862,6 @@ namespace vc
         // ---- 5. Error checking ----
         if (!in_generic)
         {
-          bool param_error = false;
           for (auto& pd : *(func / Params))
           {
             if ((pd / Type)->front() == TypeVar)
@@ -3546,19 +3869,15 @@ namespace vc
               func->parent()->replace(
                 func,
                 err(pd / Ident, "Cannot infer type of parameter"));
-              param_error = true;
               break;
             }
           }
-          if (!param_error)
+          func_ret = func / Type;
+          if (func_ret->front() == TypeVar)
           {
-            func_ret = func / Type;
-            if (func_ret->front() == TypeVar)
-            {
-              func->parent()->replace(
-                func,
-                err(func / Ident, "Cannot infer return type of function"));
-            }
+            func->parent()->replace(
+              func,
+              err(func / Ident, "Cannot infer return type of function"));
           }
         }
       }
@@ -3566,10 +3885,11 @@ namespace vc
 
     void run()
     {
-      MethodCacheGuard cache_guard(&method_cache_storage);
+      active_method_cache = &method_cache_storage;
       build();
       solve();
       finalize();
+      active_method_cache = nullptr;
     }
   };
 
@@ -3600,8 +3920,8 @@ namespace vc
       gi.top = top;
       gi.run();
 
-      // Sweep: resolve remaining AngelicSubtype nodes to concrete
-      // defaults (u64 for IntSet, f64 for FloatSet).
+      // Sweep: AngelicSubtype -> default, DefaultInt -> u64,
+      // DefaultFloat -> f64.
       top->traverse([](Node& node) {
         if (node == AngelicSubtype)
         {
@@ -3609,26 +3929,26 @@ namespace vc
           if (parent && !node->empty())
           {
             auto bound = node->front();
-            if (bound == Isect)
-            {
-              bool is_int = false, is_float = false;
-              for (auto& child : *bound)
-              {
-                if (child == IntSet)
-                  is_int = true;
-                if (child == FloatSet)
-                  is_float = true;
-              }
-              if (is_int)
-                parent->replace(node, primitive_type(U64)->front());
-              else if (is_float)
-                parent->replace(node, primitive_type(F64)->front());
-              else
-                parent->replace(node, clone(bound));
-            }
+            if (bound == DefaultInt)
+              parent->replace(node, primitive_type(U64)->front());
+            else if (bound == DefaultFloat)
+              parent->replace(node, primitive_type(F64)->front());
             else
               parent->replace(node, clone(bound));
           }
+          return false;
+        }
+        if (node->in({DefaultInt, DefaultFloat}))
+        {
+          auto parent = node->parent();
+          bool is_int = (node == DefaultInt);
+          if (parent == Const)
+            parent->replace(node, is_int ? Node{U64} : Node{F64});
+          else
+            parent->replace(
+              node,
+              is_int ? primitive_type(U64)->front() :
+                       primitive_type(F64)->front());
           return false;
         }
         return true;
