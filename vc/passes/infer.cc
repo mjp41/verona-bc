@@ -2626,7 +2626,40 @@ namespace vc
               if (all_agree && common_ret)
                 merge(dst_loc, common_ret);
               else
-                merge(dst_loc, clone(src_it->second.type));
+              {
+                // Return types differ across members — build an
+                // Angelic from the union of all return types.
+                // §3.1.1: result = Angelic({ Ri | Ti.method → Ri })
+                std::vector<Token> ret_prims;
+                for (auto& m : mems)
+                {
+                  auto mtype = primitive_type(m);
+                  auto ret = resolve_method_return_type(
+                    top, mtype, method_ident, hand, arity, method_ta);
+                  if (!ret || ret->front() == TypeVar)
+                    continue;
+                  auto rp = extract_primitive(ret);
+                  if (!rp)
+                    continue;
+                  bool dup = false;
+                  for (auto& r : ret_prims)
+                    if (r == rp->type())
+                    {
+                      dup = true;
+                      break;
+                    }
+                  if (!dup)
+                    ret_prims.push_back(rp->type());
+                }
+                if (!ret_prims.empty())
+                {
+                  bool concrete = has_concrete(bound);
+                  auto rb = make_angelic_bound(ret_prims, concrete);
+                  merge(dst_loc, make_angelic(rb));
+                }
+                else
+                  merge(dst_loc, clone(src_it->second.type));
+              }
             }
             else
             {
