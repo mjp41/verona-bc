@@ -3385,36 +3385,14 @@ namespace vc
 
             for (auto& [loc, info] : ub_entry)
             {
-              // Path-sensitive backward push (ALGORITHM.md §4.4).
-              if (pred_term == Cond)
-              {
-                auto trace =
-                  trace_typetest(pred_term / LocalId, pred_li.label / Body);
-                if (trace && loc == trace->src->location())
-                {
-                  auto& pred_func_idx = cfg.func_label_idx[pred_li.function];
-                  auto t_it = pred_func_idx.find(
-                    std::string((pred_term / Lhs)->location().view()));
-
-                  bool is_true_edge =
-                    (t_it != pred_func_idx.end() &&
-                     t_it->second == label) != trace->negated;
-
-                  if (is_true_edge)
-                  {
-                    // True edge: intersect backward type with
-                    // tested type (ALGORITHM.md §4.4).
-                    auto intersected =
-                      meet_type(info.type, trace->type, top);
-                    if (intersected)
-                      push_bwd(p, loc, intersected);
-                    else
-                      push_bwd(p, loc, info.type);
-                    continue;
-                  }
-                }
-              }
-
+              // No path-sensitive backward filtering for the tested
+              // variable. Precise filtering would require type-level
+              // implication (¬T ∨ S), which we can't express. Instead
+              // we push the raw constraint from both edges — sound but
+              // possibly imprecise. The predecessor merges via meet,
+              // which is correct for non-tested variables. For the
+              // tested variable, the constraint may be tighter than
+              // necessary, but refinement handles contradictions.
               push_bwd(p, loc, info.type);
             }
           }
@@ -3465,41 +3443,91 @@ namespace vc
             if (is_angelic(ub_type) || ub_front == TypeVar)
               continue;
 
-            // ALGORITHM.md §5: candidates = members(fwd) ∩ ub
-            // For now (Iteration 0), use the simpler compatible-check.
-            // Iteration 3 replaces with full R1-R4 dispatch.
-            bool do_refine = false;
+            // ===== Refinement dispatch (ALGORITHM.md §5) =====
+            // candidates = members(fwd) ∩ ub_members
 
             if (is_fwd_angelic)
             {
               auto bound = fwd_type->front()->front();
-              auto p = extract_primitive(ub_type);
-              if (p)
+              auto fwd_mems = members(bound);
+
+              // Extract ub member set for intersection.
+              std::vector<Token> ub_mems;
+              auto ub_prim = extract_primitive(ub_type);
+              if (ub_prim)
               {
-                do_refine = is_angelic_compatible(fwd_type, p);
+                ub_mems.push_back(ub_prim->type());
               }
-              else if (!has_concrete(bound))
+              else if (ub_front == Union)
               {
-                // Non-Concrete Angelic (e.g., type param) — any
-                // concrete backward type refines.
-                do_refine = true;
+                for (auto& child : *ub_front)
+                {
+                  auto p = extract_primitive(Type << clone(child));
+                  if (p)
+                    ub_mems.push_back(p->type());
+                }
               }
+
+              if (ub_mems.empty() && !has_concrete(bound) &&
+                  fwd_mems.empty())
+              {
+                // Non-Concrete Angelic (type param) with no primitive
+                // members and non-primitive ub — commit directly.
+                if (entry_it != fwd[label].end())
+                  entry_it->second.type = clone(ub_type);
+                if (exit_it != fwd_exit[label].end())
+                  exit_it->second.type = clone(ub_type);
+                enqueue(label, Direction::Both);
+                continue;
+              }
+
+              // Intersect: candidates = fwd_mems ∩ ub_mems.
+              std::vector<Token> candidates;
+              for (auto& fm : fwd_mems)
+                for (auto& um : ub_mems)
+                  if (fm == um)
+                    candidates.push_back(fm);
+
+              if (candidates.empty())
+              {
+                // R4: empty — contradictory. Leave fwd unchanged;
+                // typecheck will report the error.
+                continue;
+              }
+
+              if (candidates.size() == 1)
+              {
+                // R1: singleton — commit to concrete.
+                auto concrete_type = primitive_type(candidates[0]);
+                if (entry_it != fwd[label].end())
+                  entry_it->second.type = clone(concrete_type);
+                if (exit_it != fwd_exit[label].end())
+                  exit_it->second.type = clone(concrete_type);
+                enqueue(label, Direction::Both);
+              }
+              else if (candidates.size() < fwd_mems.size())
+              {
+                // R2: tightened bound — narrow Angelic.
+                bool concrete = has_concrete(bound);
+                auto new_bound = make_angelic_bound(candidates, concrete);
+                auto new_type = make_angelic(new_bound);
+                if (entry_it != fwd[label].end())
+                  entry_it->second.type = clone(new_type);
+                if (exit_it != fwd_exit[label].end())
+                  exit_it->second.type = clone(new_type);
+                enqueue(label, Direction::Both);
+              }
+              // R3: candidates == fwd_mems — no change, no enqueue.
             }
             else if (is_fwd_typevar)
             {
-              do_refine = true;
+              // TypeVar: any concrete backward type refines.
+              if (entry_it != fwd[label].end())
+                entry_it->second.type = clone(ub_type);
+              if (exit_it != fwd_exit[label].end())
+                exit_it->second.type = clone(ub_type);
+              enqueue(label, Direction::Both);
             }
-
-            if (!do_refine)
-              continue;
-
-            fwd_info->type = clone(ub_type);
-            if (entry_it != fwd[label].end())
-              entry_it->second.type = clone(ub_type);
-            if (exit_it != fwd_exit[label].end())
-              exit_it->second.type = clone(ub_type);
-
-            enqueue(label, Direction::Both);
           }
         }
       }
