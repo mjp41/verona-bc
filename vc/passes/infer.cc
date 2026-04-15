@@ -2482,7 +2482,28 @@ namespace vc
         {
           auto dst_loc = (stmt / LocalId)->location();
           auto lhs_loc = (stmt / Lhs)->location();
+          auto rhs_loc = (stmt / Rhs)->location();
           auto lhs_it = env.find(lhs_loc);
+          auto rhs_it = env.find(rhs_loc);
+
+          // Forward cross-operand refinement: if LHS is Angelic and
+          // RHS is a compatible concrete primitive, refine LHS to
+          // match RHS. Homogeneous ops require both operands to have
+          // the same type, so a concrete RHS constrains the LHS.
+          if (lhs_it != env.end() && rhs_it != env.end() &&
+              is_angelic(lhs_it->second.type))
+          {
+            auto rhs_prim = extract_callable_primitive(rhs_it->second.type);
+            if (rhs_prim &&
+                is_angelic_compatible(lhs_it->second.type, rhs_prim))
+            {
+              auto refined = primitive_or_ffi_type(rhs_prim->type());
+              merge(lhs_loc, refined);
+              // Re-fetch after merge may have changed the iterator.
+              lhs_it = env.find(lhs_loc);
+            }
+          }
+
           if (lhs_it != env.end())
             merge(dst_loc, clone(lhs_it->second.type));
         }
@@ -2825,6 +2846,19 @@ namespace vc
           auto dst_loc = (stmt / LocalId)->location();
           auto src_loc = (stmt / Rhs)->location();
           auto expected = best_ub(dst_loc);
+          if (!expected)
+          {
+            // Fall back to forward type of dst if it's a simple
+            // concrete primitive. Skip Angelic, TypeVar, Union,
+            // and non-primitive types (e.g., nomatch) to avoid
+            // poisoning backward constraints.
+            auto dst_it = env.find(dst_loc);
+            if (dst_it != env.end() && !is_angelic(dst_it->second.type) &&
+                dst_it->second.type->front() != TypeVar &&
+                dst_it->second.type->front() != Union &&
+                extract_primitive(dst_it->second.type))
+              expected = dst_it->second.type;
+          }
           if (expected && !is_angelic(expected))
             push_bwd_local(src_loc, expected);
         }
