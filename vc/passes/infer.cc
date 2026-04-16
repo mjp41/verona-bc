@@ -751,6 +751,16 @@ namespace vc
     bool ex_angelic = is_angelic(existing);
     bool in_angelic = is_angelic(incoming);
 
+    // TypeVarId-aware join: same constraint variable → identity.
+    if (ex_angelic && in_angelic)
+    {
+      auto ex_id = get_angelic_var_id(existing);
+      auto in_id = get_angelic_var_id(incoming);
+      if (ex_id.has_value() && in_id.has_value() &&
+          ex_id.value() == in_id.value())
+        return {}; // Same constraint variable, no change.
+    }
+
     // F2/F2a: Both Angelic.
     if (ex_angelic && in_angelic)
     {
@@ -1751,6 +1761,9 @@ namespace vc
       tuple_locals.clear();
       ref_to_tuple.clear();
 
+      // Enqueue callback for constraint resolution notifications.
+      auto enqueue_cb = [&](size_t lbl) { ai.enqueue(lbl); };
+
       auto merge = [&](const Location& loc, const Node& type,
                        Node call_node = {}) -> bool {
         auto it = env.find(loc);
@@ -1781,41 +1794,37 @@ namespace vc
           }
           else
           {
-            // Untyped literal — produce Angelic.
-            auto lit = stmt->back();
-            if (lit->in({Bin, Oct, Int, Hex, Char}))
+            // Untyped literal — check stability map first, then
+            // create a fresh constraint variable.
+            auto stable = constraints.check_stability(stmt);
+            if (stable)
             {
-              // If forward env already has a concrete integer for
-              // this location (from a prior iteration's refinement),
-              // preserve it.
-              auto it = env.find(dst->location());
-              if (it != env.end() && !is_angelic(it->second.type))
-              {
-                auto prim = extract_primitive(it->second.type);
-                if (prim && prim->in(integer_types))
-                  type = clone(it->second.type);
-              }
-              if (!type)
-                type = angelic_int();
+              type = stable;
             }
-            else if (lit->in({Float, HexFloat}))
-            {
-              auto it = env.find(dst->location());
-              if (it != env.end() && !is_angelic(it->second.type))
-              {
-                auto prim = extract_primitive(it->second.type);
-                if (prim && prim->in(float_types))
-                  type = clone(it->second.type);
-              }
-              if (!type)
-                type = angelic_float();
-            }
-            else if (lit->in({True, False}))
-              type = primitive_type(Bool);
-            else if (lit == None)
-              type = primitive_type(None);
             else
-              type = make_type(); // Fallback.
+            {
+              auto lit = stmt->back();
+              if (lit->in({Bin, Oct, Int, Hex, Char}))
+              {
+                auto id = constraints.fresh(
+                  true, std::vector<Token>(intset_members()), stmt);
+                type = make_angelic_var(id, true, intset_members());
+                constraints.add_observer(id, label_idx);
+              }
+              else if (lit->in({Float, HexFloat}))
+              {
+                auto id = constraints.fresh(
+                  true, std::vector<Token>(floatset_members()), stmt);
+                type = make_angelic_var(id, true, floatset_members());
+                constraints.add_observer(id, label_idx);
+              }
+              else if (lit->in({True, False}))
+                type = primitive_type(Bool);
+              else if (lit == None)
+                type = primitive_type(None);
+              else
+                type = make_type(); // Fallback.
+            }
           }
           merge(dst->location(), type);
         }
@@ -1896,6 +1905,16 @@ namespace vc
             if (inner)
             {
               merge(dst_loc, clone(inner));
+
+              // Constrain Angelic stored value from field type.
+              auto val_it2 = env.find(val_loc);
+              if (val_it2 != env.end() && !is_any_type(inner))
+              {
+                auto var_id = get_angelic_var_id(val_it2->second.type);
+                if (var_id.has_value())
+                  constraints.add_upper_bound(
+                    var_id.value(), inner, enqueue_cb);
+              }
 
               auto rtt = ref_to_tuple.find(ref_loc);
               if (rtt != ref_to_tuple.end())
@@ -2044,6 +2063,41 @@ namespace vc
         else if (stmt->in({New, Stack}))
         {
           merge((stmt / LocalId)->location(), clone(stmt / Type));
+
+          // Constrain Angelic NewArg values from field types.
+          auto new_type = stmt / Type;
+          auto inner = new_type->front();
+          if (inner == TypeName)
+          {
+            auto class_def = find_def(top, inner);
+            if (class_def && class_def == ClassDef)
+            {
+              auto subst = build_class_subst(class_def, inner);
+              for (auto& na : *(stmt / NewArgs))
+              {
+                auto arg_loc = (na / Rhs)->location();
+                auto arg_it = env.find(arg_loc);
+                if (arg_it == env.end())
+                  continue;
+                auto var_id = get_angelic_var_id(arg_it->second.type);
+                if (!var_id.has_value())
+                  continue;
+                auto fname = (na / Ident)->location().view();
+                for (auto& f : *(class_def / ClassBody))
+                {
+                  if (f != FieldDef)
+                    continue;
+                  if ((f / Ident)->location().view() != fname)
+                    continue;
+                  auto ft = apply_subst(top, f / Type, subst);
+                  if (ft && !contains_typevar(ft))
+                    constraints.add_upper_bound(
+                      var_id.value(), ft, enqueue_cb);
+                  break;
+                }
+              }
+            }
+          }
         }
         else if (stmt->in(propagate_lhs_ops))
         {
@@ -2065,9 +2119,26 @@ namespace vc
             if (rhs_prim &&
                 is_angelic_compatible(lhs_it->second.type, rhs_prim))
             {
+              // Constrain LHS Angelic from concrete RHS type.
+              auto var_id = get_angelic_var_id(lhs_it->second.type);
+              if (var_id.has_value())
+                constraints.add_upper_bound(
+                  var_id.value(), rhs_it->second.type, enqueue_cb);
               merge(dst_loc, clone(rhs_it->second.type));
               continue;
             }
+          }
+
+          // Symmetric: if RHS is Angelic and LHS is concrete,
+          // constrain RHS from LHS.
+          if (lhs_it != env.end() && rhs_it != env.end() &&
+              !is_angelic(lhs_it->second.type) &&
+              is_angelic(rhs_it->second.type))
+          {
+            auto var_id = get_angelic_var_id(rhs_it->second.type);
+            if (var_id.has_value())
+              constraints.add_upper_bound(
+                var_id.value(), lhs_it->second.type, enqueue_cb);
           }
 
           if (lhs_it != env.end())
@@ -2141,9 +2212,18 @@ namespace vc
             auto pt = apply_subst(top, params->at(i) / Type, subst);
             if (pt && pt->front() != TypeVar)
             {
-              auto arg_it = env.find((args->at(i) / Rhs)->location());
+              auto arg_loc = (args->at(i) / Rhs)->location();
+              auto arg_it = env.find(arg_loc);
               if (arg_it != env.end())
+              {
                 push_shape_to_lambda(pt, arg_it->second.type);
+                // Constrain Angelic arg from param type.
+                auto var_id = get_angelic_var_id(arg_it->second.type);
+                if (var_id.has_value() &&
+                    !is_uninformative_backward_type(pt))
+                  constraints.add_upper_bound(
+                    var_id.value(), pt, enqueue_cb);
+              }
             }
           }
 
@@ -2525,6 +2605,27 @@ namespace vc
         }
       }
 
+      // ---- Return terminator: constrain returned value ----
+      auto term = body->parent() / Return;
+      if (term == Return)
+      {
+        auto ret_loc = (term / LocalId)->location();
+        auto ret_it = env.find(ret_loc);
+        if (ret_it != env.end())
+        {
+          auto func_ret = func / Type;
+          if (!contains_typevar(func_ret) && !is_angelic(func_ret))
+          {
+            auto var_id = get_angelic_var_id(ret_it->second.type);
+            if (var_id.has_value())
+            {
+              constraints.add_upper_bound(
+                var_id.value(), func_ret, enqueue_cb);
+            }
+          }
+        }
+      }
+
       snmalloc::UNUSED(label_idx, func);
     }
 
@@ -2577,7 +2678,7 @@ namespace vc
         return true;
       });
 
-      // Seed fwd[entry_label] with param types.
+      // Seed fwd[entry_label] with param types and enqueue.
       for (auto& [func, entry_idx] : ai.func_entry())
       {
         Env param_env;
@@ -2586,7 +2687,11 @@ namespace vc
           auto type = pd / Type;
           param_env[(pd / Ident)->location()] = {clone(type), {}};
         }
-        ai.push_fwd(entry_idx, param_env);
+        if (!param_env.empty())
+          ai.push_fwd(entry_idx, param_env);
+        // Always enqueue entry labels — even parameterless functions
+        // need forward_transfer to process their body.
+        ai.enqueue(entry_idx);
       }
     }
 
@@ -2756,9 +2861,25 @@ namespace vc
               !is_angelic(env_it->second.type))
               final_type = env_it->second.type;
 
-            // In the forward-only design, unresolved Angelic literals
-            // are resolved in finalize using the constraint store
-            // (TODO: Phase 3). For now, fallback to literal defaults.
+            // Check constraint store for resolved Angelic types.
+            if (!final_type && env_it != fwd_exit[i].end())
+            {
+              auto var_id = get_angelic_var_id(env_it->second.type);
+              if (var_id.has_value())
+              {
+                auto resolved = constraints.resolved(var_id.value());
+                if (resolved)
+                  final_type = resolved;
+              }
+            }
+
+            // Also check stability map directly for the stmt.
+            if (!final_type)
+            {
+              auto stable = constraints.check_stability(*it);
+              if (stable)
+                final_type = stable;
+            }
 
             Node final_prim;
             if (final_type)
