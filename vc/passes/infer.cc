@@ -1,80 +1,23 @@
-// ===== Bidirectional Type Inference with Angelic Constraints =====
+// ===== Forward-Only Type Inference with Constraint Variables =====
 //
-// Architecture (ALGORITHM.md §2): Product Lattice with Forward Join +
-// Backward Meet
+// Architecture (FORWARD-CONSTRAINT-PLAN.md):
 //
-// Type inference operates on a product lattice with two independent
-// components per location:
+// A single forward analysis where type variables carry constraints.
+// "Backward" information flows naturally when a type variable reaches
+// a typed context and acquires a constraint.
 //
-//   fwd[x]  — Forward (lower bound): what the value IS
-//   ub[x]   — Backward (upper bound): what the value must SATISFY
+// Each unresolved type (untyped literal, type parameter) gets a fresh
+// TypeVarId stored in an AngelicSubtype node. The constraint store
+// tracks upper/lower bounds. When bounds determine a unique type,
+// the variable resolves and observers (labels) are re-enqueued.
 //
-// Forward:  join (⊔) — ascending. Angelic bounds tighten (F2),
-//           concrete absorbs Angelic (F3). Both upward in info order.
-// Backward: meet (⊓) — descending. Meet only tightens. Always
-//           intersection — every use-site constraint must be satisfied.
-//
-// Angelic types (ALGORITHM.md §1.1):
-//   Angelic(Concrete ∩ IntSet) — integer literal, compiler chooses type
-//   Angelic(Concrete ∩ FloatSet) — float literal, compiler chooses type
-//   Angelic(Any) — type parameter, may resolve to Union
-//
-// The Concrete constraint (ALGORITHM.md §1.2):
-//   Not a runtime type — a constraint meaning "must resolve to exactly
-//   one concrete type." Present in literals (must pick ONE integer),
-//   absent in type parameters (may resolve to Union).
-//
-// Refinement (ALGORITHM.md §5):
-//   candidates = members(fwd[x]) ∩ ub[x]
-//   R1: |candidates| = 1 → commit to concrete
-//   R2: candidates ⊂ members(fwd) → tighten Angelic bound
-//   R3: no change → skip
-//   R4: candidates = ∅ → contradiction flag
-//
-// Resolution (ALGORITHM.md §1.4):
-//   Concrete → pick max under partial ≤ preference order
-//   Non-Concrete → Union(candidates)
-//
-// Forward Join Rules (ALGORITHM.md §3.2):
-//   F1: ⊔(TypeVar, X) = X
-//   F2: ⊔(Angelic(T₁), Angelic(T₂)) = Angelic(T₁ ∩ T₂)
-//   F2a: ⊔(Angelic(Concrete∩T₁), Angelic(T₂)) = Union(...)
-//   F3: ⊔(Angelic(T), concrete S) = S
-//   F4: ⊔(S₁, S₂) = Union(S₁, S₂)
-//   F5: ⊔(S₁, S₂) = S₂ when S₁ <: S₂
-//
-// Backward Meet (ALGORITHM.md §4):
-//   Always intersection. Only applies to Angelic locations.
-//
-// Per-label state:
-//   fwd[i]  = forward types at ENTRY of label i
-//   ub[i]   = upper bound constraints at EXIT of label i
-//   fwd_exit[i] = forward types at EXIT of label i (computed by
-//                 transfer functions)
-//
-// Forward processing of label i:
-//   1. Read fwd[i], run forward transfer functions → fwd_exit
-//   2. Push fwd_exit into fwd[succ] via join_type
-//   3. Cond: typetest narrowing on true/false successors
-//
-// Backward processing of label i:
-//   1. Read ub[i], run backward transfer functions → ub_entry
-//   2. Push ub_entry into ub[pred] via meet_type
-//   3. Path-sensitive filtering on Cond edges
-//
-// Refinement after processing a label:
-//   For each Angelic location: candidates = members(fwd) ∩ ub
-//   R1-R4 dispatch. Re-enqueue on change.
-//
-// Convergence:
-//   Forward monotone ascending, backward monotone descending,
-//   refinement bounded by |members| per location. Product lattice
-//   guarantees fixpoint in finite steps.
-//
-// The AST is mutated exactly once, at finalization, after convergence.
+// The framework (AbstractInterpreter) handles CFG propagation.
+// The domain (InferDomain) handles type-level operations.
 
 #include "../lang.h"
 #include "../subtype.h"
+#include "abstract_interp.h"
+#include "constraint_store.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -88,19 +31,6 @@
 
 namespace vc
 {
-  // ===== Constants =====
-
-  constexpr size_t MAX_ITERS_PER_LABEL = 200;
-
-  // ===== Direction enum =====
-
-  enum class Direction
-  {
-    Forward,
-    Backward,
-    Both
-  };
-
   // ===== Forward declarations =====
 
   bool is_lambda_function(const Node& func);
@@ -135,9 +65,6 @@ namespace vc
   const std::initializer_list<Token> float_types = {F32, F64};
 
   // Binary ops: result type = LHS type.
-  // Backward: ub[lhs] ⊓= ub[dst], ub[rhs] ⊓= fwd[lhs].
-  // When fwd[lhs] is Angelic, members() is expanded to a Union
-  // upper bound per ALGORITHM.md §4.1.
   const std::initializer_list<Token> propagate_lhs_ops = {
     Add,
     Sub,
@@ -156,7 +83,6 @@ namespace vc
     Atan2};
 
   // Heterogeneous binary ops where LHS and RHS have different types.
-  // Backward: only push ub[dst] to LHS, NOT to RHS.
   // Currently empty — all Verona binary ops are homogeneous.
   const std::initializer_list<Token> propagate_lhs_ops_heterogeneous = {};
 
@@ -934,103 +860,6 @@ namespace vc
     return (u->size() == 1) ? Type << clone(u->front()) : Type << u;
   }
 
-  // ===== Backward Meet (ALGORITHM.md §4) =====
-  //
-  // meet_type computes the intersection of two upper bounds.
-  // Used for backward constraint merging. Returns the tightened
-  // type, or {} if no change from existing.
-  //
-  // Upper bounds are always concrete types or Unions/Isects of
-  // concrete types. Angelic does NOT appear in the backward lattice.
-  static Node meet_type(const Node& existing, const Node& incoming, Node top)
-  {
-    // Top absorbs: no existing constraint means incoming is the result.
-    if (!existing || existing->empty() || existing->front() == TypeVar)
-      return clone(incoming);
-    if (!incoming || incoming->empty() || incoming->front() == TypeVar)
-      return {};
-
-    // Pointer/structural equality fast paths.
-    if (existing == incoming)
-      return {};
-    if (same_type_tree(existing, incoming))
-      return {};
-
-    // Skip uninformative backward types (any, dyn, TypeSelf).
-    if (is_uninformative_backward_type(incoming))
-      return {};
-    if (is_uninformative_backward_type(existing))
-      return clone(incoming);
-
-    // Subtype checks: if existing <: incoming, existing is already tighter.
-    SequentCtx ctx{top, {}, {}};
-
-    if (Subtype(ctx, existing, incoming))
-      return {}; // existing already satisfies incoming.
-    if (Subtype(ctx, incoming, existing))
-      return clone(incoming); // incoming is tighter.
-
-    // General intersection: extract concrete members from both,
-    // compute set intersection.
-    auto extract_members = [](const Node& type) -> Nodes {
-      Nodes result;
-      if (type->front() == Union)
-      {
-        for (auto& child : *(type->front()))
-          result.push_back(Type << clone(child));
-      }
-      else
-      {
-        result.push_back(clone(type));
-      }
-      return result;
-    };
-
-    auto ex_members = extract_members(existing);
-    auto in_members = extract_members(incoming);
-
-    Nodes isect;
-    for (auto& e : ex_members)
-    {
-      for (auto& i : in_members)
-      {
-        bool e_sub_i = Subtype(ctx, e, i);
-        bool i_sub_e = !e_sub_i && Subtype(ctx, i, e);
-        if (e_sub_i || i_sub_e || same_type_tree(e, i))
-        {
-          // Keep the more specific one.
-          isect.push_back(e_sub_i ? clone(e) : clone(i));
-          break;
-        }
-      }
-    }
-
-    if (isect.empty())
-    {
-      // Empty intersection — contradictory constraints.
-      // Return bottom of the backward lattice: empty Union (∅).
-      // This ensures the ub is tightened to ∅, so R4 will detect
-      // via members(fwd) ∩ ub = ∅. ALGORITHM.md §10.4.
-      return Type << Union;
-    }
-
-    if (isect.size() == 1)
-    {
-      if (same_type_tree(isect[0], existing))
-        return {};
-      return isect[0];
-    }
-
-    // Build union of intersection results.
-    Node u = Union;
-    for (auto& m : isect)
-      u << clone(m->front());
-    Node result = Type << u;
-    if (same_type_tree(result, existing))
-      return {};
-    return result;
-  }
-
   // ===== TypetestTrace =====
 
   struct TypetestTrace
@@ -1325,168 +1154,151 @@ namespace vc
 
   // ===== Method resolution =====
 
-  // Method cache: module-level (reset per run).
-  static std::map<
-    std::tuple<std::string, std::string, std::string, size_t>,
-    Node>*
-    active_method_cache = nullptr;
-
-  // RAII guard for active_method_cache — ensures cleanup on exception.
-  struct MethodCacheGuard
+  struct MethodCache
   {
-    MethodCacheGuard(decltype(active_method_cache) cache)
-    {
-      active_method_cache = cache;
-    }
-    ~MethodCacheGuard()
-    {
-      active_method_cache = nullptr;
-    }
-    MethodCacheGuard(const MethodCacheGuard&) = delete;
-    MethodCacheGuard& operator=(const MethodCacheGuard&) = delete;
-  };
+    Node top;
 
-  static Node resolve_class_method_cached(
-    const MethodOwner& owner,
-    std::string_view method_name,
-    Token hand,
-    size_t arity)
-  {
-    if (!owner.class_def)
-      return {};
-
-    auto key = std::make_tuple(
-      owner.key,
-      std::string(method_name),
-      std::string(hand.str()),
-      arity);
-
-    if (active_method_cache)
+    Node resolve_class_method(
+      const MethodOwner& owner,
+      std::string_view method_name,
+      Token hand,
+      size_t arity)
     {
-      auto it = active_method_cache->find(key);
-      if (it != active_method_cache->end())
+      if (!owner.class_def)
+        return {};
+
+      auto key = std::make_tuple(
+        owner.key,
+        std::string(method_name),
+        std::string(hand.str()),
+        arity);
+
+      auto it = cache_.find(key);
+      if (it != cache_.end())
         return it->second;
-    }
 
-    Node func;
-    for (auto& child : *(owner.class_def / ClassBody))
-    {
-      if (child != Function)
-        continue;
-      auto child_name = lookup_method_name(child);
-      if (!child_name || child_name->location().view() != method_name)
-        continue;
-      if ((child / Lhs)->type() != hand)
-        continue;
-      if ((child / Params)->size() != arity)
-        continue;
-      func = child;
-      break;
-    }
-
-    if (active_method_cache)
-      (*active_method_cache)[std::move(key)] = func;
-
-    return func;
-  }
-
-  static MethodInfo resolve_method(
-    Node top,
-    const Node& receiver_type,
-    const Node& method_ident,
-    Token hand,
-    size_t arity,
-    const Node& method_typeargs)
-  {
-    auto owner = resolve_method_owner(top, receiver_type);
-    if (owner.class_def)
-    {
-      auto subst = build_class_subst(owner.class_def, owner.subst_source);
-      auto func = resolve_class_method_cached(
-        owner, method_ident->location().view(), hand, arity);
-      if (func)
+      Node func;
+      for (auto& child : *(owner.class_def / ClassBody))
       {
-        auto func_tps = func / TypeParams;
-        if (
-          !method_typeargs->empty() &&
-          method_typeargs->size() == func_tps->size())
+        if (child != Function)
+          continue;
+        auto child_name = lookup_method_name(child);
+        if (!child_name || child_name->location().view() != method_name)
+          continue;
+        if ((child / Lhs)->type() != hand)
+          continue;
+        if ((child / Params)->size() != arity)
+          continue;
+        func = child;
+        break;
+      }
+
+      cache_[std::move(key)] = func;
+      return func;
+    }
+
+    MethodInfo resolve(
+      const Node& receiver_type,
+      const Node& method_ident,
+      Token hand,
+      size_t arity,
+      const Node& method_typeargs)
+    {
+      auto owner = resolve_method_owner(top, receiver_type);
+      if (owner.class_def)
+      {
+        auto subst = build_class_subst(owner.class_def, owner.subst_source);
+        auto func = resolve_class_method(
+          owner, method_ident->location().view(), hand, arity);
+        if (func)
         {
-          for (size_t i = 0; i < func_tps->size(); i++)
-            subst[func_tps->at(i)] = method_typeargs->at(i);
+          auto func_tps = func / TypeParams;
+          if (
+            !method_typeargs->empty() &&
+            method_typeargs->size() == func_tps->size())
+          {
+            for (size_t i = 0; i < func_tps->size(); i++)
+              subst[func_tps->at(i)] = method_typeargs->at(i);
+          }
+          return MethodInfo{func, std::move(subst)};
         }
-        return MethodInfo{func, std::move(subst)};
       }
-    }
 
-    if (receiver_type == Type && receiver_type->front() == Union)
-    {
-      MethodInfo first_info;
-      for (auto& member : *(receiver_type->front()))
+      if (receiver_type == Type && receiver_type->front() == Union)
       {
-        Node member_type = Type << clone(member);
-        auto info = resolve_method(
-          top, member_type, method_ident, hand, arity, method_typeargs);
-        if (!info.func)
-          return {};
-        if (!first_info.func)
-          first_info = std::move(info);
+        MethodInfo first_info;
+        for (auto& member : *(receiver_type->front()))
+        {
+          Node member_type = Type << clone(member);
+          auto info =
+            resolve(member_type, method_ident, hand, arity, method_typeargs);
+          if (!info.func)
+            return {};
+          if (!first_info.func)
+            first_info = std::move(info);
+        }
+        return first_info;
       }
-      return first_info;
-    }
 
-    auto ref_inner = extract_ref_inner(receiver_type);
-    if (!ref_inner)
-      ref_inner = extract_cown_inner(receiver_type);
-    if (ref_inner)
-      return resolve_method(
-        top, ref_inner, method_ident, hand, arity, method_typeargs);
-    return {};
-  }
-
-  static Node resolve_method_return_type(
-    Node top,
-    const Node& receiver_type,
-    const Node& method_ident,
-    Token hand,
-    size_t arity,
-    const Node& method_typeargs)
-  {
-    auto info = resolve_method(
-      top, receiver_type, method_ident, hand, arity, method_typeargs);
-    if (!info.func)
+      auto ref_inner = extract_ref_inner(receiver_type);
+      if (!ref_inner)
+        ref_inner = extract_cown_inner(receiver_type);
+      if (ref_inner)
+        return resolve(
+          ref_inner, method_ident, hand, arity, method_typeargs);
       return {};
-    auto ret = apply_subst(top, info.func / Type, info.subst);
-
-    if (ret && ret->front() == TypeVar && hand == Rhs)
-    {
-      auto lhs_info = resolve_method(
-        top, receiver_type, method_ident, Lhs, arity, method_typeargs);
-      if (lhs_info.func)
-      {
-        auto lhs_ret = apply_subst(top, lhs_info.func / Type, lhs_info.subst);
-        auto inner = extract_ref_inner(lhs_ret);
-        if (inner)
-          return inner;
-      }
     }
-    return ret;
-  }
 
-  static MethodInfo resolve_callable_method(
-    Node top,
-    const Node& receiver_type,
-    const Node& method_ident,
-    Token hand,
-    size_t arity,
-    const Node& method_typeargs)
-  {
-    auto info = resolve_method(
-      top, receiver_type, method_ident, hand, arity, method_typeargs);
-    if (!info.func && hand == Rhs)
-      info = resolve_method(
-        top, receiver_type, method_ident, Lhs, arity, method_typeargs);
-    return info;
-  }
+    Node resolve_return_type(
+      const Node& receiver_type,
+      const Node& method_ident,
+      Token hand,
+      size_t arity,
+      const Node& method_typeargs)
+    {
+      auto info =
+        resolve(receiver_type, method_ident, hand, arity, method_typeargs);
+      if (!info.func)
+        return {};
+      auto ret = apply_subst(top, info.func / Type, info.subst);
+
+      if (ret && ret->front() == TypeVar && hand == Rhs)
+      {
+        auto lhs_info =
+          resolve(receiver_type, method_ident, Lhs, arity, method_typeargs);
+        if (lhs_info.func)
+        {
+          auto lhs_ret =
+            apply_subst(top, lhs_info.func / Type, lhs_info.subst);
+          auto inner = extract_ref_inner(lhs_ret);
+          if (inner)
+            return inner;
+        }
+      }
+      return ret;
+    }
+
+    MethodInfo resolve_callable(
+      const Node& receiver_type,
+      const Node& method_ident,
+      Token hand,
+      size_t arity,
+      const Node& method_typeargs)
+    {
+      auto info =
+        resolve(receiver_type, method_ident, hand, arity, method_typeargs);
+      if (!info.func && hand == Rhs)
+        info =
+          resolve(receiver_type, method_ident, Lhs, arity, method_typeargs);
+      return info;
+    }
+
+  private:
+    std::map<
+      std::tuple<std::string, std::string, std::string, size_t>,
+      Node>
+      cache_;
+  };
 
   // ===== Shape propagation helpers =====
 
@@ -1497,17 +1309,6 @@ namespace vc
       return false;
     owner->replace(old_child, new_child);
     return true;
-  }
-
-  static std::unordered_set<const void*>& get_lambda_returns_omitted()
-  {
-    static std::unordered_set<const void*> s;
-    return s;
-  }
-
-  static bool lambda_return_was_omitted(const Node& func)
-  {
-    return get_lambda_returns_omitted().count(func.get()) > 0;
   }
 
   // ===== Call navigation =====
@@ -1683,362 +1484,111 @@ namespace vc
     return Type << tup;
   }
 
-  // ===== CFG (immutable after construction) =====
-
-  struct CFG
-  {
-    struct LabelInfo
-    {
-      Node function;
-      Node label;
-    };
-
-    std::vector<LabelInfo> labels;
-    std::map<Node, std::pair<size_t, size_t>> func_label_range;
-    std::vector<std::vector<size_t>> succ, pred;
-
-    // Per-function label ID to global index.
-    std::map<Node, std::map<std::string, size_t>> func_label_idx;
-
-    // Per-function def stmts (scoped to avoid Location collision).
-    std::map<Node, std::map<Location, Node>> func_def_stmts;
-
-    void build(Node top)
-    {
-      // Collect all functions.
-      std::vector<Node> functions;
-      top->traverse([&](auto node) {
-        if (node != Function)
-          return node == Top || node == ClassDef || node == ClassBody ||
-            node == Lib || node == Symbols;
-        functions.push_back(node);
-        return false;
-      });
-
-      // Build global label array.
-      for (auto& func : functions)
-      {
-        auto func_labels = func / Labels;
-        if (func_labels->empty())
-          continue;
-        size_t first = labels.size();
-        for (auto& lbl : *func_labels)
-          labels.push_back({func, lbl});
-        func_label_range[func] = {first, labels.size()};
-      }
-
-      size_t n = labels.size();
-      succ.resize(n);
-      pred.resize(n);
-
-      // Build per-function label index.
-      for (size_t i = 0; i < n; i++)
-      {
-        auto& li = labels[i];
-        auto key = std::string((li.label / LabelId)->location().view());
-        func_label_idx[li.function][key] = i;
-      }
-
-      // Build CFG edges.
-      for (size_t i = 0; i < n; i++)
-      {
-        auto& li = labels[i];
-        auto term = li.label / Return;
-        auto& idx = func_label_idx[li.function];
-
-        if (term == Cond)
-        {
-          auto t =
-            idx.find(std::string((term / Lhs)->location().view()));
-          auto f =
-            idx.find(std::string((term / Rhs)->location().view()));
-          if (t != idx.end())
-            succ[i].push_back(t->second);
-          if (f != idx.end())
-            succ[i].push_back(f->second);
-        }
-        else if (term == Jump)
-        {
-          auto t =
-            idx.find(std::string((term / LabelId)->location().view()));
-          if (t != idx.end())
-            succ[i].push_back(t->second);
-        }
-      }
-
-      for (size_t i = 0; i < n; i++)
-        for (auto s : succ[i])
-          pred[s].push_back(i);
-
-      // Compute RPO ordering for worklist scheduling.
-      compute_rpo();
-
-      // Build per-function def stmts.
-      for (auto& [func, range] : func_label_range)
-      {
-        auto& defs = func_def_stmts[func];
-        for (size_t i = range.first; i < range.second; i++)
-        {
-          auto body = labels[i].label / Body;
-          for (auto& stmt : *body)
-            if (!stmt->empty() && stmt->front() == LocalId)
-              defs[stmt->front()->location()] = stmt;
-        }
-      }
-    }
-
-    // RPO index for each label (lower = earlier in RPO).
-    std::vector<size_t> rpo_index;
-
-    void compute_rpo()
-    {
-      size_t n = labels.size();
-      rpo_index.resize(n, 0);
-      std::vector<bool> visited(n, false);
-      std::vector<size_t> post_order;
-      post_order.reserve(n);
-
-      // DFS from each function's entry label.
-      std::function<void(size_t)> dfs = [&](size_t u) {
-        if (visited[u])
-          return;
-        visited[u] = true;
-        for (auto s : succ[u])
-          dfs(s);
-        post_order.push_back(u);
-      };
-
-      for (auto& [func, range] : func_label_range)
-        dfs(range.first);
-
-      // Any unreachable labels.
-      for (size_t i = 0; i < n; i++)
-        if (!visited[i])
-          post_order.push_back(i);
-
-      // Reverse post-order: reverse the post_order list.
-      for (size_t i = 0; i < post_order.size(); i++)
-        rpo_index[post_order[post_order.size() - 1 - i]] = i;
-    }
-
-    size_t size() const
-    {
-      return labels.size();
-    }
-
-    const std::map<Location, Node>& def_stmts_for(const Node& func) const
-    {
-      static const std::map<Location, Node> empty;
-      auto it = func_def_stmts.find(func);
-      return (it != func_def_stmts.end()) ? it->second : empty;
-    }
-  };
-
-  // ===== GlobalInfer (orchestrator) =====
+  // ===== InferDomain =====
   //
-  // Product lattice per location (ALGORITHM.md §2):
-  //   fwd[x]  — forward type (lower bound, ascending via join)
-  //   ub[x]   — upper bound (backward constraint, descending via meet)
-  //
-  // Forward and backward are independent analyses that interact
-  // through refinement. The AST is mutated only at finalization.
+  // Domain for the forward-only AbstractInterpreter.
+  // Manages type environments, constraint store, and transfer functions.
 
-  struct GlobalInfer
+  struct InferDomain
   {
+    using Env = TypeEnv;
+
     Node top;
-    CFG cfg;
 
-    // Per-label state: stored INPUTS in each direction.
-    std::vector<TypeEnv> fwd;      // fwd[i] = forward types at ENTRY
-    std::vector<TypeEnv> ub;       // ub[i] = upper bound constraints at EXIT
-    std::vector<TypeEnv> fwd_exit; // fwd_exit[i] = forward types at EXIT
+    // Constraint store for type variable tracking.
+    ConstraintStore constraints;
 
-    // Cross-function mappings.
-    std::map<Node, size_t> func_entry;
-    std::map<Node, std::vector<size_t>> func_returns;
-
-    // Reverse call-site map: callee → call sites that invoke it.
-    // Used for backward callee→caller flow (ALGORITHM.md §8.2 row 4).
-    struct CallSiteInfo
-    {
-      size_t caller_label;
-      std::vector<Location> arg_locs;
-    };
-    std::map<Node, std::vector<CallSiteInfo>> callee_call_sites;
-
-    // Forward pass shared state (reset per-label or per-solve).
+    // Forward pass shared state (reset per-label).
     std::map<Location, Node> lookup_stmts;
     std::map<Location, std::pair<Location, size_t>> ref_to_tuple;
     std::map<Location, TupleTracking> tuple_locals;
 
     // Method resolution cache.
-    std::map<
-      std::tuple<std::string, std::string, std::string, size_t>,
-      Node>
-      method_cache_storage;
+    MethodCache method_cache;
 
-    // Worklist of (label, direction) pairs, ordered so that:
-    //   Forward entries come before Backward (forward-first priority)
-    //   Forward: ascending RPO (predecessors first)
-    //   Backward: descending RPO (successors first)
-    // enqueue(label, Both) inserts two entries.
-    struct WorkItem
+    // Lambda return tracking (moved from file-static).
+    std::unordered_set<const void*> lambda_returns_omitted;
+
+    // ===== Domain concept implementation =====
+
+    Env empty_env() const { return {}; }
+
+    Env clone_env(const Env& env) const
     {
-      size_t label;
-      Direction dir;
-    };
-    struct WorkItemCompare
+      Env result;
+      for (auto& [loc, info] : env)
+        result[loc] = {clone(info.type), info.call_node};
+      return result;
+    }
+
+    bool join(Env& target, const Env& incoming)
     {
-      const std::vector<size_t>& rpo;
-      bool operator()(const WorkItem& a, const WorkItem& b) const
+      bool changed = false;
+      for (auto& [loc, info] : incoming)
       {
-        // Forward (0) before Backward (1).
-        if (a.dir != b.dir)
-          return a.dir < b.dir;
-        auto ra = rpo[a.label];
-        auto rb = rpo[b.label];
-        if (a.dir == Direction::Forward)
-          return (ra != rb) ? (ra < rb) : (a.label < b.label);
+        auto it = target.find(loc);
+        if (it == target.end())
+        {
+          target[loc] = {clone(info.type), info.call_node};
+          changed = true;
+        }
         else
-          return (ra != rb) ? (ra > rb) : (a.label > b.label);
+        {
+          auto joined = join_type(it->second.type, info.type, top);
+          if (joined)
+          {
+            it->second.type = joined;
+            if (info.call_node && !it->second.call_node)
+              it->second.call_node = info.call_node;
+            changed = true;
+          }
+        }
       }
-    };
-    WorkItemCompare wi_cmp{cfg.rpo_index};
-    std::set<WorkItem, WorkItemCompare> worklist{wi_cmp};
-
-    void enqueue(size_t label, Direction dir)
-    {
-      if (dir == Direction::Both)
-      {
-        worklist.insert({label, Direction::Forward});
-        worklist.insert({label, Direction::Backward});
-      }
-      else
-      {
-        worklist.insert({label, dir});
-      }
-    }
-
-    bool dequeue(size_t& label, Direction& dir)
-    {
-      if (worklist.empty())
-        return false;
-      auto it = worklist.begin();
-      label = it->label;
-      dir = it->dir;
-      worklist.erase(it);
-      return true;
-    }
-
-    // ===== Push helpers =====
-
-    // Raw forward merge: join into a TypeEnv. Returns true if changed.
-    // Does NOT enqueue — used by forward_pass for the local label_exit env.
-    bool merge_fwd(
-      TypeEnv& target,
-      const Location& loc,
-      const Node& type,
-      Node call_node = {})
-    {
-      auto it = target.find(loc);
-      if (it == target.end())
-      {
-        target[loc] = {clone(type), call_node};
-        return true;
-      }
-      if (it->second.type == type)
-        return false;
-      auto joined = join_type(it->second.type, type, top);
-      if (!joined)
-        return false;
-      it->second.type = joined;
-      if (call_node && !it->second.call_node)
-        it->second.call_node = call_node;
-      return true;
-    }
-
-    // Forward push: join into fwd[label] and enqueue.
-    bool push_fwd(
-      size_t label,
-      const Location& loc,
-      const Node& type,
-      Node call_node = {})
-    {
-      if (merge_fwd(fwd[label], loc, type, call_node))
-      {
-        enqueue(label, Direction::Forward);
-        return true;
-      }
-      return false;
-    }
-
-    // Raw backward merge: meet into a TypeEnv. Returns true if changed.
-    // Does NOT enqueue — used for self-merge of ub_entry into ub[label].
-    bool merge_bwd(
-      TypeEnv& target,
-      const Location& loc,
-      const Node& type)
-    {
-      auto it = target.find(loc);
-      if (it == target.end())
-      {
-        target[loc] = {clone(type), {}};
-        return true;
-      }
-      auto met = meet_type(it->second.type, type, top);
-      if (!met)
-        return false;
-      it->second.type = met;
-      return true;
-    }
-
-    // Backward push: meet into ub[label] and enqueue.
-    // ALGORITHM.md §4: "ub[x] ⊓= T — always intersection."
-    bool push_bwd(
-      size_t label,
-      const Location& loc,
-      const Node& type)
-    {
-      if (merge_bwd(ub[label], loc, type))
-      {
-        enqueue(label, Direction::Backward);
-        return true;
-      }
-      return false;
+      return changed;
     }
 
     // ===== Cross-function push =====
+    //
+    // These use the AbstractInterpreter reference stored during
+    // forward_transfer to push types across function boundaries.
+
+    AbstractInterpreter<InferDomain>* ai_ = nullptr;
+
+    // RAII guard for ai_ pointer — ensures cleanup on early return.
+    struct AiGuard
+    {
+      AbstractInterpreter<InferDomain>*& ptr;
+      AiGuard(AbstractInterpreter<InferDomain>*& p,
+              AbstractInterpreter<InferDomain>& ai) : ptr(p) { ptr = &ai; }
+      ~AiGuard() { ptr = nullptr; }
+      AiGuard(const AiGuard&) = delete;
+      AiGuard& operator=(const AiGuard&) = delete;
+    };
 
     bool push_param_type(
       const Node& func_def,
       const Location& param_loc,
       const Node& type)
     {
-      auto entry_it = func_entry.find(func_def);
-      if (entry_it == func_entry.end())
+      if (!ai_)
         return false;
-      return push_fwd(entry_it->second, param_loc, type);
+      auto entry_it = ai_->func_entry().find(func_def);
+      if (entry_it == ai_->func_entry().end())
+        return false;
+      Env param_env;
+      param_env[param_loc] = {clone(type), {}};
+      return ai_->push_fwd(entry_it->second, param_env);
     }
 
     bool push_return_constraint(
       const Node& func_def,
       const Node& type)
     {
-      auto ret_it = func_returns.find(func_def);
-      if (ret_it == func_returns.end())
-        return false;
-      bool changed = false;
-      for (auto idx : ret_it->second)
-      {
-        auto term = cfg.labels[idx].label / Return;
-        if (term == Return)
-        {
-          auto ret_loc = (term / LocalId)->location();
-          if (push_bwd(idx, ret_loc, type))
-            changed = true;
-        }
-      }
-      return changed;
+      // In the forward-only design, return constraints flow through
+      // the constraint store, not through backward push.
+      // TODO(Phase 3): Add upper bounds to constraint variables.
+      snmalloc::UNUSED(func_def, type);
+      return false;
     }
 
     void push_args_to_callee(
@@ -2046,6 +1596,8 @@ namespace vc
       const Node& args,
       TypeEnv& caller_env)
     {
+      if (!ai_)
+        return;
       auto params = func_def / Params;
       auto parent_cls = func_def->parent(ClassDef);
 
@@ -2169,7 +1721,8 @@ namespace vc
             auto actual_ret = af / Type;
             if (
               actual_ret->front() == TypeVar ||
-              (is_lambda_function(af) && lambda_return_was_omitted(af)))
+              (is_lambda_function(af) &&
+               lambda_returns_omitted.count(af.get()) > 0))
             {
               auto lambda_func =
                 af->parent(Function) ? af->parent(Function) : af;
@@ -2183,19 +1736,27 @@ namespace vc
       return changed;
     }
 
-    // ===== Forward Transfer Functions (ALGORITHM.md §3.1) =====
+    // ===== Forward Transfer Function =====
 
-    bool forward_pass(
-      TypeEnv& env, const Node& body, const Node& /*func*/)
+    void forward_transfer(
+      Env& env,
+      const Node& body,
+      const Node& func,
+      size_t label_idx,
+      AbstractInterpreter<InferDomain>& ai)
     {
-      bool changed = false;
+      AiGuard ai_guard(ai_, ai);
+
+      // Clear per-label state.
+      tuple_locals.clear();
+      ref_to_tuple.clear();
+
       auto merge = [&](const Location& loc, const Node& type,
                        Node call_node = {}) -> bool {
         auto it = env.find(loc);
         if (it == env.end())
         {
           env[loc] = {clone(type), call_node};
-          changed = true;
           return true;
         }
         auto joined = join_type(it->second.type, type, top);
@@ -2204,7 +1765,6 @@ namespace vc
         it->second.type = joined;
         if (call_node && !it->second.call_node)
           it->second.call_node = call_node;
-        changed = true;
         return true;
       };
 
@@ -2361,7 +1921,6 @@ namespace vc
                         !same_type_tree(tup_it->second.type, tracked))
                       {
                         env[tup_loc] = {clone(tracked), {}};
-                        changed = true;
                       }
                     }
                   }
@@ -2481,7 +2040,6 @@ namespace vc
           // not via join. This is idempotent and bounded.
           auto loc = (stmt / LocalId)->location();
           env[loc] = {clone(stmt / Type), {}};
-          changed = true;
         }
         else if (stmt->in({New, Stack}))
         {
@@ -2585,8 +2143,7 @@ namespace vc
             {
               auto arg_it = env.find((args->at(i) / Rhs)->location());
               if (arg_it != env.end())
-                changed |=
-                  push_shape_to_lambda(pt, arg_it->second.type);
+                push_shape_to_lambda(pt, arg_it->second.type);
             }
           }
 
@@ -2616,8 +2173,8 @@ namespace vc
               for (auto& m : mems)
               {
                 auto mtype = primitive_type(m);
-                auto ret = resolve_method_return_type(
-                  top, mtype, method_ident, hand, arity, method_ta);
+                auto ret = method_cache.resolve_return_type(
+                  mtype, method_ident, hand, arity, method_ta);
                 if (!ret || ret->front() == TypeVar)
                 {
                   all_agree = false;
@@ -2643,8 +2200,8 @@ namespace vc
                 for (auto& m : mems)
                 {
                   auto mtype = primitive_type(m);
-                  auto ret = resolve_method_return_type(
-                    top, mtype, method_ident, hand, arity, method_ta);
+                  auto ret = method_cache.resolve_return_type(
+                    mtype, method_ident, hand, arity, method_ta);
                   if (!ret || ret->front() == TypeVar)
                     continue;
                   auto rp = extract_primitive(ret);
@@ -2676,8 +2233,7 @@ namespace vc
               auto method_ident = lookup_method_name(stmt);
               auto method_ta = stmt / TypeArgs;
               auto arity = from_chars_sep_v<size_t>(stmt / Int);
-              auto ret = resolve_method_return_type(
-                top,
+              auto ret = method_cache.resolve_return_type(
                 src_it->second.type,
                 method_ident,
                 hand,
@@ -2759,8 +2315,8 @@ namespace vc
               for (auto& ti : recv_mems)
               {
                 auto ti_type = primitive_type(ti);
-                auto info = resolve_callable_method(
-                  top, ti_type, method_ident, hand, arity, method_ta);
+                auto info = method_cache.resolve_callable(
+                  ti_type, method_ident, hand, arity, method_ta);
                 if (!info.func)
                   continue;
 
@@ -2842,8 +2398,7 @@ namespace vc
               auto method_ident = lookup_method_name(lookup_node);
               auto method_ta = lookup_node / TypeArgs;
               auto arity = from_chars_sep_v<size_t>(lookup_node / Int);
-              auto info = resolve_callable_method(
-                top,
+              auto info = method_cache.resolve_callable(
                 recv_it->second.type,
                 method_ident,
                 hand,
@@ -2864,7 +2419,7 @@ namespace vc
                     auto arg_it =
                       env.find((args->at(i) / Rhs)->location());
                     if (arg_it != env.end())
-                      changed |= push_shape_to_lambda(
+                      push_shape_to_lambda(
                         pt, arg_it->second.type);
                   }
                 }
@@ -2970,418 +2525,50 @@ namespace vc
         }
       }
 
-      return changed;
+      snmalloc::UNUSED(label_idx, func);
     }
 
-    // ===== Backward Transfer Functions (ALGORITHM.md §4) =====
-    //
-    // Computes upper bound constraints by walking the body in reverse.
-    // Each use-site contributes: ub[x] ⊓= T (meet/intersection).
-    // Only updates ub for Angelic locations (§4.3 skip optimization).
-    // No AST mutations — refinement is handled by the solve loop.
+    // ===== split_cond (typetest narrowing) =====
 
-    bool backward_pass(
-      TypeEnv& env,
-      TypeEnv& ub_entry,
-      const TypeEnv& ub_exit,
-      const Node& body)
+    void split_cond(
+      const Node& cond,
+      const Node& body,
+      const Env& fwd_exit,
+      Env& true_env,
+      Env& false_env)
     {
-      bool changed = false;
-
-      // push_bwd_local: meet a backward constraint into ub_entry.
-      // Skips uninformative types (TypeVar, any, dyn, Angelic).
-      // §4.3: Skip non-Angelic forward locations.
-      auto push_bwd_local =
-        [&](const Location& loc, const Node& type) -> bool {
-        if (!type || type->empty())
-          return false;
-        if (type->front() == TypeVar || is_angelic(type))
-          return false;
-        if (is_uninformative_backward_type(type))
-          return false;
-
-        // §4.3: Only constrain Angelic forward locations.
-        auto fwd_it = env.find(loc);
-        if (fwd_it != env.end() && !is_angelic(fwd_it->second.type) &&
-            fwd_it->second.type->front() != TypeVar)
-          return false;
-
-        auto it = ub_entry.find(loc);
-        if (it == ub_entry.end())
-        {
-          ub_entry[loc] = {clone(type), {}};
-          changed = true;
-          return true;
-        }
-        auto met = meet_type(it->second.type, type, top);
-        if (!met)
-          return false;
-        it->second.type = met;
-        changed = true;
-        return true;
-      };
-
-      // best_ub: find the best backward constraint for a location,
-      // checking ub_entry first, then ub_exit.
-      auto best_ub = [&](const Location& loc) -> Node {
-        auto be_it = ub_entry.find(loc);
-        if (be_it != ub_entry.end() && !is_angelic(be_it->second.type) &&
-            be_it->second.type->front() != TypeVar)
-          return be_it->second.type;
-        auto bx_it = ub_exit.find(loc);
-        if (bx_it != ub_exit.end() && !is_angelic(bx_it->second.type) &&
-            bx_it->second.type->front() != TypeVar)
-          return bx_it->second.type;
-        return {};
-      };
-
-      // Walk body in reverse.
-      for (auto it = body->rbegin(); it != body->rend(); ++it)
-      {
-        auto& stmt = *it;
-
-        if (stmt->in({Copy, Move}))
-        {
-          // §4.1: ub[src] ⊓= ub[dst]
-          auto dst_loc = (stmt / LocalId)->location();
-          auto src_loc = (stmt / Rhs)->location();
-          auto expected = best_ub(dst_loc);
-          if (!expected)
-          {
-            // Fall back to forward type of dst if it's a simple
-            // concrete primitive. Skip Angelic, TypeVar, Union,
-            // and non-primitive types (e.g., nomatch) to avoid
-            // poisoning backward constraints.
-            auto dst_it = env.find(dst_loc);
-            if (dst_it != env.end() && !is_angelic(dst_it->second.type) &&
-                dst_it->second.type->front() != TypeVar &&
-                dst_it->second.type->front() != Union &&
-                extract_primitive(dst_it->second.type))
-              expected = dst_it->second.type;
-          }
-          if (expected && !is_angelic(expected))
-            push_bwd_local(src_loc, expected);
-        }
-        else if (stmt == Store)
-        {
-          // §4.1: ub[val] ⊓= field_type
-          auto ref_loc = (stmt / Rhs)->location();
-          auto val_loc = ((stmt / Arg) / Rhs)->location();
-          auto ref_it = env.find(ref_loc);
-          if (ref_it != env.end())
-          {
-            auto inner = extract_ref_inner(ref_it->second.type);
-            if (inner && !is_any_type(inner))
-              push_bwd_local(val_loc, inner);
-          }
-        }
-        else if (stmt->in({New, Stack}))
-        {
-          // §4.1: ub[arg] ⊓= field_type
-          auto new_type = stmt / Type;
-          auto inner = new_type->front();
-          if (inner == TypeName)
-          {
-            auto class_def = find_def(top, inner);
-            if (class_def && class_def == ClassDef)
-            {
-              auto subst = build_class_subst(class_def, inner);
-              for (auto& na : *(stmt / NewArgs))
-              {
-                auto arg_loc = (na / Rhs)->location();
-                auto fname = (na / Ident)->location().view();
-                for (auto& f : *(class_def / ClassBody))
-                {
-                  if (f != FieldDef)
-                    continue;
-                  if ((f / Ident)->location().view() != fname)
-                    continue;
-                  auto ft = apply_subst(top, f / Type, subst);
-                  if (ft && !contains_typevar(ft))
-                    push_bwd_local(arg_loc, ft);
-                  break;
-                }
-              }
-            }
-          }
-        }
-        // NewArray/NewArrayConst: no direct backward handler needed.
-        // Element type constraints flow through ArrayRefConst → Store:
-        // the Store handler pushes ub[val] ⊓= ref_inner_type, which
-        // is the array's element type from the forward pass.
-        else if (stmt->in(propagate_lhs_ops))
-        {
-          // Backward for homogeneous (T, T) → T ops per §4.1:
-          //   ub[lhs] ⊓= ub[dst]
-          //   ub[rhs] ⊓= fwd[lhs]  (as concrete members if Angelic)
-          auto dst_loc = (stmt / LocalId)->location();
-          auto lhs_loc = (stmt / Lhs)->location();
-          auto rhs_loc = (stmt / Rhs)->location();
-
-          auto dst_ub = best_ub(dst_loc);
-          if (dst_ub)
-            push_bwd_local(lhs_loc, dst_ub);
-
-          // §4.1: ub[rhs] ⊓= fwd[lhs]
-          // When fwd[lhs] is Angelic, expand members() into a Union
-          // upper bound per ALGORITHM.md §4.1 note: "Angelic forward
-          // types contribute members() not themselves."
-          auto lhs_it = env.find(lhs_loc);
-          if (lhs_it != env.end())
-          {
-            if (is_angelic(lhs_it->second.type))
-            {
-              auto mems = members(lhs_it->second.type->front()->front());
-              if (!mems.empty())
-              {
-                if (mems.size() == 1)
-                {
-                  push_bwd_local(rhs_loc, primitive_type(mems[0]));
-                }
-                else
-                {
-                  Node u = Union;
-                  for (auto& m : mems)
-                    u << primitive_type(m)->front();
-                  push_bwd_local(rhs_loc, Type << u);
-                }
-              }
-            }
-            else if (lhs_it->second.type->front() != TypeVar)
-            {
-              push_bwd_local(rhs_loc, lhs_it->second.type);
-            }
-          }
-        }
-        else if (stmt->in(propagate_lhs_ops_heterogeneous))
-        {
-          // Backward for heterogeneous ops: only push ub[dst] to LHS.
-          // RHS type differs from LHS — no constraint from dst or lhs.
-          auto dst_loc = (stmt / LocalId)->location();
-          auto lhs_loc = (stmt / Lhs)->location();
-          auto dst_ub = best_ub(dst_loc);
-          if (dst_ub)
-            push_bwd_local(lhs_loc, dst_ub);
-        }
-        else if (stmt->in(propagate_rhs_ops))
-        {
-          // ub[src] ⊓= ub[dst]
-          auto dst_loc = (stmt / LocalId)->location();
-          auto src_loc = (stmt / Rhs)->location();
-          auto dst_ub = best_ub(dst_loc);
-          if (dst_ub)
-            push_bwd_local(src_loc, dst_ub);
-        }
-        else if (stmt == FFIStore)
-        {
-          // ub[val] ⊓= ffi_field_type
-          auto value_loc = (stmt / ValueSrc)->location();
-          push_bwd_local(value_loc, clone(stmt / Type));
-        }
-        else if (stmt == Call)
-        {
-          // §4.1: ub[arg] ⊓= param_type
-          std::vector<ScopeInfo> scopes;
-          auto func_def = navigate_call(stmt, top, scopes);
-          if (!func_def)
-            continue;
-
-          auto args = stmt / Args;
-          auto params = func_def / Params;
-
-          NodeMap<Node> subst;
-          for (auto& scope : scopes)
-          {
-            auto ta = scope.name_elem / TypeArgs;
-            auto tps = scope.def / TypeParams;
-            if (!ta->empty() && ta->size() == tps->size())
-              for (size_t i = 0; i < tps->size(); i++)
-                subst[tps->at(i)] = ta->at(i);
-          }
-
-          // Backward refine TypeArgs from return constraint.
-          auto dst_loc = (stmt / LocalId)->location();
-          auto ret_type = func_def / Type;
-          auto bwd_result = best_ub(dst_loc);
-          if (bwd_result && ret_type->front() != TypeVar)
-          {
-            NodeMap<LocalTypeInfo> constraints;
-            extract_constraints(
-              top,
-              ret_type->front(),
-              bwd_result->front(),
-              constraints,
-              false);
-            for (auto& scope : scopes)
-            {
-              auto tps = scope.def / TypeParams;
-              for (auto& tp : *tps)
-              {
-                auto find = constraints.find(tp);
-                if (find != constraints.end() &&
-                    !is_angelic(find->second.type))
-                  subst[tp] = find->second.type;
-              }
-            }
-          }
-
-          // Push param constraints to args.
-          for (size_t i = 0; i < params->size() && i < args->size(); i++)
-          {
-            auto expected = apply_subst(top, params->at(i) / Type, subst);
-            if (
-              expected && expected->front() != TypeVar &&
-              !is_uninformative_backward_type(expected))
-            {
-              auto arg_loc = (args->at(i) / Rhs)->location();
-              push_bwd_local(arg_loc, expected);
-            }
-          }
-        }
-        else if (stmt->in({CallDyn, TryCallDyn}))
-        {
-          // Backward: if receiver is Angelic and we have a backward
-          // constraint or concrete arg, resolve and push param types.
-          auto dst_loc = (stmt / LocalId)->location();
-          auto src_loc = (stmt / Rhs)->location();
-          auto args = stmt / Args;
-
-          auto lookup_it = lookup_stmts.find(src_loc);
-          if (lookup_it == lookup_stmts.end())
-            continue;
-
-          auto lookup_node = lookup_it->second;
-          auto recv_loc = (lookup_node / Rhs)->location();
-          auto recv_it = env.find(recv_loc);
-          if (recv_it == env.end())
-            continue;
-
-          auto hand = (lookup_node / Lhs)->type();
-          auto method_ident = lookup_method_name(lookup_node);
-          auto method_ta = lookup_node / TypeArgs;
-          auto arity = from_chars_sep_v<size_t>(lookup_node / Int);
-
-          Node resolve_type = recv_it->second.type;
-
-          // If receiver is Angelic, try to determine concrete type
-          // from backward constraints or concrete args.
-          if (is_angelic(resolve_type))
-          {
-            Node target_prim;
-            auto bwd_result = best_ub(dst_loc);
-            if (bwd_result)
-              target_prim = extract_primitive(bwd_result);
-
-            if (!target_prim)
-            {
-              for (auto& arg_node : *args)
-              {
-                auto arg_it =
-                  env.find((arg_node / Rhs)->location());
-                if (arg_it != env.end() &&
-                    !is_angelic(arg_it->second.type))
-                {
-                  target_prim =
-                    extract_callable_primitive(arg_it->second.type);
-                  if (target_prim)
-                    break;
-                }
-              }
-            }
-
-            if (target_prim &&
-                is_angelic_compatible(resolve_type, target_prim))
-            {
-              resolve_type =
-                primitive_or_ffi_type(target_prim->type());
-              push_bwd_local(recv_loc, resolve_type);
-            }
-          }
-
-          // Push param constraints if we have a concrete receiver.
-          if (!is_angelic(resolve_type) &&
-              resolve_type->front() != TypeVar)
-          {
-            auto info = resolve_callable_method(
-              top, resolve_type, method_ident, hand, arity, method_ta);
-            if (info.func)
-            {
-              auto params = info.func / Params;
-              for (
-                size_t i = 0;
-                i < params->size() && i < args->size();
-                i++)
-              {
-                auto expected =
-                  apply_subst(top, params->at(i) / Type, info.subst);
-                if (
-                  expected && expected->front() != TypeVar &&
-                  !is_uninformative_backward_type(expected))
-                {
-                  auto arg_loc = (args->at(i) / Rhs)->location();
-                  push_bwd_local(arg_loc, expected);
-                }
-              }
-            }
-          }
-        }
-        else if (stmt == FFI)
-        {
-          // §4.1: ub[arg] ⊓= ffi_param_type
-          auto sym_name = (stmt / SymbolId)->location();
-          auto cls = body->parent(Function)->parent(ClassDef);
-          while (cls)
-          {
-            bool found = false;
-            for (auto& child : *(cls / ClassBody))
-            {
-              if (child != Lib)
-                continue;
-              for (auto& sym : *(child / Symbols))
-              {
-                if (sym != Symbol)
-                  continue;
-                if ((sym / SymbolId)->location() != sym_name)
-                  continue;
-                auto ffi_params = sym / FFIParams;
-                auto ffi_args = stmt / Args;
-                auto fp = ffi_params->begin();
-                auto fa = ffi_args->begin();
-                while (fp != ffi_params->end() && fa != ffi_args->end())
-                {
-                  push_bwd_local((*fa)->location(), clone(*fp));
-                  ++fp;
-                  ++fa;
-                }
-                found = true;
-                break;
-              }
-              if (found)
-                break;
-            }
-            if (found)
-              break;
-            cls = cls->parent(ClassDef);
-          }
-        }
-        // Load, When, Typetest — no backward constraints.
-      }
-
-      return changed;
-    }
-
-    // ===== Build =====
-
-    void build()
-    {
-      cfg.build(top);
-      size_t n = cfg.size();
-      if (n == 0)
+      auto trace = trace_typetest(cond / LocalId, body);
+      if (!trace)
         return;
 
+      auto src_loc = trace->src->location();
+      auto src_it = fwd_exit.find(src_loc);
+      if (src_it == fwd_exit.end())
+        return;
+
+      auto true_target = trace->negated ? &false_env : &true_env;
+      auto false_target = trace->negated ? &true_env : &false_env;
+
+      // True branch: narrow to tested type.
+      (*true_target)[src_loc] = {clone(trace->type), src_it->second.call_node};
+
+      // False branch: exclude tested type if possible.
+      auto excluded = exclude_tested_type(
+        top, src_it->second.type, trace->type);
+      if (excluded)
+        (*false_target)[src_loc] = {excluded, src_it->second.call_node};
+    }
+
+    // ===== seed =====
+
+    void seed(AbstractInterpreter<InferDomain>& ai)
+    {
+      // Initialize method cache with top node.
+      method_cache.top = top;
+
       // Track lambda functions with omitted return types.
-      auto& lro = get_lambda_returns_omitted();
-      lro.clear();
+      lambda_returns_omitted.clear();
+      auto& lro = lambda_returns_omitted;
       top->traverse([&](auto node) {
         if (
           node == Function && is_lambda_function(node) &&
@@ -3390,450 +2577,29 @@ namespace vc
         return true;
       });
 
-      // Allocate per-label state.
-      fwd.resize(n);
-      fwd_exit.resize(n);
-      ub.resize(n);
-
-      // Build cross-function mappings.
-      for (auto& [func, range] : cfg.func_label_range)
-      {
-        func_entry[func] = range.first;
-        for (size_t i = range.first; i < range.second; i++)
-        {
-          auto term = cfg.labels[i].label / Return;
-          if (term == Return)
-            func_returns[func].push_back(i);
-        }
-      }
-
       // Seed fwd[entry_label] with param types.
-      for (auto& [func, entry_idx] : func_entry)
+      for (auto& [func, entry_idx] : ai.func_entry())
       {
+        Env param_env;
         for (auto& pd : *(func / Params))
         {
           auto type = pd / Type;
-          fwd[entry_idx][(pd / Ident)->location()] = {clone(type), {}};
+          param_env[(pd / Ident)->location()] = {clone(type), {}};
         }
-      }
-
-      // Seed ub[return_labels] with declared return types.
-      // ALGORITHM.md §4: "return: ub[ret] ⊓= func_return_type"
-      for (auto& [func, return_indices] : func_returns)
-      {
-        auto func_ret = func / Type;
-        if (!contains_typevar(func_ret) && !is_angelic(func_ret))
-        {
-          for (auto idx : return_indices)
-          {
-            auto term = cfg.labels[idx].label / Return;
-            auto ret_loc = (term / LocalId)->location();
-            ub[idx][ret_loc] = {clone(func_ret), {}};
-          }
-        }
-      }
-
-      // Enqueue entry labels for forward, return labels for backward.
-      for (auto& [func, entry_idx] : func_entry)
-        enqueue(entry_idx, Direction::Forward);
-      for (auto& [func, return_indices] : func_returns)
-        for (auto idx : return_indices)
-          enqueue(idx, Direction::Backward);
-
-      // Build reverse call-site map for callee→caller backward flow.
-      for (size_t i = 0; i < n; i++)
-      {
-        auto body = cfg.labels[i].label / Body;
-        for (auto& stmt : *body)
-        {
-          if (stmt == Call)
-          {
-            std::vector<ScopeInfo> scopes;
-            auto func_def = navigate_call(stmt, top, scopes);
-            if (!func_def)
-              continue;
-            auto args = stmt / Args;
-            std::vector<Location> arg_locs;
-            for (auto& arg : *args)
-              arg_locs.push_back((arg / Rhs)->location());
-            callee_call_sites[func_def].push_back({i, std::move(arg_locs)});
-          }
-        }
+        ai.push_fwd(entry_idx, param_env);
       }
     }
 
-    // ===== Solve (ALGORITHM.md §6) =====
+    // ===== Finalize =====
 
-    void solve()
+    void finalize(FinalizeContext<Env>& ctx)
     {
-      size_t n = cfg.size();
-      if (n == 0)
-        return;
+      auto& cfg = ctx.cfg;
+      auto& fwd = ctx.fwd;
+      auto& fwd_exit = ctx.fwd_exit;
+      auto& func_entry = ctx.func_entry;
+      auto& func_returns = ctx.func_returns;
 
-      size_t wl_iters = 0;
-      size_t label;
-      Direction dir;
-
-      while (dequeue(label, dir))
-      {
-        wl_iters++;
-
-        if (wl_iters > n * MAX_ITERS_PER_LABEL)
-        {
-          auto& li = cfg.labels[label];
-          li.function->parent()->replace(
-            li.function,
-            err(
-              li.function,
-              "Type inference did not converge after " +
-                std::to_string(wl_iters) + " iterations"));
-          return;
-        }
-
-        auto& li = cfg.labels[label];
-        auto body = li.label / Body;
-        auto term = li.label / Return;
-
-        bool run_fwd =
-          (dir == Direction::Forward || dir == Direction::Both);
-        bool run_bwd =
-          (dir == Direction::Backward || dir == Direction::Both);
-
-        TypeEnv label_exit;
-
-        // ---- Forward phase ----
-        if (run_fwd)
-        {
-          // Copy entry env as starting point.
-          for (auto& [loc, info] : fwd[label])
-            label_exit[loc] = {clone(info.type), info.call_node};
-
-          // Preserve locally-defined variables from prior iteration.
-          for (auto& [loc, info] : fwd_exit[label])
-          {
-            if (!is_angelic(info.type))
-            {
-              auto it = label_exit.find(loc);
-              if (it == label_exit.end())
-                label_exit[loc] = {clone(info.type), info.call_node};
-              else if (is_angelic(it->second.type))
-                it->second.type = clone(info.type);
-            }
-          }
-
-          // Clear per-label state for forward pass.
-          tuple_locals.clear();
-          ref_to_tuple.clear();
-
-          // Run forward transfer functions.
-          forward_pass(label_exit, body, li.function);
-
-          // Store exit env for finalization.
-          fwd_exit[label] = label_exit;
-
-          // Push to successors.
-          if (term == Cond)
-          {
-            auto trace = trace_typetest(term / LocalId, body);
-            auto& func_idx = cfg.func_label_idx[li.function];
-            auto t_it =
-              func_idx.find(std::string((term / Lhs)->location().view()));
-            auto f_it =
-              func_idx.find(std::string((term / Rhs)->location().view()));
-
-            for (auto& [loc, info] : label_exit)
-            {
-              if (trace && loc == trace->src->location())
-                continue;
-              if (t_it != func_idx.end())
-                push_fwd(t_it->second, loc, info.type, info.call_node);
-              if (f_it != func_idx.end())
-                push_fwd(f_it->second, loc, info.type, info.call_node);
-            }
-
-            // Typetest narrowing (ALGORITHM.md §3.3).
-            if (trace)
-            {
-              auto src_loc = trace->src->location();
-              auto src_it = label_exit.find(src_loc);
-              if (src_it != label_exit.end())
-              {
-                auto true_succ = trace->negated ? f_it : t_it;
-                auto false_succ = trace->negated ? t_it : f_it;
-
-                if (true_succ != func_idx.end())
-                  push_fwd(
-                    true_succ->second,
-                    src_loc,
-                    trace->type,
-                    src_it->second.call_node);
-
-                if (false_succ != func_idx.end())
-                {
-                  auto excluded = exclude_tested_type(
-                    top, src_it->second.type, trace->type);
-                  auto& push_type =
-                    excluded ? excluded : src_it->second.type;
-                  push_fwd(
-                    false_succ->second,
-                    src_loc,
-                    push_type,
-                    src_it->second.call_node);
-                }
-              }
-            }
-          }
-          else if (term == Jump)
-          {
-            auto& func_idx = cfg.func_label_idx[li.function];
-            auto t_it = func_idx.find(
-              std::string((term / LabelId)->location().view()));
-            if (t_it != func_idx.end())
-            {
-              for (auto& [loc, info] : label_exit)
-                push_fwd(t_it->second, loc, info.type, info.call_node);
-            }
-          }
-        }
-
-        // ---- Backward phase ----
-        if (run_bwd)
-        {
-          if (!run_fwd)
-          {
-            if (!fwd_exit[label].empty())
-            {
-              for (auto& [loc, info] : fwd_exit[label])
-                label_exit[loc] = {clone(info.type), info.call_node};
-            }
-            else
-            {
-              for (auto& [loc, info] : fwd[label])
-                label_exit[loc] = {clone(info.type), info.call_node};
-            }
-          }
-
-          TypeEnv ub_entry;
-          for (auto& [loc, info] : ub[label])
-            ub_entry[loc] = {clone(info.type), info.call_node};
-          backward_pass(label_exit, ub_entry, ub[label], body);
-
-          fwd_exit[label] = label_exit;
-
-          // Merge ub_entry into ub[label] (self-merge, no enqueue).
-          for (auto& [loc, info] : ub_entry)
-            merge_bwd(ub[label], loc, info.type);
-
-          // Push to predecessors (path-sensitive).
-          for (auto p : cfg.pred[label])
-          {
-            auto& pred_li = cfg.labels[p];
-            auto pred_term = pred_li.label / Return;
-
-            for (auto& [loc, info] : ub_entry)
-            {
-              // No path-sensitive backward filtering for the tested
-              // variable. Precise filtering would require type-level
-              // implication (¬T ∨ S), which we can't express. Instead
-              // we push the raw constraint from both edges — sound but
-              // possibly imprecise. The predecessor merges via meet,
-              // which is correct for non-tested variables. For the
-              // tested variable, the constraint may be tighter than
-              // necessary, but refinement handles contradictions.
-              push_bwd(p, loc, info.type);
-            }
-          }
-
-          // Backward callee→caller flow (ALGORITHM.md §8.2 row 4):
-          // If this is a function entry label and params have ub
-          // constraints, push them back to caller args.
-          auto entry_func_it = std::find_if(
-            func_entry.begin(), func_entry.end(),
-            [&](auto& kv) { return kv.second == label; });
-          if (entry_func_it != func_entry.end())
-          {
-            auto& callee_func = entry_func_it->first;
-            // Skip generic functions — param constraints are
-            // per-instantiation, not per-definition.
-            bool in_generic =
-              (callee_func / TypeParams)->size() > 0 ||
-              (callee_func->parent({ClassDef}) != nullptr &&
-               (callee_func->parent({ClassDef}) / TypeParams)->size() > 0);
-            if (!in_generic)
-            {
-              auto params = callee_func / Params;
-              auto sites_it = callee_call_sites.find(callee_func);
-              if (sites_it != callee_call_sites.end())
-              {
-                for (auto& site : sites_it->second)
-                {
-                  for (
-                    size_t pi = 0;
-                    pi < params->size() && pi < site.arg_locs.size();
-                    pi++)
-                  {
-                    auto param_loc =
-                      (params->at(pi) / Ident)->location();
-                    auto ub_it = ub[label].find(param_loc);
-                    if (ub_it == ub[label].end())
-                      continue;
-                    if (is_angelic(ub_it->second.type) ||
-                        ub_it->second.type->front() == TypeVar)
-                      continue;
-                    if (is_uninformative_backward_type(
-                          ub_it->second.type))
-                      continue;
-                    push_bwd(
-                      site.caller_label,
-                      site.arg_locs[pi],
-                      ub_it->second.type);
-                  }
-                }
-              }
-            }
-          }
-        }
-
-        // ---- Refinement (ALGORITHM.md §5) ----
-        {
-          std::set<Location> all_locs;
-          for (auto& [loc, info] : fwd[label])
-            all_locs.insert(loc);
-          for (auto& [loc, info] : fwd_exit[label])
-            all_locs.insert(loc);
-
-          for (auto& loc : all_locs)
-          {
-            LocalTypeInfo* fwd_info = nullptr;
-            auto exit_it = fwd_exit[label].find(loc);
-            auto entry_it = fwd[label].find(loc);
-            if (exit_it != fwd_exit[label].end())
-              fwd_info = &exit_it->second;
-            else if (entry_it != fwd[label].end())
-              fwd_info = &entry_it->second;
-            if (!fwd_info)
-              continue;
-
-            auto ub_it = ub[label].find(loc);
-            if (ub_it == ub[label].end())
-              continue;
-
-            auto& fwd_type = fwd_info->type;
-            auto& ub_type = ub_it->second.type;
-
-            if (!fwd_type || fwd_type->empty())
-              continue;
-            auto fwd_front = fwd_type->front();
-
-            // Only refine Angelic/TypeVar forward types.
-            bool is_fwd_angelic = is_angelic(fwd_type);
-            bool is_fwd_typevar = fwd_front == TypeVar;
-            if (!is_fwd_angelic && !is_fwd_typevar)
-              continue;
-
-            if (!ub_type || ub_type->empty())
-              continue;
-            auto ub_front = ub_type->front();
-
-            // Skip if backward is also unresolved.
-            if (is_angelic(ub_type) || ub_front == TypeVar)
-              continue;
-
-            // ===== Refinement dispatch (ALGORITHM.md §5) =====
-            // candidates = members(fwd) ∩ ub_members
-
-            if (is_fwd_angelic)
-            {
-              auto bound = fwd_type->front()->front();
-              auto fwd_mems = members(bound);
-
-              // Extract ub member set for intersection.
-              std::vector<Token> ub_mems;
-              auto ub_prim = extract_primitive(ub_type);
-              if (ub_prim)
-              {
-                ub_mems.push_back(ub_prim->type());
-              }
-              else if (ub_front == Union)
-              {
-                for (auto& child : *ub_front)
-                {
-                  auto p = extract_primitive(Type << clone(child));
-                  if (p)
-                    ub_mems.push_back(p->type());
-                }
-              }
-
-              if (ub_mems.empty() && !has_concrete(bound) &&
-                  fwd_mems.empty())
-              {
-                // Non-Concrete Angelic (type param) with no primitive
-                // members and non-primitive ub — commit directly.
-                if (entry_it != fwd[label].end())
-                  entry_it->second.type = clone(ub_type);
-                if (exit_it != fwd_exit[label].end())
-                  exit_it->second.type = clone(ub_type);
-                enqueue(label, Direction::Both);
-                continue;
-              }
-
-              // Intersect: candidates = fwd_mems ∩ ub_mems.
-              std::vector<Token> candidates;
-              for (auto& fm : fwd_mems)
-                for (auto& um : ub_mems)
-                  if (fm == um)
-                    candidates.push_back(fm);
-
-              if (candidates.empty())
-              {
-                // R4: empty — contradictory. Leave fwd unchanged;
-                // typecheck will report the error.
-                continue;
-              }
-
-              if (candidates.size() == 1)
-              {
-                // R1: singleton — commit to concrete.
-                auto concrete_type = primitive_type(candidates[0]);
-                if (entry_it != fwd[label].end())
-                  entry_it->second.type = clone(concrete_type);
-                if (exit_it != fwd_exit[label].end())
-                  exit_it->second.type = clone(concrete_type);
-                enqueue(label, Direction::Both);
-              }
-              else if (candidates.size() < fwd_mems.size())
-              {
-                // R2: tightened bound — narrow Angelic.
-                bool concrete = has_concrete(bound);
-                auto new_bound = make_angelic_bound(candidates, concrete);
-                auto new_type = make_angelic(new_bound);
-                if (entry_it != fwd[label].end())
-                  entry_it->second.type = clone(new_type);
-                if (exit_it != fwd_exit[label].end())
-                  exit_it->second.type = clone(new_type);
-                enqueue(label, Direction::Both);
-              }
-              // R3: candidates == fwd_mems — no change, no enqueue.
-            }
-            else if (is_fwd_typevar)
-            {
-              // TypeVar: any concrete backward type refines.
-              if (entry_it != fwd[label].end())
-                entry_it->second.type = clone(ub_type);
-              if (exit_it != fwd_exit[label].end())
-                exit_it->second.type = clone(ub_type);
-              enqueue(label, Direction::Both);
-            }
-          }
-        }
-      }
-    }
-
-    // ===== Finalize (stub for Iteration 0) =====
-    // Iteration 4 will implement the full finalization logic.
-
-    void finalize()
-    {
       size_t n = cfg.size();
       if (n == 0)
         return;
@@ -3990,38 +2756,9 @@ namespace vc
               !is_angelic(env_it->second.type))
               final_type = env_it->second.type;
 
-            if (!final_type)
-            {
-              auto ub_it = ub[i].find(loc);
-              if (
-                ub_it != ub[i].end() &&
-                !is_angelic(ub_it->second.type))
-                final_type = ub_it->second.type;
-            }
-
-            if (
-              !final_type && env_it != fwd_exit[i].end() &&
-              is_angelic(env_it->second.type))
-            {
-              auto [frange_begin, frange_end] =
-                cfg.func_label_range[cfg.labels[i].function];
-              for (size_t j = frange_begin; j < frange_end; j++)
-              {
-                auto ub_it = ub[j].find(loc);
-                if (
-                  ub_it != ub[j].end() &&
-                  !is_angelic(ub_it->second.type))
-                {
-                  auto prim = extract_primitive(ub_it->second.type);
-                  if (prim &&
-                      is_angelic_compatible(env_it->second.type, prim))
-                  {
-                    final_type = ub_it->second.type;
-                    break;
-                  }
-                }
-              }
-            }
+            // In the forward-only design, unresolved Angelic literals
+            // are resolved in finalize using the constraint store
+            // (TODO: Phase 3). For now, fallback to literal defaults.
 
             Node final_prim;
             if (final_type)
@@ -4297,14 +3034,6 @@ namespace vc
         }
       }
     }
-
-    void run()
-    {
-      MethodCacheGuard cache_guard(&method_cache_storage);
-      build();
-      solve();
-      finalize();
-    }
   };
 
   // ===== is_lambda_function =====
@@ -4330,9 +3059,11 @@ namespace vc
     PassDef p{"infer", wfPassInfer, dir::once, {}};
 
     p.post([](auto top) {
-      GlobalInfer gi;
-      gi.top = top;
-      gi.run();
+      InferDomain domain;
+      domain.top = top;
+
+      AbstractInterpreter<InferDomain> ai(top, std::move(domain));
+      ai.run();
 
       // Sweep: resolve remaining AngelicSubtype nodes to concrete
       // defaults (u64 for IntSet, f64 for FloatSet).
