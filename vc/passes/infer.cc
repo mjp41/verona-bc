@@ -1570,6 +1570,14 @@ namespace vc
     // Lambda return tracking (moved from file-static).
     std::unordered_set<const void*> lambda_returns_omitted;
 
+    // Cross-function return observers: when a callee's return label
+    // produces a new type, re-enqueue all caller labels that read it.
+    // Key: callee Function node pointer. Value: set of caller label indices.
+    std::map<const void*, std::vector<size_t>> return_observers;
+
+    // Previous inferred return type per function, for change detection.
+    std::map<const void*, Node> prev_inferred_return;
+
     // ===== Domain concept implementation =====
 
     Env empty_env() const { return {}; }
@@ -1645,9 +1653,7 @@ namespace vc
       const Node& func_def,
       const Node& type)
     {
-      // In the forward-only design, return constraints flow through
-      // the constraint store, not through backward push.
-      // TODO(Phase 3): Add upper bounds to constraint variables.
+      // TODO: Implement shape return type propagation.
       snmalloc::UNUSED(func_def, type);
       return false;
     }
@@ -1870,6 +1876,131 @@ namespace vc
       for (auto& c : concrete)
         u << c;
       return Type << u;
+    }
+
+    // ===== Cross-function return type inference =====
+    //
+    // When a callee's declared return type is TypeVar, read the
+    // inferred return type from fwd_exit of the callee's return labels.
+    // Register the caller as an observer so it's re-enqueued when
+    // the callee's return type changes.
+
+    Node infer_callee_return(
+      Node callee_func,
+      size_t caller_label,
+      AbstractInterpreter<InferDomain>& ai)
+    {
+      auto& fr = ai.func_returns();
+      auto it = fr.find(callee_func);
+      if (it == fr.end())
+        return {};
+
+      // Register caller as observer of this callee's returns.
+      auto& obs = return_observers[callee_func.get()];
+      bool already = false;
+      for (auto o : obs)
+        if (o == caller_label) { already = true; break; }
+      if (!already)
+        obs.push_back(caller_label);
+
+      // Join all return label exit environments.
+      Nodes ret_types;
+      for (auto idx : it->second)
+      {
+        auto term = ai.cfg().labels[idx].label / Return;
+        if (term != Return)
+          continue;
+        auto ret_loc = (term / LocalId)->location();
+        auto& exit_env = ai.get_fwd_exit(idx);
+        auto eit = exit_env.find(ret_loc);
+        if (eit == exit_env.end())
+          continue;
+        auto& rt = eit->second.type;
+        if (!rt || rt->empty() || rt->front() == TypeVar)
+          continue;
+        // Deduplicate.
+        bool covered = false;
+        for (auto& existing : ret_types)
+          if (same_type_tree(existing, rt))
+          { covered = true; break; }
+        if (!covered)
+          ret_types.push_back(clone(rt));
+      }
+
+      if (ret_types.empty())
+        return {};
+      if (ret_types.size() == 1)
+        return ret_types[0];
+
+      // Build Union of all return types.
+      Node u = Union;
+      for (auto& rt : ret_types)
+        u << clone(rt->front());
+      return Type << u;
+    }
+
+    // Notify cross-function return observers when a return label
+    // is re-processed and the inferred return type has changed.
+    void notify_return_observers(
+      const Node& func,
+      AbstractInterpreter<InferDomain>& ai)
+    {
+      auto obs_it = return_observers.find(func.get());
+      if (obs_it == return_observers.end())
+        return;
+
+      // Compute current inferred return type.
+      auto& fr = ai.func_returns();
+      auto fr_it = fr.find(func);
+      if (fr_it == fr.end())
+        return;
+
+      Nodes ret_types;
+      for (auto idx : fr_it->second)
+      {
+        auto term = ai.cfg().labels[idx].label / Return;
+        if (term != Return)
+          continue;
+        auto ret_loc = (term / LocalId)->location();
+        auto& exit_env = ai.get_fwd_exit(idx);
+        auto eit = exit_env.find(ret_loc);
+        if (eit == exit_env.end())
+          continue;
+        auto& rt = eit->second.type;
+        if (!rt || rt->empty() || rt->front() == TypeVar)
+          continue;
+        bool covered = false;
+        for (auto& existing : ret_types)
+          if (same_type_tree(existing, rt))
+          { covered = true; break; }
+        if (!covered)
+          ret_types.push_back(clone(rt));
+      }
+
+      if (ret_types.empty())
+        return;
+
+      Node current;
+      if (ret_types.size() == 1)
+        current = ret_types[0];
+      else
+      {
+        Node u = Union;
+        for (auto& rt : ret_types)
+          u << clone(rt->front());
+        current = Type << u;
+      }
+
+      // Only notify if changed from previous.
+      auto prev_it = prev_inferred_return.find(func.get());
+      if (prev_it != prev_inferred_return.end() &&
+          same_type_tree(prev_it->second, current))
+        return; // No change.
+
+      prev_inferred_return[func.get()] = clone(current);
+
+      for (auto caller_label : obs_it->second)
+        ai.enqueue(caller_label);
     }
 
     // ===== Forward Transfer Function =====
@@ -2351,6 +2482,13 @@ namespace vc
           }
 
           auto ret = apply_subst(top, func_def / Type, subst);
+          // If declared return type is TypeVar, try inferred return.
+          if (ret && ret->front() == TypeVar)
+          {
+            auto inferred = infer_callee_return(func_def, label_idx, ai);
+            if (inferred)
+              ret = inferred;
+          }
           if (ret)
             merge(
               (stmt / LocalId)->location(),
@@ -2393,6 +2531,19 @@ namespace vc
             {
               auto ret = method_cache.resolve_return_type(
                 concrete_recv, method_ident, hand, arity, method_ta);
+              // If return type is TypeVar, try inferred return.
+              if (ret && ret->front() == TypeVar)
+              {
+                auto info = method_cache.resolve_callable(
+                  concrete_recv, method_ident, hand, arity, method_ta);
+                if (info.func)
+                {
+                  auto inferred =
+                    infer_callee_return(info.func, label_idx, ai);
+                  if (inferred)
+                    ret = inferred;
+                }
+              }
               if (ret)
                 merge(dst_loc, ret);
             }
@@ -2899,9 +3050,13 @@ namespace vc
               ret_it->second.type, func_ret, enqueue_cb);
           }
         }
+
+        // Notify cross-function callers that may be reading
+        // this function's inferred return type.
+        notify_return_observers(func, ai);
       }
 
-      snmalloc::UNUSED(label_idx, func);
+      snmalloc::UNUSED(label_idx);
     }
 
     // ===== split_cond (typetest narrowing) =====
