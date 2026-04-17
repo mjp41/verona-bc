@@ -1942,8 +1942,14 @@ namespace vc
                     true, std::vector<Token>(intset_members()), stmt);
                   stmt_var_ids[stmt.get()] = id;
                 }
-                type = make_angelic_var(id, true, intset_members());
-                constraints.add_observer(id, label_idx);
+                auto& cur = constraints.member_set(id);
+                if (cur.size() == 1)
+                  type = primitive_type(cur[0]);
+                else
+                {
+                  type = make_angelic_var(id, true, cur);
+                  constraints.add_observer(id, label_idx);
+                }
               }
               else if (lit->in({Float, HexFloat}))
               {
@@ -1957,8 +1963,14 @@ namespace vc
                     true, std::vector<Token>(floatset_members()), stmt);
                   stmt_var_ids[stmt.get()] = id;
                 }
-                type = make_angelic_var(id, true, floatset_members());
-                constraints.add_observer(id, label_idx);
+                auto& cur = constraints.member_set(id);
+                if (cur.size() == 1)
+                  type = primitive_type(cur[0]);
+                else
+                {
+                  type = make_angelic_var(id, true, cur);
+                  constraints.add_observer(id, label_idx);
+                }
               }
               else if (lit->in({True, False}))
                 type = primitive_type(Bool);
@@ -2462,9 +2474,16 @@ namespace vc
                         true, std::vector<Token>(ret_prims), stmt);
                       stmt_var_ids[stmt.get()] = id;
                     }
-                    merge(dst_loc,
-                      make_angelic_var(id, true, ret_prims));
-                    constraints.add_observer(id, label_idx);
+                    auto& cur = constraints.member_set(id);
+                    auto& mems = cur.empty() ? ret_prims : cur;
+                    if (mems.size() == 1)
+                      merge(dst_loc, primitive_type(mems[0]));
+                    else
+                    {
+                      merge(dst_loc,
+                        make_angelic_var(id, true, mems));
+                      constraints.add_observer(id, label_idx);
+                    }
                   }
                 }
               }
@@ -2634,13 +2653,94 @@ namespace vc
                       concrete, std::vector<Token>(result_prims), stmt);
                     stmt_var_ids[stmt.get()] = id;
                   }
-                  merge(dst_loc,
-                    make_angelic_var(id, concrete, result_prims));
-                  constraints.add_observer(id, label_idx);
+                  auto& cur = constraints.member_set(id);
+                  auto& mems = cur.empty() ? result_prims : cur;
+                  if (mems.size() == 1)
+                    merge(dst_loc, primitive_type(mems[0]));
+                  else
+                  {
+                    merge(dst_loc,
+                      make_angelic_var(id, concrete, mems));
+                    constraints.add_observer(id, label_idx);
+                  }
                 }
               }
               else if (result_nonprim)
                 merge(dst_loc, result_nonprim);
+
+              // Reverse constraint: if result is resolved/constrained,
+              // filter receiver members and constrain angelic args.
+              auto dst_it2 = env.find(dst_loc);
+              if (dst_it2 != env.end() &&
+                  !contains_angelic(dst_it2->second.type) &&
+                  dst_it2->second.type->front() != TypeVar)
+              {
+                // Result is concrete — filter recv_mems to those
+                // whose method returns this type, then constrain args.
+                auto result_prim = extract_primitive(dst_it2->second.type);
+                std::vector<Token> filtered_recv;
+                std::vector<MethodInfo> filtered_info;
+                for (auto& ti : recv_mems)
+                {
+                  auto ti_type = primitive_type(ti);
+                  auto info = method_cache.resolve_callable(
+                    ti_type, method_ident, hand, arity, method_ta);
+                  if (!info.func)
+                    continue;
+                  auto ret = apply_subst(
+                    top, info.func / Type, info.subst);
+                  if (!ret || ret->front() == TypeVar)
+                    continue;
+                  if (result_prim)
+                  {
+                    auto rp = extract_primitive(ret);
+                    if (!rp || rp->type() != result_prim->type())
+                      continue;
+                  }
+                  filtered_recv.push_back(ti);
+                  filtered_info.push_back(std::move(info));
+                }
+
+                // Constrain receiver angelic.
+                if (!filtered_recv.empty() &&
+                    filtered_recv.size() < recv_mems.size())
+                {
+                  auto recv_var =
+                    get_angelic_var_id(recv_it->second.type);
+                  if (recv_var.has_value())
+                  {
+                    // Tighten receiver member set.
+                    for (auto& frt : filtered_recv)
+                      constraints.add_upper_bound(
+                        recv_var.value(),
+                        primitive_type(frt),
+                        enqueue_cb);
+                  }
+                }
+
+                // Constrain angelic args from surviving methods.
+                if (filtered_info.size() == 1)
+                {
+                  auto& fi = filtered_info[0];
+                  auto params = fi.func / Params;
+                  for (size_t j = 0;
+                       j < params->size() && j < args->size();
+                       j++)
+                  {
+                    auto pt = apply_subst(
+                      top, params->at(j) / Type, fi.subst);
+                    if (pt && pt->front() != TypeVar)
+                    {
+                      auto arg_loc =
+                        (args->at(j) / Rhs)->location();
+                      auto arg_it = env.find(arg_loc);
+                      if (arg_it != env.end())
+                        constrain_type(
+                          arg_it->second.type, pt, enqueue_cb);
+                    }
+                  }
+                }
+              }
             }
 
             // Resolve on concrete part of receiver.
@@ -3061,11 +3161,11 @@ namespace vc
                     auto cid = get_angelic_var_id(ct);
                     if (cid.has_value())
                     {
-                      auto r = constraints.resolved(cid.value());
-                      if (r)
-                        resolved_parts.push_back(r);
+                      auto& ms = constraints.member_set(cid.value());
+                      if (ms.size() == 1)
+                        resolved_parts.push_back(primitive_type(ms[0]));
                       else
-                        all_ok = false; // Unresolved.
+                        all_ok = false; // Not yet singleton.
                     }
                     else
                       all_ok = false;
