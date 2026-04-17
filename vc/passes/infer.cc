@@ -1842,7 +1842,26 @@ namespace vc
           auto src_loc = (stmt / Rhs)->location();
           auto src_it = env.find(src_loc);
           if (src_it != env.end())
+          {
             merge(dst_loc, src_it->second.type, src_it->second.call_node);
+
+            // If source is Angelic and destination already has a
+            // concrete type (e.g., from TypeAssertion or prior join),
+            // constrain the source variable.
+            auto var_id = get_angelic_var_id(src_it->second.type);
+            if (var_id.has_value())
+            {
+              auto dst_it = env.find(dst_loc);
+              if (dst_it != env.end() &&
+                  !is_angelic(dst_it->second.type) &&
+                  dst_it->second.type->front() != TypeVar &&
+                  !is_uninformative_backward_type(dst_it->second.type))
+              {
+                constraints.add_upper_bound(
+                  var_id.value(), dst_it->second.type, enqueue_cb);
+              }
+            }
+          }
         }
         else if (stmt == RegisterRef)
         {
@@ -2496,11 +2515,20 @@ namespace vc
                     apply_subst(top, params->at(i) / Type, info.subst);
                   if (pt && pt->front() != TypeVar)
                   {
-                    auto arg_it =
-                      env.find((args->at(i) / Rhs)->location());
+                    auto arg_loc = (args->at(i) / Rhs)->location();
+                    auto arg_it = env.find(arg_loc);
                     if (arg_it != env.end())
+                    {
                       push_shape_to_lambda(
                         pt, arg_it->second.type);
+                      // Constrain Angelic arg from param type.
+                      auto var_id =
+                        get_angelic_var_id(arg_it->second.type);
+                      if (var_id.has_value() &&
+                          !is_uninformative_backward_type(pt))
+                        constraints.add_upper_bound(
+                          var_id.value(), pt, enqueue_cb);
+                    }
                   }
                 }
                 push_args_to_callee(info.func, args, env);
