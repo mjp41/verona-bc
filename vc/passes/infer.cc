@@ -1553,6 +1553,34 @@ namespace vc
         }
         else
         {
+          // Before joining, if one side is concrete and the other is
+          // Angelic with a TypeVarId, constrain the variable so that
+          // F3 absorption doesn't lose type information.
+          auto enq = [&](size_t lbl) {
+            if (ai_) ai_->enqueue(lbl);
+          };
+          if (is_angelic(info.type) && !is_angelic(it->second.type) &&
+              it->second.type->front() != TypeVar)
+          {
+            constrain_type(info.type, it->second.type, enq);
+          }
+          else if (is_angelic(it->second.type) && !is_angelic(info.type) &&
+                   info.type->front() != TypeVar)
+          {
+            constrain_type(it->second.type, info.type, enq);
+          }
+          // Also handle Union containing Angelics joined with concrete.
+          else if (contains_angelic(info.type) && !is_angelic(it->second.type) &&
+                   it->second.type->front() != TypeVar)
+          {
+            constrain_type(info.type, it->second.type, enq);
+          }
+          else if (contains_angelic(it->second.type) && !is_angelic(info.type) &&
+                   info.type->front() != TypeVar)
+          {
+            constrain_type(it->second.type, info.type, enq);
+          }
+
           auto joined = join_type(it->second.type, info.type, top);
           if (joined)
           {
@@ -1809,7 +1837,7 @@ namespace vc
       size_t label_idx,
       AbstractInterpreter<InferDomain>& ai)
     {
-      AiGuard ai_guard(ai_, ai);
+      snmalloc::UNUSED(ai);
 
       // Clear per-label state.
       tuple_locals.clear();
@@ -2722,6 +2750,9 @@ namespace vc
 
     void seed(AbstractInterpreter<InferDomain>& ai)
     {
+      // Keep AI reference for constraint notifications during join.
+      ai_ = &ai;
+
       // Initialize method cache with top node.
       method_cache.top = top;
 
@@ -2757,6 +2788,9 @@ namespace vc
 
     void finalize(FinalizeContext<Env>& ctx)
     {
+      // Clear AI reference.
+      ai_ = nullptr;
+
       auto& cfg = ctx.cfg;
       auto& fwd = ctx.fwd;
       auto& fwd_exit = ctx.fwd_exit;
