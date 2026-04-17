@@ -725,13 +725,17 @@ namespace vc
     return true;
   }
 
-  // ===== Forward Join (ALGORITHM.md §3.2) =====
+  // ===== Forward Join — Split Approach =====
+  //
+  // Decomposes types into (angelic, concrete) parts.
+  // Angelic part: set union by TypeVarId, bound widening for same ID.
+  // Concrete part: standard Union with Subtype absorption.
+  // Subtype never sees AngelicSubtype nodes.
   //
   // Returns the joined type, or {} if no change from existing.
-  // Rules F1-F5 + F2a.
   static Node join_type(const Node& existing, const Node& incoming, Node top)
   {
-    // F1: ⊔(TypeVar, X) = X — bottom absorbs.
+    // Bottom absorbs.
     if (!existing || existing->empty() || existing->front() == TypeVar)
     {
       if (incoming && !incoming->empty() && incoming->front() == TypeVar)
@@ -741,142 +745,176 @@ namespace vc
     if (!incoming || incoming->empty() || incoming->front() == TypeVar)
       return {};
 
-    // Pointer equality fast path.
+    // Fast paths.
     if (existing == incoming)
       return {};
-    // Structural equality fast path.
     if (same_type_tree(existing, incoming))
       return {};
 
-    bool ex_angelic = is_angelic(existing);
-    bool in_angelic = is_angelic(incoming);
+    // --- Split both sides into angelic and concrete parts ---
 
-    // TypeVarId-aware join: same constraint variable → identity.
-    if (ex_angelic && in_angelic)
+    struct SplitResult
     {
-      auto ex_id = get_angelic_var_id(existing);
-      auto in_id = get_angelic_var_id(incoming);
-      if (ex_id.has_value() && in_id.has_value())
-      {
-        if (ex_id.value() == in_id.value())
-          return {}; // Same constraint variable, no change.
+      std::vector<TypeVarId> ids;
+      Nodes angelic_nodes; // AngelicSubtype nodes (parallel with ids)
+      Nodes concrete;      // Type nodes (non-angelic)
+    };
 
-        // Different TypeVarIds → Union('a, 'b).
-        // Constraints on this Union decompose to both variables.
-        Node u = Union;
-        u << clone(existing->front());
-        u << clone(incoming->front());
-        return Type << u;
+    auto do_split = [](const Node& type) -> SplitResult {
+      SplitResult r;
+      auto inner = type->front();
+      if (inner == AngelicSubtype)
+      {
+        auto ct = Type << clone(inner);
+        auto id = get_angelic_var_id(ct);
+        if (id.has_value())
+          r.ids.push_back(id.value());
+        r.angelic_nodes.push_back(clone(inner));
+      }
+      else if (inner == Union)
+      {
+        for (auto& child : *inner)
+        {
+          if (child == AngelicSubtype)
+          {
+            auto ct = Type << clone(child);
+            auto id = get_angelic_var_id(ct);
+            if (id.has_value())
+              r.ids.push_back(id.value());
+            r.angelic_nodes.push_back(clone(child));
+          }
+          else
+          {
+            r.concrete.push_back(Type << clone(child));
+          }
+        }
+      }
+      else
+      {
+        r.concrete.push_back(clone(type));
+      }
+      return r;
+    };
+
+    auto ex = do_split(existing);
+    auto in = do_split(incoming);
+
+    // --- Join angelic part: set union by TypeVarId, bound widening ---
+    auto result_ids = ex.ids;
+    auto result_angelic = std::move(ex.angelic_nodes);
+    for (size_t i = 0; i < in.ids.size(); i++)
+    {
+      bool found = false;
+      for (size_t j = 0; j < result_ids.size(); j++)
+      {
+        if (result_ids[j] == in.ids[i])
+        {
+          found = true;
+          // Same ID — widen bounds if different.
+          if (!same_type_tree(
+                Type << clone(result_angelic[j]),
+                Type << clone(in.angelic_nodes[i])))
+          {
+            auto ex_bound = result_angelic[j]->front();
+            auto in_bound = in.angelic_nodes[i]->front();
+            auto ex_mems = members(ex_bound);
+            auto in_mems = members(in_bound);
+            std::vector<Token> widened = ex_mems;
+            for (auto& m : in_mems)
+            {
+              bool dup = false;
+              for (auto& w : widened)
+                if (w == m) { dup = true; break; }
+              if (!dup)
+                widened.push_back(m);
+            }
+            bool is_c = has_concrete(ex_bound) || has_concrete(in_bound);
+            auto nb = make_angelic_bound(widened, is_c);
+            result_angelic[j] =
+              (AngelicSubtype ^ std::to_string(in.ids[i])) << nb;
+          }
+          break;
+        }
+      }
+      if (!found)
+      {
+        result_ids.push_back(in.ids[i]);
+        result_angelic.push_back(clone(in.angelic_nodes[i]));
       }
     }
 
-    // F2/F2a: Both Angelic.
-    if (ex_angelic && in_angelic)
+    // --- Join concrete part: Subtype-aware union ---
+    auto result_concrete = std::move(ex.concrete);
+    if (!in.concrete.empty())
     {
-      auto ex_bound = existing->front()->front();
-      auto in_bound = incoming->front()->front();
-      bool ex_concrete = has_concrete(ex_bound);
-      bool in_concrete = has_concrete(in_bound);
-
-      // F2a: Mixed Concrete — one has Concrete, other doesn't.
-      // Fall back to demonic Union (different resolution semantics).
-      if (ex_concrete != in_concrete)
+      // Self type handling.
+      bool ex_self = false, in_self = false;
+      for (auto& c : result_concrete)
+        if (contains_self_type(c)) ex_self = true;
+      for (auto& c : in.concrete)
+        if (contains_self_type(c)) in_self = true;
+      if (ex_self != in_self)
       {
-        Node u = Union;
-        u << clone(existing->front());
-        u << clone(incoming->front());
-        return Type << u;
+        if (ex_self)
+          result_concrete = std::move(in.concrete);
       }
-
-      // F2: Same Concrete status — intersect bounds.
-      auto ex_members = members(ex_bound);
-      auto in_members = members(in_bound);
-
-      // Intersect member sets.
-      std::vector<Token> isect;
-      for (auto& t : ex_members)
-        for (auto& u : in_members)
-          if (t == u)
-            isect.push_back(t);
-
-      if (isect.empty())
+      else if (!result_concrete.empty())
       {
-        // Empty intersection — R4 will catch this.
-        // Return Angelic with empty bound.
-        if (ex_concrete)
-          return make_angelic(Isect << Concrete);
-        // Non-Concrete empty intersection is also a contradiction.
-        // Return Angelic with empty Isect bound so members() = {}.
-        return make_angelic(Isect);
+        SequentCtx ctx{top, {}, {}};
+        for (auto& inc : in.concrete)
+        {
+          bool covered = false;
+          for (auto& rc : result_concrete)
+          {
+            if (same_type_tree(rc, inc) || Subtype(ctx, inc, rc))
+            { covered = true; break; }
+          }
+          if (!covered)
+          {
+            auto it = result_concrete.begin();
+            while (it != result_concrete.end())
+            {
+              if (Subtype(ctx, *it, inc))
+                it = result_concrete.erase(it);
+              else
+                ++it;
+            }
+            result_concrete.push_back(clone(inc));
+          }
+        }
       }
-
-      // Build tightened Angelic bound.
-      auto new_bound = make_angelic_bound(isect, ex_concrete);
-      return make_angelic(new_bound);
+      else
+      {
+        result_concrete = std::move(in.concrete);
+      }
     }
 
-    // F3: ⊔(Angelic(T), concrete S) = S — concrete absorbs Angelic.
-    if (ex_angelic && !in_angelic)
-      return clone(incoming);
-    if (!ex_angelic && in_angelic)
-      return {}; // existing is concrete, keep it.
+    // --- Recombine ---
+    size_t total = result_angelic.size() + result_concrete.size();
+    if (total == 0)
+      return {};
 
-    // Self type handling.
-    bool existing_has_self = contains_self_type(existing);
-    bool incoming_has_self = contains_self_type(incoming);
-    if (existing_has_self != incoming_has_self)
+    Node result;
+    if (total == 1)
     {
-      if (existing_has_self)
-        return clone(incoming);
-      return {};
+      if (!result_angelic.empty())
+        result = Type << result_angelic[0];
+      else
+        result = result_concrete[0];
     }
-
-    // F5: Subtype absorption.
-    SequentCtx ctx{top, {}, {}};
-
-    if (Subtype.invariant(ctx, existing, incoming))
-      return {};
-
-    if (Subtype(ctx, incoming, existing))
-      return {};
-    if (Subtype(ctx, existing, incoming))
-      return clone(incoming);
-
-    // F4: Build union.
-    auto e_inner = existing->front();
-    auto i_inner = incoming->front();
-    Node u = Union;
-
-    if (e_inner == Union)
-      for (auto& c : *e_inner)
-        u << clone(c);
     else
-      u << clone(e_inner);
-
-    bool covered = false;
-    for (auto& m : *u)
     {
-      if (Subtype(ctx, incoming, Type << clone(m)))
-      {
-        covered = true;
-        break;
-      }
+      Node u = Union;
+      for (auto& a : result_angelic)
+        u << a;
+      for (auto& c : result_concrete)
+        u << clone(c->front());
+      result = Type << u;
     }
 
-    if (!covered)
-    {
-      auto it = u->begin();
-      while (it != u->end())
-      {
-        if (Subtype(ctx, Type << clone(*it), incoming))
-          it = u->erase(it, std::next(it));
-        else
-          ++it;
-      }
-      u << clone(i_inner);
-    }
-
-    return (u->size() == 1) ? Type << clone(u->front()) : Type << u;
+    if (same_type_tree(result, existing))
+      return {};
+    return result;
   }
 
   // ===== TypetestTrace =====
@@ -1517,6 +1555,10 @@ namespace vc
     // Constraint store for type variable tracking.
     ConstraintStore constraints;
 
+    // Stable TypeVarId per statement — ensures re-runs produce the
+    // same variable, not fresh ones.
+    std::map<const void*, TypeVarId> stmt_var_ids;
+
     // Forward pass shared state (reset per-label).
     std::map<Location, Node> lookup_stmts;
     std::map<Location, std::pair<Location, size_t>> ref_to_tuple;
@@ -1553,34 +1595,6 @@ namespace vc
         }
         else
         {
-          // Before joining, if one side is concrete and the other is
-          // Angelic with a TypeVarId, constrain the variable so that
-          // F3 absorption doesn't lose type information.
-          auto enq = [&](size_t lbl) {
-            if (ai_) ai_->enqueue(lbl);
-          };
-          if (is_angelic(info.type) && !is_angelic(it->second.type) &&
-              it->second.type->front() != TypeVar)
-          {
-            constrain_type(info.type, it->second.type, enq);
-          }
-          else if (is_angelic(it->second.type) && !is_angelic(info.type) &&
-                   info.type->front() != TypeVar)
-          {
-            constrain_type(it->second.type, info.type, enq);
-          }
-          // Also handle Union containing Angelics joined with concrete.
-          else if (contains_angelic(info.type) && !is_angelic(it->second.type) &&
-                   it->second.type->front() != TypeVar)
-          {
-            constrain_type(info.type, it->second.type, enq);
-          }
-          else if (contains_angelic(it->second.type) && !is_angelic(info.type) &&
-                   info.type->front() != TypeVar)
-          {
-            constrain_type(it->second.type, info.type, enq);
-          }
-
           auto joined = join_type(it->second.type, info.type, top);
           if (joined)
           {
@@ -1828,6 +1842,36 @@ namespace vc
       }
     }
 
+    // ===== Type splitting =====
+    //
+    // Extract the concrete part of a type, stripping all angelic
+    // components. Returns {} if the type is purely angelic.
+    // This is the fundamental operation for handlers that need to
+    // dispatch on concrete structure.
+    static Node extract_concrete_part(const Node& type)
+    {
+      if (!type || type != Type || type->empty())
+        return {};
+      auto inner = type->front();
+      if (inner == AngelicSubtype)
+        return {}; // Purely angelic.
+      if (inner != Union)
+        return clone(type); // Purely concrete.
+      // Union — extract non-angelic components.
+      Nodes concrete;
+      for (auto& child : *inner)
+        if (child != AngelicSubtype)
+          concrete.push_back(clone(child));
+      if (concrete.empty())
+        return {};
+      if (concrete.size() == 1)
+        return Type << concrete[0];
+      Node u = Union;
+      for (auto& c : concrete)
+        u << c;
+      return Type << u;
+    }
+
     // ===== Forward Transfer Function =====
 
     void forward_transfer(
@@ -1888,15 +1932,31 @@ namespace vc
               auto lit = stmt->back();
               if (lit->in({Bin, Oct, Int, Hex, Char}))
               {
-                auto id = constraints.fresh(
-                  true, std::vector<Token>(intset_members()), stmt);
+                auto sit = stmt_var_ids.find(stmt.get());
+                TypeVarId id;
+                if (sit != stmt_var_ids.end())
+                  id = sit->second;
+                else
+                {
+                  id = constraints.fresh(
+                    true, std::vector<Token>(intset_members()), stmt);
+                  stmt_var_ids[stmt.get()] = id;
+                }
                 type = make_angelic_var(id, true, intset_members());
                 constraints.add_observer(id, label_idx);
               }
               else if (lit->in({Float, HexFloat}))
               {
-                auto id = constraints.fresh(
-                  true, std::vector<Token>(floatset_members()), stmt);
+                auto sit = stmt_var_ids.find(stmt.get());
+                TypeVarId id;
+                if (sit != stmt_var_ids.end())
+                  id = sit->second;
+                else
+                {
+                  id = constraints.fresh(
+                    true, std::vector<Token>(floatset_members()), stmt);
+                  stmt_var_ids[stmt.get()] = id;
+                }
                 type = make_angelic_var(id, true, floatset_members());
                 constraints.add_observer(id, label_idx);
               }
@@ -2199,37 +2259,27 @@ namespace vc
           auto lhs_it = env.find(lhs_loc);
           auto rhs_it = env.find(rhs_loc);
 
-          // For homogeneous ops (T, T) → T: if LHS is Angelic and
-          // RHS is a compatible concrete primitive, use the RHS type
-          // as the result type WITHOUT refining the LHS. The LHS
-          // stays Angelic — backward will narrow it later.
-          if (lhs_it != env.end() && rhs_it != env.end() &&
-              is_angelic(lhs_it->second.type) &&
-              !is_angelic(rhs_it->second.type))
-          {
-            auto rhs_prim = extract_callable_primitive(rhs_it->second.type);
-            if (rhs_prim &&
-                is_angelic_compatible(lhs_it->second.type, rhs_prim))
-            {
-              // Constrain LHS Angelic from concrete RHS type.
-              constrain_type(
-                lhs_it->second.type, rhs_it->second.type, enqueue_cb);
-              merge(dst_loc, clone(rhs_it->second.type));
-              continue;
-            }
-          }
+          // For homogeneous ops: extract concrete parts for dispatch,
+          // constrain angelic parts from the concrete side.
+          auto lhs_concrete = lhs_it != env.end()
+            ? extract_concrete_part(lhs_it->second.type) : Node{};
+          auto rhs_concrete = rhs_it != env.end()
+            ? extract_concrete_part(rhs_it->second.type) : Node{};
 
-          // Symmetric: if RHS is Angelic and LHS is concrete,
-          // constrain RHS from LHS.
-          if (lhs_it != env.end() && rhs_it != env.end() &&
-              !is_angelic(lhs_it->second.type) &&
-              is_angelic(rhs_it->second.type))
-          {
+          // Constrain angelic from concrete on opposite side.
+          if (lhs_it != env.end() && rhs_concrete &&
+              contains_angelic(lhs_it->second.type))
             constrain_type(
-              rhs_it->second.type, lhs_it->second.type, enqueue_cb);
-          }
+              lhs_it->second.type, rhs_concrete, enqueue_cb);
+          if (rhs_it != env.end() && lhs_concrete &&
+              contains_angelic(rhs_it->second.type))
+            constrain_type(
+              rhs_it->second.type, lhs_concrete, enqueue_cb);
 
-          if (lhs_it != env.end())
+          // Result type = concrete part of LHS (or full LHS if no concrete).
+          if (lhs_concrete)
+            merge(dst_loc, lhs_concrete);
+          else if (lhs_it != env.end())
             merge(dst_loc, clone(lhs_it->second.type));
         }
         else if (stmt->in(propagate_lhs_ops_heterogeneous))
@@ -2320,92 +2370,104 @@ namespace vc
           auto src_it = env.find((stmt / Rhs)->location());
           if (src_it != env.end())
           {
-            if (is_angelic(src_it->second.type))
+            auto hand = (stmt / Lhs)->type();
+            auto method_ident = lookup_method_name(stmt);
+            auto method_ta = stmt / TypeArgs;
+            auto arity = from_chars_sep_v<size_t>(stmt / Int);
+
+            // Extract concrete part for method resolution.
+            auto concrete_recv = extract_concrete_part(src_it->second.type);
+            if (concrete_recv)
             {
-              // Receiver is Angelic — resolve the method for all
-              // members and use the common return type. If all
-              // members agree (e.g., all integer ==  returns Bool),
-              // use that. Otherwise keep Angelic.
-              auto bound = src_it->second.type->front()->front();
-              auto mems = members(bound);
-              auto hand = (stmt / Lhs)->type();
-              auto method_ident = lookup_method_name(stmt);
-              auto method_ta = stmt / TypeArgs;
-              auto arity = from_chars_sep_v<size_t>(stmt / Int);
+              auto ret = method_cache.resolve_return_type(
+                concrete_recv, method_ident, hand, arity, method_ta);
+              if (ret)
+                merge(dst_loc, ret);
+            }
 
-              Node common_ret;
-              bool all_agree = !mems.empty();
-              for (auto& m : mems)
-              {
-                auto mtype = primitive_type(m);
-                auto ret = method_cache.resolve_return_type(
-                  mtype, method_ident, hand, arity, method_ta);
-                if (!ret || ret->front() == TypeVar)
+            // Handle angelic part: resolve method for each member.
+            if (contains_angelic(src_it->second.type))
+            {
+              // Collect all angelic bounds' members.
+              std::vector<Token> all_mems;
+              auto collect_angelic_mems = [&](const Node& n) {
+                if (n == AngelicSubtype && !n->empty())
                 {
-                  all_agree = false;
-                  break;
+                  auto b = n->front();
+                  auto m = members(b);
+                  for (auto& t : m)
+                  {
+                    bool dup = false;
+                    for (auto& a : all_mems)
+                      if (a == t) { dup = true; break; }
+                    if (!dup)
+                      all_mems.push_back(t);
+                  }
                 }
-                if (!common_ret)
-                  common_ret = ret;
-                else if (!same_type_tree(common_ret, ret))
-                {
-                  all_agree = false;
-                  break;
-                }
-              }
+              };
+              if (is_angelic(src_it->second.type))
+                collect_angelic_mems(src_it->second.type->front());
+              else if (src_it->second.type->front() == Union)
+                for (auto& child : *(src_it->second.type->front()))
+                  if (child == AngelicSubtype)
+                    collect_angelic_mems(child);
 
-              if (all_agree && common_ret)
-                merge(dst_loc, common_ret);
-              else
+              if (!all_mems.empty())
               {
-                // Return types differ across members — build an
-                // Angelic from the union of all return types.
-                // §3.1.1: result = Angelic({ Ri | Ti.method → Ri })
-                std::vector<Token> ret_prims;
-                for (auto& m : mems)
+                Node common_ret;
+                bool all_agree = true;
+                for (auto& m : all_mems)
                 {
                   auto mtype = primitive_type(m);
                   auto ret = method_cache.resolve_return_type(
                     mtype, method_ident, hand, arity, method_ta);
                   if (!ret || ret->front() == TypeVar)
-                    continue;
-                  auto rp = extract_primitive(ret);
-                  if (!rp)
-                    continue;
-                  bool dup = false;
-                  for (auto& r : ret_prims)
-                    if (r == rp->type())
-                    {
-                      dup = true;
-                      break;
-                    }
-                  if (!dup)
-                    ret_prims.push_back(rp->type());
+                  { all_agree = false; break; }
+                  if (!common_ret)
+                    common_ret = ret;
+                  else if (!same_type_tree(common_ret, ret))
+                  { all_agree = false; break; }
                 }
-                if (!ret_prims.empty())
-                {
-                  bool concrete = has_concrete(bound);
-                  auto rb = make_angelic_bound(ret_prims, concrete);
-                  merge(dst_loc, make_angelic(rb));
-                }
+
+                if (all_agree && common_ret)
+                  merge(dst_loc, common_ret);
                 else
-                  merge(dst_loc, clone(src_it->second.type));
+                {
+                  std::vector<Token> ret_prims;
+                  for (auto& m : all_mems)
+                  {
+                    auto mtype = primitive_type(m);
+                    auto ret = method_cache.resolve_return_type(
+                      mtype, method_ident, hand, arity, method_ta);
+                    if (!ret || ret->front() == TypeVar)
+                      continue;
+                    auto rp = extract_primitive(ret);
+                    if (!rp)
+                      continue;
+                    bool dup = false;
+                    for (auto& r : ret_prims)
+                      if (r == rp->type()) { dup = true; break; }
+                    if (!dup)
+                      ret_prims.push_back(rp->type());
+                  }
+                  if (!ret_prims.empty())
+                  {
+                    auto sit = stmt_var_ids.find(stmt.get());
+                    TypeVarId id;
+                    if (sit != stmt_var_ids.end())
+                      id = sit->second;
+                    else
+                    {
+                      id = constraints.fresh(
+                        true, std::vector<Token>(ret_prims), stmt);
+                      stmt_var_ids[stmt.get()] = id;
+                    }
+                    merge(dst_loc,
+                      make_angelic_var(id, true, ret_prims));
+                    constraints.add_observer(id, label_idx);
+                  }
+                }
               }
-            }
-            else
-            {
-              auto hand = (stmt / Lhs)->type();
-              auto method_ident = lookup_method_name(stmt);
-              auto method_ta = stmt / TypeArgs;
-              auto arity = from_chars_sep_v<size_t>(stmt / Int);
-              auto ret = method_cache.resolve_return_type(
-                src_it->second.type,
-                method_ident,
-                hand,
-                arity,
-                method_ta);
-              if (ret)
-                merge(dst_loc, ret);
             }
           }
           lookup_stmts[dst_loc] = stmt;
@@ -2438,15 +2500,31 @@ namespace vc
             // only one value.
             if (
               recv_it != env.end() &&
-              is_angelic(recv_it->second.type))
+              contains_angelic(recv_it->second.type))
             {
               auto hand = (lookup_node / Lhs)->type();
               auto method_ident = lookup_method_name(lookup_node);
               auto method_ta = lookup_node / TypeArgs;
               auto arity = from_chars_sep_v<size_t>(lookup_node / Int);
 
-              auto recv_bound = recv_it->second.type->front()->front();
-              auto recv_mems = members(recv_bound);
+              // Collect all angelic members from receiver.
+              std::vector<Token> recv_mems;
+              auto collect_mems = [&](const Node& n) {
+                if (n == AngelicSubtype && !n->empty())
+                  for (auto& m : members(n->front()))
+                  {
+                    bool dup = false;
+                    for (auto& r : recv_mems)
+                      if (r == m) { dup = true; break; }
+                    if (!dup) recv_mems.push_back(m);
+                  }
+              };
+              if (is_angelic(recv_it->second.type))
+                collect_mems(recv_it->second.type->front());
+              else if (recv_it->second.type->front() == Union)
+                for (auto& child : *(recv_it->second.type->front()))
+                  if (child == AngelicSubtype)
+                    collect_mems(child);
 
               // Collect arg member sets.
               std::vector<std::vector<Token>> arg_mem_sets;
@@ -2545,26 +2623,37 @@ namespace vc
                   merge(dst_loc, primitive_type(result_prims[0]));
                 else
                 {
-                  bool concrete = has_concrete(recv_bound);
-                  auto bound =
-                    make_angelic_bound(result_prims, concrete);
-                  merge(dst_loc, make_angelic(bound));
+                  bool concrete = true;
+                  auto sit = stmt_var_ids.find(stmt.get());
+                  TypeVarId id;
+                  if (sit != stmt_var_ids.end())
+                    id = sit->second;
+                  else
+                  {
+                    id = constraints.fresh(
+                      concrete, std::vector<Token>(result_prims), stmt);
+                    stmt_var_ids[stmt.get()] = id;
+                  }
+                  merge(dst_loc,
+                    make_angelic_var(id, concrete, result_prims));
+                  constraints.add_observer(id, label_idx);
                 }
               }
               else if (result_nonprim)
                 merge(dst_loc, result_nonprim);
             }
 
-            if (
-              recv_it != env.end() &&
-              !is_angelic(recv_it->second.type))
+            // Resolve on concrete part of receiver.
+            auto concrete_recv = recv_it != env.end()
+              ? extract_concrete_part(recv_it->second.type) : Node{};
+            if (concrete_recv)
             {
               auto hand = (lookup_node / Lhs)->type();
               auto method_ident = lookup_method_name(lookup_node);
               auto method_ta = lookup_node / TypeArgs;
               auto arity = from_chars_sep_v<size_t>(lookup_node / Int);
               auto info = method_cache.resolve_callable(
-                recv_it->second.type,
+                concrete_recv,
                 method_ident,
                 hand,
                 arity,
@@ -2946,26 +3035,80 @@ namespace vc
             auto dst = (*it)->front();
             auto loc = dst->location();
 
+            // Resolve the Const's type from fwd_exit, resolving any
+            // angelic components from the constraint store.
             Node final_type;
             auto env_it = fwd_exit[i].find(loc);
-            if (
-              env_it != fwd_exit[i].end() &&
-              !is_angelic(env_it->second.type))
-              final_type = env_it->second.type;
-
-            // Check constraint store for resolved Angelic types.
-            if (!final_type && env_it != fwd_exit[i].end())
+            if (env_it != fwd_exit[i].end())
             {
-              auto var_id = get_angelic_var_id(env_it->second.type);
-              if (var_id.has_value())
+              auto& etype = env_it->second.type;
+              if (!contains_angelic(etype))
               {
-                auto resolved = constraints.resolved(var_id.value());
-                if (resolved)
-                  final_type = resolved;
+                // Pure concrete — use directly.
+                final_type = etype;
+              }
+              else
+              {
+                // Contains angelic — resolve each angelic component
+                // from constraint store, rebuild as concrete.
+                Nodes resolved_parts;
+                bool all_ok = true;
+
+                auto resolve_node = [&](const Node& n) {
+                  if (n == AngelicSubtype)
+                  {
+                    auto ct = Type << clone(n);
+                    auto cid = get_angelic_var_id(ct);
+                    if (cid.has_value())
+                    {
+                      auto r = constraints.resolved(cid.value());
+                      if (r)
+                        resolved_parts.push_back(r);
+                      else
+                        all_ok = false; // Unresolved.
+                    }
+                    else
+                      all_ok = false;
+                  }
+                  else
+                    resolved_parts.push_back(Type << clone(n));
+                };
+
+                if (is_angelic(etype))
+                  resolve_node(etype->front());
+                else if (etype->front() == Union)
+                  for (auto& child : *(etype->front()))
+                    resolve_node(child);
+                else
+                  resolved_parts.push_back(clone(etype));
+
+                if (all_ok && !resolved_parts.empty())
+                {
+                  // Deduplicate.
+                  Nodes deduped;
+                  for (auto& rp : resolved_parts)
+                  {
+                    bool covered = false;
+                    for (auto& d : deduped)
+                      if (same_type_tree(d, rp))
+                      { covered = true; break; }
+                    if (!covered)
+                      deduped.push_back(rp);
+                  }
+                  if (deduped.size() == 1)
+                    final_type = deduped[0];
+                  else
+                  {
+                    Node u = Union;
+                    for (auto& d : deduped)
+                      u << clone(d->front());
+                    final_type = Type << u;
+                  }
+                }
               }
             }
 
-            // Also check stability map directly for the stmt.
+            // Stability map fallback.
             if (!final_type)
             {
               auto stable = constraints.check_stability(*it);
