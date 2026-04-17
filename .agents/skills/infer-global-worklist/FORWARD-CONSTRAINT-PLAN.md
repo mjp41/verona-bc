@@ -90,41 +90,85 @@ Bounds are always concrete types. When a bound is added:
 `AngelicSubtype` node, the clone carries the same TypeVarId. Both
 locations now reference the same constraint entry. No merging needed.
 
-## CFG Join
+## CFG Join — Split Approach
 
-At a merge point, when predecessors provide different types for the
-same location, produce a `Union` that may contain type variables:
+The join operation splits each type into two disjoint parts:
+
+- **Angelic part**: all `AngelicSubtype` components, tracked by TypeVarId
+- **Non-angelic part**: all concrete/TypeName components
+
+These are handled independently:
+
+### Angelic part: set union by TypeVarId
+
+Angelic components are deduplicated by TypeVarId (integer equality),
+not by Subtype. The Subtype checker never sees AngelicSubtype nodes.
+
+When the same TypeVarId appears on both sides with different local
+bounds (from typetest narrowing on different paths), the bounds are
+**widened** by taking their union:
 
 ```
-Label A:  env[%x] = 'a
-Label B:  env[%x] = 'b
-Label C:  join → env[%x] = Union('a, 'b)
+α_k[Concrete ∩ {i32}] ⊔ α_k[Concrete ∩ IntSet]
+  = α_k[Concrete ∩ IntSet]      (union of member sets)
 ```
 
-If `'a` and `'b` are the same variable (same TypeVarId), the Union
-collapses to just `'a`.
+This is correct because the local bound represents "what this variable
+could be on this path." At a join, we lose path information and must
+take the union of possibilities. The `Concrete` flag is preserved if
+either side has it.
 
-When a constraint decomposes a Union containing type variables:
+### Non-angelic part: subtype-aware union
+
+Concrete components use the standard union with subtype absorption:
+- If incoming is a subtype of an existing member, skip (covered)
+- If incoming subsumes an existing member, replace
+- Otherwise add to the union
+
+### Recombination
+
+The result is the union of the angelic and non-angelic parts:
 
 ```
-Return %x           →  constraint: Union('a, 'b) <: i32
-                    →  decompose:  'a <: i32 AND 'b <: i32
+result = Angelic_result ∪ NonAngelic_result
 ```
 
-Each variable gets a concrete upper bound directly. When `'a`
-resolves, its observer labels re-run, flowing the concrete type
-forward. On re-run, the join at Label C becomes `Union(i32, 'b)` or
-`Union(i32, i32) = i32` once both resolve.
+If total components = 1, produce a bare type (not wrapped in Union).
 
-`join(Env& target, const Env& incoming)` rules per location:
-- Both AngelicSubtype with same TypeVarId → no change
-- Both same concrete type → no change
-- One Angelic, other concrete → Union('a, concrete)
-- Both Angelic with different IDs → Union('a, 'b)
-- Both concrete and different → standard Union/subtype rules
+### Join rules (derived from split)
 
-The `join` method is a domain method with access to the constraint
-store for resolving variables before comparison.
+```
+⊥ ⊔ X = X                              (bottom absorbs)
+X ⊔ X = X                              (structural equality)
+α_i ⊔ α_j = Union(α_i, α_j)            (different IDs)
+α_k[B1] ⊔ α_k[B2] = α_k[B1 ∪ B2]      (same ID, widen bounds)
+α_k ⊔ C = Union(α_k, C)                (angelic + concrete)
+C1 ⊔ C2 = Union/subtype rules           (concrete + concrete)
+Union(A,B) ⊔ X = split, join parts, recombine
+```
+
+### Convergence
+
+The ascending chain stabilizes because:
+- Angelic IDs are **stable** (Const reuses TypeVarId per statement)
+- The set of angelic IDs only grows (bounded by number of Const stmts)
+- Local bounds only widen (monotone in the subset lattice)
+- Concrete part follows existing lattice convergence
+- Structural equality check after recombination detects no-change
+
+### Constraint decomposition on Unions
+
+When a type containing angelic variables reaches a typed context:
+
+```
+Return %x           →  constraint: Union(α_a, α_b, i32) <: i32
+                    →  decompose:  α_a <: i32 AND α_b <: i32
+                        (i32 <: i32 is trivially satisfied)
+```
+
+Each angelic variable gets a concrete upper bound. Resolution triggers
+observer notification → defining label re-runs → stability map
+produces concrete type → join stabilizes.
 
 ## Subtype Constraints
 
