@@ -53,7 +53,7 @@ namespace vc
 
     std::vector<LabelInfo> labels;
     std::map<Node, std::pair<size_t, size_t>> func_label_range;
-    std::vector<std::vector<size_t>> succ, pred;
+    std::vector<std::vector<size_t>> succ;
     std::map<Node, std::map<std::string, size_t>> func_label_idx;
     std::vector<size_t> rpo_index;
 
@@ -85,7 +85,6 @@ namespace vc
 
       size_t n = labels.size();
       succ.resize(n);
-      pred.resize(n);
 
       // Build per-function label index.
       for (size_t i = 0; i < n; i++)
@@ -121,10 +120,6 @@ namespace vc
             succ[i].push_back(t->second);
         }
       }
-
-      for (size_t i = 0; i < n; i++)
-        for (auto s : succ[i])
-          pred[s].push_back(i);
 
       compute_rpo();
     }

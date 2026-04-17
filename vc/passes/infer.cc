@@ -756,9 +756,18 @@ namespace vc
     {
       auto ex_id = get_angelic_var_id(existing);
       auto in_id = get_angelic_var_id(incoming);
-      if (ex_id.has_value() && in_id.has_value() &&
-          ex_id.value() == in_id.value())
-        return {}; // Same constraint variable, no change.
+      if (ex_id.has_value() && in_id.has_value())
+      {
+        if (ex_id.value() == in_id.value())
+          return {}; // Same constraint variable, no change.
+
+        // Different TypeVarIds → Union('a, 'b).
+        // Constraints on this Union decompose to both variables.
+        Node u = Union;
+        u << clone(existing->front());
+        u << clone(incoming->front());
+        return Type << u;
+      }
     }
 
     // F2/F2a: Both Angelic.
@@ -1746,6 +1755,51 @@ namespace vc
       return changed;
     }
 
+    // ===== Constraint decomposition =====
+    //
+    // Adds upper bound constraints to all type variables in a type.
+    // Handles: direct TypeVarId, Union containing Angelics.
+    // No-op for concrete types without Angelics.
+    void constrain_type(
+      const Node& value_type,
+      const Node& expected_type,
+      const EnqueueCallback& enqueue_cb)
+    {
+      if (!value_type || !expected_type)
+        return;
+      if (is_uninformative_backward_type(expected_type))
+        return;
+      if (contains_typevar(expected_type))
+        return;
+
+      // Direct TypeVarId.
+      auto var_id = get_angelic_var_id(value_type);
+      if (var_id.has_value())
+      {
+        constraints.add_upper_bound(
+          var_id.value(), expected_type, enqueue_cb);
+        return;
+      }
+
+      // Union containing Angelics: decompose.
+      // Union('a, 'b) <: T → 'a <: T AND 'b <: T.
+      if (value_type == Type && !value_type->empty() &&
+          value_type->front() == Union)
+      {
+        for (auto& component : *(value_type->front()))
+        {
+          if (component == AngelicSubtype)
+          {
+            auto comp_type = Type << clone(component);
+            auto comp_id = get_angelic_var_id(comp_type);
+            if (comp_id.has_value())
+              constraints.add_upper_bound(
+                comp_id.value(), expected_type, enqueue_cb);
+          }
+        }
+      }
+    }
+
     // ===== Forward Transfer Function =====
 
     void forward_transfer(
@@ -1845,20 +1899,18 @@ namespace vc
           {
             merge(dst_loc, src_it->second.type, src_it->second.call_node);
 
-            // If source is Angelic and destination already has a
-            // concrete type (e.g., from TypeAssertion or prior join),
-            // constrain the source variable.
-            auto var_id = get_angelic_var_id(src_it->second.type);
-            if (var_id.has_value())
+            // If source contains type variables and destination already
+            // has a concrete type, constrain the source.
+            if (is_angelic(src_it->second.type) ||
+                contains_angelic(src_it->second.type))
             {
               auto dst_it = env.find(dst_loc);
               if (dst_it != env.end() &&
                   !is_angelic(dst_it->second.type) &&
-                  dst_it->second.type->front() != TypeVar &&
-                  !is_uninformative_backward_type(dst_it->second.type))
+                  dst_it->second.type->front() != TypeVar)
               {
-                constraints.add_upper_bound(
-                  var_id.value(), dst_it->second.type, enqueue_cb);
+                constrain_type(
+                  src_it->second.type, dst_it->second.type, enqueue_cb);
               }
             }
           }
@@ -1928,12 +1980,8 @@ namespace vc
               // Constrain Angelic stored value from field type.
               auto val_it2 = env.find(val_loc);
               if (val_it2 != env.end() && !is_any_type(inner))
-              {
-                auto var_id = get_angelic_var_id(val_it2->second.type);
-                if (var_id.has_value())
-                  constraints.add_upper_bound(
-                    var_id.value(), inner, enqueue_cb);
-              }
+                constrain_type(
+                  val_it2->second.type, inner, enqueue_cb);
 
               auto rtt = ref_to_tuple.find(ref_loc);
               if (rtt != ref_to_tuple.end())
@@ -2098,9 +2146,6 @@ namespace vc
                 auto arg_it = env.find(arg_loc);
                 if (arg_it == env.end())
                   continue;
-                auto var_id = get_angelic_var_id(arg_it->second.type);
-                if (!var_id.has_value())
-                  continue;
                 auto fname = (na / Ident)->location().view();
                 for (auto& f : *(class_def / ClassBody))
                 {
@@ -2110,8 +2155,8 @@ namespace vc
                     continue;
                   auto ft = apply_subst(top, f / Type, subst);
                   if (ft && !contains_typevar(ft))
-                    constraints.add_upper_bound(
-                      var_id.value(), ft, enqueue_cb);
+                    constrain_type(
+                      arg_it->second.type, ft, enqueue_cb);
                   break;
                 }
               }
@@ -2139,10 +2184,8 @@ namespace vc
                 is_angelic_compatible(lhs_it->second.type, rhs_prim))
             {
               // Constrain LHS Angelic from concrete RHS type.
-              auto var_id = get_angelic_var_id(lhs_it->second.type);
-              if (var_id.has_value())
-                constraints.add_upper_bound(
-                  var_id.value(), rhs_it->second.type, enqueue_cb);
+              constrain_type(
+                lhs_it->second.type, rhs_it->second.type, enqueue_cb);
               merge(dst_loc, clone(rhs_it->second.type));
               continue;
             }
@@ -2154,10 +2197,8 @@ namespace vc
               !is_angelic(lhs_it->second.type) &&
               is_angelic(rhs_it->second.type))
           {
-            auto var_id = get_angelic_var_id(rhs_it->second.type);
-            if (var_id.has_value())
-              constraints.add_upper_bound(
-                var_id.value(), lhs_it->second.type, enqueue_cb);
+            constrain_type(
+              rhs_it->second.type, lhs_it->second.type, enqueue_cb);
           }
 
           if (lhs_it != env.end())
@@ -2237,11 +2278,8 @@ namespace vc
               {
                 push_shape_to_lambda(pt, arg_it->second.type);
                 // Constrain Angelic arg from param type.
-                auto var_id = get_angelic_var_id(arg_it->second.type);
-                if (var_id.has_value() &&
-                    !is_uninformative_backward_type(pt))
-                  constraints.add_upper_bound(
-                    var_id.value(), pt, enqueue_cb);
+                constrain_type(
+                  arg_it->second.type, pt, enqueue_cb);
               }
             }
           }
@@ -2522,12 +2560,8 @@ namespace vc
                       push_shape_to_lambda(
                         pt, arg_it->second.type);
                       // Constrain Angelic arg from param type.
-                      auto var_id =
-                        get_angelic_var_id(arg_it->second.type);
-                      if (var_id.has_value() &&
-                          !is_uninformative_backward_type(pt))
-                        constraints.add_upper_bound(
-                          var_id.value(), pt, enqueue_cb);
+                      constrain_type(
+                        arg_it->second.type, pt, enqueue_cb);
                     }
                   }
                 }
@@ -2644,12 +2678,8 @@ namespace vc
           auto func_ret = func / Type;
           if (!contains_typevar(func_ret) && !is_angelic(func_ret))
           {
-            auto var_id = get_angelic_var_id(ret_it->second.type);
-            if (var_id.has_value())
-            {
-              constraints.add_upper_bound(
-                var_id.value(), func_ret, enqueue_cb);
-            }
+            constrain_type(
+              ret_it->second.type, func_ret, enqueue_cb);
           }
         }
       }
