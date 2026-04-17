@@ -130,6 +130,31 @@ namespace vc
       return {};
     }
 
+    // Check stability map by TypeVarId (for variables without source_stmt,
+    // like function return type variables).
+    Node check_stability_by_id(TypeVarId var) const
+    {
+      if (var >= entries.size())
+        return {};
+      // For non-concrete vars, check if all upper bounds agree.
+      auto& e = entries[var];
+      if (!e.upper_bounds.empty())
+      {
+        bool all_agree = true;
+        for (size_t i = 1; i < e.upper_bounds.size(); i++)
+        {
+          if (!structural_eq(e.upper_bounds[i], e.upper_bounds[0]))
+          {
+            all_agree = false;
+            break;
+          }
+        }
+        if (all_agree)
+          return clone(e.upper_bounds[0]);
+      }
+      return {};
+    }
+
     size_t size() const { return entries.size(); }
 
   private:

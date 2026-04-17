@@ -1570,13 +1570,11 @@ namespace vc
     // Lambda return tracking (moved from file-static).
     std::unordered_set<const void*> lambda_returns_omitted;
 
-    // Cross-function return observers: when a callee's return label
-    // produces a new type, re-enqueue all caller labels that read it.
-    // Key: callee Function node pointer. Value: set of caller label indices.
-    std::map<const void*, std::vector<size_t>> return_observers;
-
-    // Previous inferred return type per function, for change detection.
-    std::map<const void*, Node> prev_inferred_return;
+    // Cross-function return type constraint variables.
+    // For each function with TypeVar return, a constraint variable
+    // tracks the inferred return type. Callers observe this variable;
+    // return labels tighten it.
+    std::map<const void*, TypeVarId> func_return_var;
 
     // ===== Domain concept implementation =====
 
@@ -1880,127 +1878,65 @@ namespace vc
 
     // ===== Cross-function return type inference =====
     //
-    // When a callee's declared return type is TypeVar, read the
-    // inferred return type from fwd_exit of the callee's return labels.
-    // Register the caller as an observer so it's re-enqueued when
-    // the callee's return type changes.
+// When a callee's declared return type is TypeVar, get or create
+    // a constraint variable for the callee's inferred return type.
+    // The caller observes this variable. Return labels tighten it.
 
-    Node infer_callee_return(
-      Node callee_func,
-      size_t caller_label,
-      AbstractInterpreter<InferDomain>& ai)
+    TypeVarId get_func_return_var(Node callee_func)
     {
-      auto& fr = ai.func_returns();
-      auto it = fr.find(callee_func);
-      if (it == fr.end())
-        return {};
+      auto key = callee_func.get();
+      auto it = func_return_var.find(key);
+      if (it != func_return_var.end())
+        return it->second;
 
-      // Register caller as observer of this callee's returns.
-      auto& obs = return_observers[callee_func.get()];
-      bool already = false;
-      for (auto o : obs)
-        if (o == caller_label) { already = true; break; }
-      if (!already)
-        obs.push_back(caller_label);
-
-      // Join all return label exit environments.
-      Nodes ret_types;
-      for (auto idx : it->second)
-      {
-        auto term = ai.cfg().labels[idx].label / Return;
-        if (term != Return)
-          continue;
-        auto ret_loc = (term / LocalId)->location();
-        auto& exit_env = ai.get_fwd_exit(idx);
-        auto eit = exit_env.find(ret_loc);
-        if (eit == exit_env.end())
-          continue;
-        auto& rt = eit->second.type;
-        if (!rt || rt->empty() || rt->front() == TypeVar)
-          continue;
-        // Deduplicate.
-        bool covered = false;
-        for (auto& existing : ret_types)
-          if (same_type_tree(existing, rt))
-          { covered = true; break; }
-        if (!covered)
-          ret_types.push_back(clone(rt));
-      }
-
-      if (ret_types.empty())
-        return {};
-      if (ret_types.size() == 1)
-        return ret_types[0];
-
-      // Build Union of all return types.
-      Node u = Union;
-      for (auto& rt : ret_types)
-        u << clone(rt->front());
-      return Type << u;
+      // Create a non-concrete variable with no member set.
+      auto id = constraints.fresh(false, {});
+      func_return_var[key] = id;
+      return id;
     }
 
-    // Notify cross-function return observers when a return label
-    // is re-processed and the inferred return type has changed.
-    void notify_return_observers(
-      const Node& func,
-      AbstractInterpreter<InferDomain>& ai)
+    // Read the callee's inferred return type from its constraint variable.
+    // Register the caller as an observer. Returns {} if no info yet.
+    Node infer_callee_return(
+      Node callee_func,
+      size_t caller_label)
     {
-      auto obs_it = return_observers.find(func.get());
-      if (obs_it == return_observers.end())
+      auto id = get_func_return_var(callee_func);
+      constraints.add_observer(id, caller_label);
+
+      auto& ms = constraints.member_set(id);
+      if (ms.size() == 1)
+        return primitive_type(ms[0]);
+
+      // Check stability map for non-primitive resolved type.
+      // For non-concrete variables, tighten stores in stability_map
+      // when all upper bounds agree structurally.
+      auto stable = constraints.check_stability_by_id(id);
+      if (stable)
+        return stable;
+
+      return {};
+    }
+
+    // Called from return labels: tighten the function's return
+    // constraint variable with the current fwd_exit return type.
+    void tighten_func_return(
+      const Node& func,
+      const Node& ret_type,
+      const EnqueueCallback& enqueue_cb)
+    {
+      if (!ret_type || ret_type->empty() || ret_type->front() == TypeVar)
+        return;
+      if (contains_angelic(ret_type))
         return;
 
-      // Compute current inferred return type.
-      auto& fr = ai.func_returns();
-      auto fr_it = fr.find(func);
-      if (fr_it == fr.end())
+      // Only relevant for functions with TypeVar declared return.
+      auto func_ret = func / Type;
+      if (!contains_typevar(func_ret))
         return;
 
-      Nodes ret_types;
-      for (auto idx : fr_it->second)
-      {
-        auto term = ai.cfg().labels[idx].label / Return;
-        if (term != Return)
-          continue;
-        auto ret_loc = (term / LocalId)->location();
-        auto& exit_env = ai.get_fwd_exit(idx);
-        auto eit = exit_env.find(ret_loc);
-        if (eit == exit_env.end())
-          continue;
-        auto& rt = eit->second.type;
-        if (!rt || rt->empty() || rt->front() == TypeVar)
-          continue;
-        bool covered = false;
-        for (auto& existing : ret_types)
-          if (same_type_tree(existing, rt))
-          { covered = true; break; }
-        if (!covered)
-          ret_types.push_back(clone(rt));
-      }
-
-      if (ret_types.empty())
-        return;
-
-      Node current;
-      if (ret_types.size() == 1)
-        current = ret_types[0];
-      else
-      {
-        Node u = Union;
-        for (auto& rt : ret_types)
-          u << clone(rt->front());
-        current = Type << u;
-      }
-
-      // Only notify if changed from previous.
-      auto prev_it = prev_inferred_return.find(func.get());
-      if (prev_it != prev_inferred_return.end() &&
-          same_type_tree(prev_it->second, current))
-        return; // No change.
-
-      prev_inferred_return[func.get()] = clone(current);
-
-      for (auto caller_label : obs_it->second)
-        ai.enqueue(caller_label);
+      auto id = get_func_return_var(func);
+      constraints.add_upper_bound(id, ret_type, enqueue_cb);
     }
 
     // ===== Forward Transfer Function =====
@@ -2485,7 +2421,7 @@ namespace vc
           // If declared return type is TypeVar, try inferred return.
           if (ret && ret->front() == TypeVar)
           {
-            auto inferred = infer_callee_return(func_def, label_idx, ai);
+            auto inferred = infer_callee_return(func_def, label_idx);
             if (inferred)
               ret = inferred;
           }
@@ -2539,7 +2475,7 @@ namespace vc
                 if (info.func)
                 {
                   auto inferred =
-                    infer_callee_return(info.func, label_idx, ai);
+                    infer_callee_return(info.func, label_idx);
                   if (inferred)
                     ret = inferred;
                 }
@@ -3049,14 +2985,12 @@ namespace vc
             constrain_type(
               ret_it->second.type, func_ret, enqueue_cb);
           }
+
+          // Tighten the function's return constraint variable
+          // with the current return type.
+          tighten_func_return(func, ret_it->second.type, enqueue_cb);
         }
-
-        // Notify cross-function callers that may be reading
-        // this function's inferred return type.
-        notify_return_observers(func, ai);
       }
-
-      snmalloc::UNUSED(label_idx);
     }
 
     // ===== split_cond (typetest narrowing) =====
