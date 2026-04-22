@@ -75,6 +75,13 @@ namespace vc
       return var < entries.size() ? entries[var].member_set : empty;
     }
 
+    // Get the upper bounds for a variable.
+    const std::vector<Node>& upper_bounds(TypeVarId var) const
+    {
+      static const std::vector<Node> empty;
+      return var < entries.size() ? entries[var].upper_bounds : empty;
+    }
+
     // Add an upper bound: 'a <: T.
     // Returns true if the member set was tightened.
     bool add_upper_bound(

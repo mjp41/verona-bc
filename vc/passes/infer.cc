@@ -1909,11 +1909,29 @@ namespace vc
         return primitive_type(ms[0]);
 
       // Check stability map for non-primitive resolved type.
-      // For non-concrete variables, tighten stores in stability_map
-      // when all upper bounds agree structurally.
       auto stable = constraints.check_stability_by_id(id);
       if (stable)
         return stable;
+
+      // If upper bounds contain angelics, return them directly.
+      // The caller can constrain the angelic's TypeVarId, and
+      // the observer cascade flows through the AI worklist.
+      auto& ubs = constraints.upper_bounds(id);
+      if (ubs.size() == 1)
+        return clone(ubs[0]);
+
+      // Multiple upper bounds — join them.
+      if (ubs.size() > 1)
+      {
+        Node result = clone(ubs[0]);
+        for (size_t i = 1; i < ubs.size(); i++)
+        {
+          auto joined = join_type(result, ubs[i], top);
+          if (joined)
+            result = joined;
+        }
+        return result;
+      }
 
       return {};
     }
@@ -1926,8 +1944,6 @@ namespace vc
       const EnqueueCallback& enqueue_cb)
     {
       if (!ret_type || ret_type->empty() || ret_type->front() == TypeVar)
-        return;
-      if (contains_angelic(ret_type))
         return;
 
       // Only relevant for functions with TypeVar declared return.
