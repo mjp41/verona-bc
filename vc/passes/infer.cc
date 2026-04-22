@@ -1844,6 +1844,54 @@ namespace vc
           }
         }
       }
+
+      // Generic decomposition:
+      // G[V1,...,Vn] <: G[E1,...,En] → Vi <: Ei for each i.
+      // Only when both are TypeName with same class identity.
+      if (value_type == Type && expected_type == Type &&
+          !value_type->empty() && !expected_type->empty() &&
+          value_type->front() == TypeName &&
+          expected_type->front() == TypeName)
+      {
+        auto v_tn = value_type->front();
+        auto e_tn = expected_type->front();
+
+        // Match class identity: same number of NameElements,
+        // same Ident at each position.
+        if (v_tn->size() == e_tn->size() && v_tn->size() >= 1)
+        {
+          bool same_class = true;
+          for (size_t i = 0; i < v_tn->size(); i++)
+          {
+            auto v_ne = v_tn->at(i);
+            auto e_ne = e_tn->at(i);
+            if (v_ne != NameElement || e_ne != NameElement)
+            { same_class = false; break; }
+            auto v_id = (v_ne / Ident)->location().view();
+            auto e_id = (e_ne / Ident)->location().view();
+            if (v_id != e_id)
+            { same_class = false; break; }
+          }
+
+          if (same_class)
+          {
+            // Extract TypeArgs from each NameElement and
+            // constrain pairwise.
+            for (size_t i = 0; i < v_tn->size(); i++)
+            {
+              auto v_ta = v_tn->at(i) / TypeArgs;
+              auto e_ta = e_tn->at(i) / TypeArgs;
+              for (size_t j = 0;
+                   j < v_ta->size() && j < e_ta->size();
+                   j++)
+              {
+                constrain_type(
+                  v_ta->at(j), e_ta->at(j), enqueue_cb);
+              }
+            }
+          }
+        }
+      }
     }
 
     // ===== Type splitting =====
