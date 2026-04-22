@@ -1801,6 +1801,102 @@ namespace vc
       return changed;
     }
 
+    // ===== Call TypeArg refinement =====
+    //
+    // When G[V] <: G[E] and V is a concrete class implementing
+    // shape E, refine the Call that produced G[V] to produce G[E].
+    // This fixes premature concretisation of generic TypeArgs.
+    void refine_call_typeargs(
+      const LocalTypeInfo& value_info,
+      const Node& expected_type,
+      const EnqueueCallback& enqueue_cb)
+    {
+      snmalloc::UNUSED(enqueue_cb);
+
+      auto& value_type = value_info.type;
+      if (!value_type || !expected_type)
+        return;
+      if (value_type == Type && expected_type == Type &&
+          !value_type->empty() && !expected_type->empty() &&
+          value_type->front() == TypeName &&
+          expected_type->front() == TypeName)
+      {
+        auto v_tn = value_type->front();
+        auto e_tn = expected_type->front();
+
+        if (v_tn->size() != e_tn->size() || v_tn->size() < 1)
+          return;
+
+        // Find mismatched TypeArgs where the value is a concrete
+        // class implementing the expected shape.
+        for (size_t i = 0; i < v_tn->size(); i++)
+        {
+          auto v_ne = v_tn->at(i);
+          auto e_ne = e_tn->at(i);
+          if (v_ne != NameElement || e_ne != NameElement)
+            return;
+          if ((v_ne / Ident)->location().view() !=
+              (e_ne / Ident)->location().view())
+            return;
+
+          auto v_ta = v_ne / TypeArgs;
+          auto e_ta = e_ne / TypeArgs;
+          if (v_ta->size() != e_ta->size())
+            return;
+
+          for (size_t j = 0; j < v_ta->size(); j++)
+          {
+            if (same_type_tree(v_ta->at(j), e_ta->at(j)))
+              continue;
+
+            // Check shape subtyping: V_j implements E_j's shape.
+            auto v_inner = v_ta->at(j)->front();
+            auto e_inner = e_ta->at(j)->front();
+            if (v_inner != TypeName || e_inner != TypeName)
+              continue;
+            auto v_def = find_def(top, v_inner);
+            auto e_def = find_def(top, e_inner);
+            if (!v_def || !e_def)
+              continue;
+            if (v_def != ClassDef || e_def != ClassDef)
+              continue;
+            if ((e_def / Shape) != Shape)
+              continue;
+
+            // V implements shape E — find the Call and rewrite
+            // its TypeArgs.
+            auto call_node = value_info.call_node;
+            if (!call_node)
+              continue;
+
+            // The Call's FuncName contains TypeArgs to update.
+            Node funcname;
+            if (call_node == Call)
+              funcname = call_node / FuncName;
+            else
+              continue;
+
+            // Find the NameElement in FuncName that has TypeArgs
+            // containing the mismatched type.
+            for (auto& ne : *funcname)
+            {
+              if (ne != NameElement)
+                continue;
+              auto ta = ne / TypeArgs;
+              for (size_t k = 0; k < ta->size(); k++)
+              {
+                if (same_type_tree(ta->at(k), v_ta->at(j)))
+                {
+                  // Replace V with E in the Call's TypeArgs.
+                  ta->replace(ta->at(k), clone(e_ta->at(j)));
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
     // ===== Constraint decomposition =====
     //
     // Adds upper bound constraints to all type variables in a type.
@@ -2386,8 +2482,17 @@ namespace vc
                     continue;
                   auto ft = apply_subst(top, f / Type, subst);
                   if (ft && !contains_typevar(ft))
+                  {
                     constrain_type(
                       arg_it->second.type, ft, enqueue_cb);
+
+                    // Refine Call TypeArgs when the value's generic
+                    // TypeArgs differ from the field's. This handles
+                    // G[concrete_A] <: G[shape_B] by rewriting the
+                    // Call to produce G[shape_B].
+                    refine_call_typeargs(
+                      arg_it->second, ft, enqueue_cb);
+                  }
                   break;
                 }
               }
@@ -2470,6 +2575,7 @@ namespace vc
 
           bool all_angelic =
             infer_typeargs(stmt, func_def, scopes, env, top);
+          snmalloc::UNUSED(all_angelic);
 
           NodeMap<Node> subst;
           for (auto& scope : scopes)
@@ -2493,7 +2599,7 @@ namespace vc
             merge(
               (stmt / LocalId)->location(),
               ret,
-              all_angelic ? stmt : Node{});
+              stmt);
 
           for (size_t i = 0; i < params->size() && i < args->size(); i++)
           {
