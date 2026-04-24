@@ -2613,7 +2613,9 @@ namespace vc
         }
         else if (stmt == FFIStruct)
         {
-          merge((stmt / LocalId)->location(), ffi_struct_result_type());
+          merge(
+            (stmt / LocalId)->location(),
+            Type << ffi_struct_result_type());
         }
         else if (stmt == FFILoad)
         {
