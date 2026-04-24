@@ -74,6 +74,13 @@ namespace vc
       return var < entries.size() ? entries[var].upper_bounds : empty;
     }
 
+    // Get the lower bounds for a variable.
+    const std::vector<Node>& lower_bounds(TypeVarId var) const
+    {
+      static const std::vector<Node> empty;
+      return var < entries.size() ? entries[var].lower_bounds : empty;
+    }
+
     // Add an upper bound: 'a <: T.
     // Returns true if the member set was tightened or observers notified.
     bool add_upper_bound(
@@ -117,6 +124,11 @@ namespace vc
       if (var >= entries.size())
         return false;
       auto& e = entries[var];
+
+      // Deduplicate.
+      for (auto& existing : e.lower_bounds)
+        if (structural_eq(existing, type))
+          return false;
 
       e.lower_bounds.push_back(clone(type));
       return tighten(var, enqueue);

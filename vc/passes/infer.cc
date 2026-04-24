@@ -1402,113 +1402,6 @@ namespace vc
     return func_def;
   }
 
-  // ===== TypeArg inference =====
-
-  static bool infer_typeargs(
-    Node call,
-    Node func_def,
-    std::vector<ScopeInfo>& scopes,
-    TypeEnv& env,
-    Node top)
-  {
-    auto args = call / Args;
-    auto params = func_def / Params;
-
-    bool needs_inference = false;
-    for (auto& scope : scopes)
-    {
-      auto ta = scope.name_elem / TypeArgs;
-      auto tps = scope.def / TypeParams;
-      if (ta->empty() && !tps->empty())
-      {
-        needs_inference = true;
-        break;
-      }
-    }
-
-    // Also need inference when existing TypeArgs contain angelics
-    // that may have been tightened since the last run.
-    if (!needs_inference)
-    {
-      for (auto& scope : scopes)
-      {
-        auto ta = scope.name_elem / TypeArgs;
-        auto tps = scope.def / TypeParams;
-        if (tps->empty() || ta->empty())
-          continue;
-        for (auto& t : *ta)
-          if (contains_angelic(t))
-          {
-            needs_inference = true;
-            break;
-          }
-        if (needs_inference)
-          break;
-      }
-    }
-
-    if (!needs_inference)
-      return false;
-
-    NodeMap<LocalTypeInfo> constraints;
-    for (size_t i = 0; i < params->size() && i < args->size(); i++)
-    {
-      auto arg_loc = (args->at(i) / Rhs)->location();
-      auto arg_it = env.find(arg_loc);
-      if (arg_it == env.end())
-        continue;
-      extract_constraints(
-        top,
-        (params->at(i) / Type)->front(),
-        arg_it->second.type->front(),
-        constraints,
-        is_angelic(arg_it->second.type));
-    }
-
-    bool all_default = !constraints.empty();
-    for (auto& [tp, info] : constraints)
-      if (!is_angelic(info.type))
-        all_default = false;
-
-    for (auto& scope : scopes)
-    {
-      auto ta = scope.name_elem / TypeArgs;
-      auto tps = scope.def / TypeParams;
-      if (tps->empty())
-        continue;
-
-      if (!ta->empty())
-      {
-        bool needs_reinfer = false;
-        for (auto& t : *ta)
-          if (direct_typeparam(top, t) || contains_angelic(t))
-          {
-            needs_reinfer = true;
-            break;
-          }
-        if (!needs_reinfer)
-          continue;
-      }
-
-      bool all_constrained = true;
-      Node new_ta = TypeArgs;
-      for (auto& tp : *tps)
-      {
-        auto find = constraints.find(tp);
-        if (find == constraints.end())
-        {
-          all_constrained = false;
-          break;
-        }
-        new_ta << clone(find->second.type);
-      }
-      if (all_constrained)
-        snmalloc::UNUSED(replace_if_changed(scope.name_elem, ta, new_ta));
-    }
-
-    return all_default;
-  }
-
   // ===== Tuple tracking =====
 
   struct TupleTracking
@@ -1606,6 +1499,14 @@ namespace vc
     // type, a constraint variable tracks the refined type. Callers
     // tighten via add_upper_bound; forward_transfer resolves.
     std::map<std::pair<const void*, std::string>, TypeVarId> param_var;
+
+    // TypeArg constraint variables: for each Call with inferred
+    // TypeArgs, a constraint variable per TypeParam tracks the
+    // inferred type via lower and upper bounds.
+    // Lower bounds come from arg types (infer_typeargs).
+    // Upper bounds come from use sites (constrain_type decomposition).
+    // Key: (Call node ptr, TypeParam name string).
+    std::map<std::pair<const void*, std::string>, TypeVarId> typearg_var;
 
     // ===== Domain concept implementation =====
 
@@ -1849,111 +1750,18 @@ namespace vc
       return changed;
     }
 
-    // ===== Call TypeArg refinement =====
-    //
-    // When G[V] <: G[E] and V is a concrete class implementing
-    // shape E, refine the Call that produced G[V] to produce G[E].
-    // This fixes premature concretisation of generic TypeArgs.
-    void refine_call_typeargs(
-      const LocalTypeInfo& value_info,
-      const Node& expected_type,
-      const EnqueueCallback& enqueue_cb)
-    {
-      snmalloc::UNUSED(enqueue_cb);
-
-      auto& value_type = value_info.type;
-      if (!value_type || !expected_type)
-        return;
-      if (value_type == Type && expected_type == Type &&
-          !value_type->empty() && !expected_type->empty() &&
-          value_type->front() == TypeName &&
-          expected_type->front() == TypeName)
-      {
-        auto v_tn = value_type->front();
-        auto e_tn = expected_type->front();
-
-        if (v_tn->size() != e_tn->size() || v_tn->size() < 1)
-          return;
-
-        // Find mismatched TypeArgs where the value is a concrete
-        // class implementing the expected shape.
-        for (size_t i = 0; i < v_tn->size(); i++)
-        {
-          auto v_ne = v_tn->at(i);
-          auto e_ne = e_tn->at(i);
-          if (v_ne != NameElement || e_ne != NameElement)
-            return;
-          if ((v_ne / Ident)->location().view() !=
-              (e_ne / Ident)->location().view())
-            return;
-
-          auto v_ta = v_ne / TypeArgs;
-          auto e_ta = e_ne / TypeArgs;
-          if (v_ta->size() != e_ta->size())
-            return;
-
-          for (size_t j = 0; j < v_ta->size(); j++)
-          {
-            if (same_type_tree(v_ta->at(j), e_ta->at(j)))
-              continue;
-
-            // Check shape subtyping: V_j implements E_j's shape.
-            auto v_inner = v_ta->at(j)->front();
-            auto e_inner = e_ta->at(j)->front();
-            if (v_inner != TypeName || e_inner != TypeName)
-              continue;
-            auto v_def = find_def(top, v_inner);
-            auto e_def = find_def(top, e_inner);
-            if (!v_def || !e_def)
-              continue;
-            if (v_def != ClassDef || e_def != ClassDef)
-              continue;
-            if ((e_def / Shape) != Shape)
-              continue;
-
-            // V implements shape E — find the Call and rewrite
-            // its TypeArgs.
-            auto call_node = value_info.call_node;
-            if (!call_node)
-              continue;
-
-            // The Call's FuncName contains TypeArgs to update.
-            Node funcname;
-            if (call_node == Call)
-              funcname = call_node / FuncName;
-            else
-              continue;
-
-            // Find the NameElement in FuncName that has TypeArgs
-            // containing the mismatched type.
-            for (auto& ne : *funcname)
-            {
-              if (ne != NameElement)
-                continue;
-              auto ta = ne / TypeArgs;
-              for (size_t k = 0; k < ta->size(); k++)
-              {
-                if (same_type_tree(ta->at(k), v_ta->at(j)))
-                {
-                  // Replace V with E in the Call's TypeArgs.
-                  ta->replace(ta->at(k), clone(e_ta->at(j)));
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
     // ===== Constraint decomposition =====
     //
     // Adds upper bound constraints to all type variables in a type.
-    // Handles: direct TypeVarId, Union containing Angelics.
-    // No-op for concrete types without Angelics.
+    // Handles: direct TypeVarId, Union containing Angelics,
+    // and generic G[V] <: G[E] decomposition.
+    // When call_node is provided, also adds upper bounds to
+    // TypeArg constraint variables for the producing Call.
     void constrain_type(
       const Node& value_type,
       const Node& expected_type,
-      const EnqueueCallback& enqueue_cb)
+      const EnqueueCallback& enqueue_cb,
+      Node call_node = {})
     {
       if (!value_type || !expected_type)
         return;
@@ -2031,6 +1839,30 @@ namespace vc
               {
                 constrain_type(
                   v_ta->at(j), e_ta->at(j), enqueue_cb);
+
+                // Add upper bound to TypeArg constraint variable
+                // if the value was produced by a Call.
+                if (call_node && call_node == Call &&
+                    !same_type_tree(v_ta->at(j), e_ta->at(j)))
+                {
+                  // Find the typearg_var for this Call whose
+                  // lower bound matches the value TypeArg.
+                  for (auto& [key, id] : typearg_var)
+                  {
+                    if (key.first != call_node.get())
+                      continue;
+                    auto& lbs = constraints.lower_bounds(id);
+                    for (auto& lb : lbs)
+                    {
+                      if (same_type_tree(lb, v_ta->at(j)))
+                      {
+                        constraints.add_upper_bound(
+                          id, e_ta->at(j), enqueue_cb);
+                        break;
+                      }
+                    }
+                  }
+                }
               }
             }
           }
@@ -2113,6 +1945,19 @@ namespace vc
       return id;
     }
 
+    // Get or create a TypeArg constraint variable for a Call.
+    TypeVarId get_typearg_var(
+      const void* call_ptr, const std::string& tp_name)
+    {
+      auto key = std::make_pair(call_ptr, tp_name);
+      auto it = typearg_var.find(key);
+      if (it != typearg_var.end())
+        return it->second;
+      auto id = constraints.fresh(false, {});
+      typearg_var[key] = id;
+      return id;
+    }
+
     // Resolve a constraint variable to its current best type.
     // Registers the label as an observer. Returns {} if unresolved.
     Node resolve_var(TypeVarId id, size_t label_idx)
@@ -2140,6 +1985,124 @@ namespace vc
       }
 
       return {};
+    }
+
+    // Resolve a TypeArg constraint variable.
+    // Prefers upper bounds (shapes) over lower bounds (concrete).
+    // If upper bound is a shape that the lower bound implements,
+    // returns the upper bound. Otherwise returns the lower bound.
+    Node resolve_typearg_var(TypeVarId id)
+    {
+      auto& ubs = constraints.upper_bounds(id);
+      auto& lbs = constraints.lower_bounds(id);
+
+      // If we have an upper bound, check if it's a shape.
+      // Shapes take priority — they're the expected type at
+      // the use site.
+      for (auto& ub : ubs)
+      {
+        if (ub != Type || ub->empty())
+          continue;
+        auto inner = ub->front();
+        if (inner != TypeName)
+          continue;
+        auto def = find_def(top, inner);
+        if (def && def == ClassDef && (def / Shape) == Shape)
+          return clone(ub);
+      }
+
+      // No shape upper bound — use upper bound if available.
+      if (!ubs.empty())
+        return clone(ubs.back());
+
+      // Fall back to lower bound (from args).
+      if (!lbs.empty())
+        return clone(lbs.back());
+
+      return {};
+    }
+
+    // Infer TypeArgs for a Call. Adds lower bounds to TypeArg
+    // constraint variables. Returns a map of TypeParam → inferred
+    // type for building the substitution. Does NOT write to AST.
+    NodeMap<Node> infer_typeargs(
+      Node call,
+      Node func_def,
+      std::vector<ScopeInfo>& scopes,
+      const TypeEnv& env,
+      const EnqueueCallback& enqueue_cb,
+      size_t label_idx)
+    {
+      auto args = call / Args;
+      auto params = func_def / Params;
+
+      // Check: any scope with TypeParams needing inference?
+      bool has_typeparams = false;
+      for (auto& scope : scopes)
+      {
+        auto tps = scope.def / TypeParams;
+        if (!tps->empty())
+        {
+          has_typeparams = true;
+          break;
+        }
+      }
+      if (!has_typeparams)
+        return {};
+
+      // Extract constraints: TypeParam → arg type.
+      NodeMap<LocalTypeInfo> arg_constraints;
+      for (size_t i = 0; i < params->size() && i < args->size(); i++)
+      {
+        auto arg_loc = (args->at(i) / Rhs)->location();
+        auto arg_it = env.find(arg_loc);
+        if (arg_it == env.end())
+          continue;
+        extract_constraints(
+          top,
+          (params->at(i) / Type)->front(),
+          arg_it->second.type->front(),
+          arg_constraints,
+          is_angelic(arg_it->second.type));
+      }
+
+      // Build result map and add lower bounds to cvars.
+      // Only create cvars for scopes that need inference
+      // (empty TypeArgs). Scopes with explicit TypeArgs are
+      // used as-is.
+      NodeMap<Node> result;
+      for (auto& scope : scopes)
+      {
+        auto tps = scope.def / TypeParams;
+        if (tps->empty())
+          continue;
+        auto ta = scope.name_elem / TypeArgs;
+        if (!ta->empty())
+          continue; // Explicit TypeArgs — don't override.
+        for (auto& tp : *tps)
+        {
+          auto find = arg_constraints.find(tp);
+          if (find == arg_constraints.end())
+            continue;
+
+          auto tp_name = std::string(
+            (tp / Ident)->location().view());
+          auto id = get_typearg_var(call.get(), tp_name);
+
+          // Add lower bound from arg type.
+          constraints.add_lower_bound(
+            id, find->second.type, enqueue_cb);
+          constraints.add_observer(id, label_idx);
+
+          // Resolve current best type for substitution.
+          auto resolved = resolve_typearg_var(id);
+          if (resolved)
+            result[tp] = resolved;
+          else
+            result[tp] = clone(find->second.type);
+        }
+      }
+      return result;
     }
 
     // Read the callee's inferred return type from its constraint variable.
@@ -2417,12 +2380,8 @@ namespace vc
               if (val_it2 != env.end() && !is_any_type(inner))
               {
                 constrain_type(
-                  val_it2->second.type, inner, enqueue_cb);
-
-                // Refine Call TypeArgs when stored value's generic
-                // TypeArgs differ from the ref's inner type.
-                refine_call_typeargs(
-                  val_it2->second, inner, enqueue_cb);
+                  val_it2->second.type, inner, enqueue_cb,
+                  val_it2->second.call_node);
               }
 
               auto rtt = ref_to_tuple.find(ref_loc);
@@ -2607,14 +2566,8 @@ namespace vc
                   if (ft && !contains_typevar(ft))
                   {
                     constrain_type(
-                      arg_it->second.type, ft, enqueue_cb);
-
-                    // Refine Call TypeArgs when the value's generic
-                    // TypeArgs differ from the field's. This handles
-                    // G[concrete_A] <: G[shape_B] by rewriting the
-                    // Call to produce G[shape_B].
-                    refine_call_typeargs(
-                      arg_it->second, ft, enqueue_cb);
+                      arg_it->second.type, ft, enqueue_cb,
+                      arg_it->second.call_node);
                   }
 
                   // Refine field type from NewArg value when
@@ -2711,27 +2664,38 @@ namespace vc
           auto args = stmt / Args;
           auto params = func_def / Params;
 
-          bool all_angelic =
-            infer_typeargs(stmt, func_def, scopes, env, top);
-          snmalloc::UNUSED(all_angelic);
+          // Infer TypeArgs via constraint variables.
+          auto inferred = infer_typeargs(
+            stmt, func_def, scopes, env,
+            enqueue_cb, label_idx);
 
+          // Build subst from inferred types, falling back to
+          // ident-pass TypeArgs for non-inferred scopes.
           NodeMap<Node> subst;
           for (auto& scope : scopes)
           {
-            auto ta = scope.name_elem / TypeArgs;
             auto tps = scope.def / TypeParams;
-            if (!ta->empty() && ta->size() == tps->size())
-              for (size_t i = 0; i < tps->size(); i++)
+            if (tps->empty())
+              continue;
+            auto ta = scope.name_elem / TypeArgs;
+            for (size_t i = 0; i < tps->size(); i++)
+            {
+              auto it = inferred.find(tps->at(i));
+              if (it != inferred.end())
+                subst[tps->at(i)] = it->second;
+              else if (!ta->empty() && i < ta->size())
                 subst[tps->at(i)] = ta->at(i);
+            }
           }
 
           auto ret = apply_subst(top, func_def / Type, subst);
           // If declared return type is TypeVar, try inferred return.
           if (ret && ret->front() == TypeVar)
           {
-            auto inferred = infer_callee_return(func_def, label_idx);
-            if (inferred)
-              ret = inferred;
+            auto inferred_ret =
+              infer_callee_return(func_def, label_idx);
+            if (inferred_ret)
+              ret = inferred_ret;
           }
           if (ret)
             merge(
@@ -2750,9 +2714,8 @@ namespace vc
               {
                 push_shape_to_lambda(pt, arg_it->second.type);
                 constrain_type(
-                  arg_it->second.type, pt, enqueue_cb);
-                refine_call_typeargs(
-                  arg_it->second, pt, enqueue_cb);
+                  arg_it->second.type, pt, enqueue_cb,
+                  arg_it->second.call_node);
               }
             }
           }
@@ -3294,7 +3257,8 @@ namespace vc
           if (!contains_typevar(func_ret) && !is_angelic(func_ret))
           {
             constrain_type(
-              ret_it->second.type, func_ret, enqueue_cb);
+              ret_it->second.type, func_ret, enqueue_cb,
+              ret_it->second.call_node);
           }
 
           // Tighten the function's return constraint variable
@@ -3703,6 +3667,81 @@ namespace vc
           }
 
           ++it;
+        }
+      }
+
+      // ---- 2b. Write inferred TypeArgs to Call AST nodes ----
+      for (size_t i = 0; i < n; i++)
+      {
+        auto body = cfg.labels[i].label / Body;
+        for (auto& stmt : *body)
+        {
+          if (stmt != Call)
+            continue;
+
+          // Check if this Call has any typearg_var entries.
+          bool has_vars = false;
+          for (auto& [key, id] : typearg_var)
+          {
+            if (key.first == stmt.get())
+            {
+              has_vars = true;
+              break;
+            }
+          }
+          if (!has_vars)
+            continue;
+
+          std::vector<ScopeInfo> scopes;
+          auto func_def = navigate_call(stmt, top, scopes);
+          if (!func_def)
+            continue;
+
+          for (auto& scope : scopes)
+          {
+            auto ta = scope.name_elem / TypeArgs;
+            auto tps = scope.def / TypeParams;
+            if (tps->empty())
+              continue;
+
+            bool all_resolved = true;
+            Node new_ta = TypeArgs;
+            for (auto& tp : *tps)
+            {
+              auto tp_name = std::string(
+                (tp / Ident)->location().view());
+              auto key =
+                std::make_pair(stmt.get(), tp_name);
+              auto tv_it = typearg_var.find(key);
+              if (tv_it == typearg_var.end())
+              {
+                // No constraint variable — keep existing TypeArg.
+                if (!ta->empty() &&
+                    (&tp - &tps->front()) < (ptrdiff_t)ta->size())
+                {
+                  size_t idx = &tp - &tps->front();
+                  new_ta << clone(ta->at(idx));
+                }
+                else
+                {
+                  all_resolved = false;
+                  break;
+                }
+                continue;
+              }
+
+              auto resolved = resolve_typearg_var(tv_it->second);
+              if (resolved)
+                new_ta << clone(resolved);
+              else
+              {
+                all_resolved = false;
+                break;
+              }
+            }
+            if (all_resolved)
+              replace_if_changed(scope.name_elem, ta, new_ta);
+          }
         }
       }
 
