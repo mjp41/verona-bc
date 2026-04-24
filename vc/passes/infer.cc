@@ -1576,11 +1576,10 @@ namespace vc
     // return labels tighten it.
     std::map<const void*, TypeVarId> func_return_var;
 
-    // Field type overrides: refined field types computed during
-    // solve, without mutating the AST. Keyed by (ClassDef*, field_name).
-    // FieldRef consults this before reading the AST FieldDef.
-    // Finalize writes these back to the AST.
-    std::map<std::pair<const void*, std::string>, Node> field_type_overrides;
+    // Field type constraint variables: for each lambda FieldDef with
+    // TypeVar type, a constraint variable tracks the refined type.
+    // FieldRef reads from this; finalize writes to the AST.
+    std::map<std::pair<const void*, std::string>, TypeVarId> field_var;
 
     // ===== Domain concept implementation =====
 
@@ -2045,6 +2044,19 @@ namespace vc
       return id;
     }
 
+    // Get or create a constraint variable for a lambda field.
+    TypeVarId get_field_var(
+      const void* class_ptr, const std::string& field_name)
+    {
+      auto key = std::make_pair(class_ptr, field_name);
+      auto it = field_var.find(key);
+      if (it != field_var.end())
+        return it->second;
+      auto id = constraints.fresh(false, {});
+      field_var[key] = id;
+      return id;
+    }
+
     // Read the callee's inferred return type from its constraint variable.
     // Register the caller as an observer. Returns {} if no info yet.
     Node infer_callee_return(
@@ -2262,15 +2274,31 @@ namespace vc
                     continue;
                   if ((f / Ident)->location().view() != fname)
                     continue;
-                  // Check field_type_overrides first, then AST.
-                  auto override_key = std::make_pair(
+                  // Check field constraint variable first, then AST.
+                  auto fv_key = std::make_pair(
                     class_def.get(), std::string(fname));
-                  auto override_it =
-                    field_type_overrides.find(override_key);
+                  auto fv_it = field_var.find(fv_key);
                   Node ft;
-                  if (override_it != field_type_overrides.end())
-                    ft = clone(override_it->second);
-                  else
+                  if (fv_it != field_var.end())
+                  {
+                    auto& ms = constraints.member_set(fv_it->second);
+                    if (ms.size() == 1)
+                      ft = primitive_type(ms[0]);
+                    else
+                    {
+                      // Check upper bounds for non-primitive types.
+                      auto& ubs = constraints.upper_bounds(fv_it->second);
+                      if (ubs.size() >= 1)
+                      {
+                        // Use the last upper bound (most refined).
+                        ft = clone(ubs.back());
+                      }
+                    }
+                    // Register current label as observer so we
+                    // re-process when the field type refines.
+                    constraints.add_observer(fv_it->second, label_idx);
+                  }
+                  if (!ft)
                     ft = apply_subst(top, f / Type, subst);
                   if (ft)
                     merge(dst_loc, ref_type(ft));
@@ -2505,31 +2533,15 @@ namespace vc
 
                   // Refine field type from NewArg value when
                   // the field has TypeVar or angelic types.
-                  // Store in side table, not AST.
+                  // Add upper bound to field constraint variable.
                   if (ft &&
                       (contains_typevar(ft) || contains_angelic(ft)) &&
                       !contains_typevar(arg_it->second.type))
                   {
-                    auto key = std::make_pair(
+                    auto fv_id = get_field_var(
                       class_def.get(), std::string(fname));
-                    auto prev = field_type_overrides.find(key);
-                    auto& arg_type = arg_it->second.type;
-                    if (prev == field_type_overrides.end() ||
-                        !same_type_tree(prev->second, arg_type))
-                    {
-                      field_type_overrides[key] = clone(arg_type);
-
-                      // Re-enqueue lambda functions so they see
-                      // the refined field type on next processing.
-                      for (auto& child : *(class_def / ClassBody))
-                      {
-                        if (child != Function)
-                          continue;
-                        auto fit = ai_->func_entry().find(child);
-                        if (fit != ai_->func_entry().end())
-                          ai_->enqueue(fit->second);
-                      }
-                    }
+                    constraints.add_upper_bound(
+                      fv_id, arg_it->second.type, enqueue_cb);
                   }
                   break;
                 }
@@ -3648,6 +3660,39 @@ namespace vc
           {
             if (child != FieldDef || (child / Type)->front() != TypeVar)
               continue;
+            auto fname_view =
+              (child / Ident)->location().view();
+
+            // Check field constraint variable first.
+            auto fv_key = std::make_pair(
+              parent_cls.get(), std::string(fname_view));
+            auto fv_it = field_var.find(fv_key);
+            if (fv_it != field_var.end())
+            {
+              auto& ms = constraints.member_set(fv_it->second);
+              if (ms.size() == 1)
+              {
+                child->replace(
+                  child / Type, primitive_type(ms[0]));
+                continue;
+              }
+              auto& ubs = constraints.upper_bounds(fv_it->second);
+              if (!ubs.empty())
+              {
+                // Use the most refined non-angelic non-TypeVar bound.
+                for (auto rit = ubs.rbegin(); rit != ubs.rend(); ++rit)
+                {
+                  if (!contains_typevar(*rit) && !contains_angelic(*rit))
+                  {
+                    child->replace(child / Type, clone(*rit));
+                    break;
+                  }
+                }
+                continue;
+              }
+            }
+
+            // Fallback: check fwd_exit.
             auto fname = (child / Ident)->location();
             for (size_t i = range.first; i < range.second; i++)
             {
