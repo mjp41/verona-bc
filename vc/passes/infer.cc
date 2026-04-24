@@ -3219,22 +3219,6 @@ namespace vc
           tighten_func_return(func, ret_it->second.type, enqueue_cb);
         }
       }
-      else if (term == Raise)
-      {
-        // Raise constrains the raised value from the enclosing
-        // function's return type, same as Return.
-        auto raise_loc = (term / LocalId)->location();
-        auto raise_it = env.find(raise_loc);
-        if (raise_it != env.end())
-        {
-          auto func_ret = func / Type;
-          if (!contains_typevar(func_ret) && !is_angelic(func_ret))
-          {
-            constrain_type(
-              raise_it->second.type, func_ret, enqueue_cb);
-          }
-        }
-      }
     }
 
     // ===== split_cond (typetest narrowing) =====
