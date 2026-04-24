@@ -2274,6 +2274,31 @@ namespace vc
                   auto ft = apply_subst(top, f / Type, subst);
                   if (ft)
                     merge(dst_loc, ref_type(ft));
+
+                  // Refine lambda FieldDef from env: when the env
+                  // already has a refined type for the FieldRef dst,
+                  // update the FieldDef. This propagates captured
+                  // variable types from the enclosing scope.
+                  auto class_ident = class_def / Ident;
+                  bool lambda_field =
+                    class_ident->location().view().rfind("lambda$", 0) == 0;
+                  if (lambda_field)
+                  {
+                    auto dst_it = env.find(dst_loc);
+                    if (dst_it != env.end())
+                    {
+                      auto field_inner =
+                        extract_ref_inner(dst_it->second.type);
+                      if (field_inner &&
+                          !contains_typevar(field_inner) &&
+                          (contains_typevar(f / Type) ||
+                           contains_angelic(f / Type)))
+                      {
+                        if (!contains_angelic(field_inner))
+                          f->replace(f / Type, clone(field_inner));
+                      }
+                    }
+                  }
                   break;
                 }
               }
@@ -2449,10 +2474,19 @@ namespace vc
         }
         else if (stmt == TypeAssertion)
         {
-          // TypeAssertion is a hard constraint — overwrite directly,
-          // not via join. This is idempotent and bounded.
           auto loc = (stmt / LocalId)->location();
-          env[loc] = {clone(stmt / Type), {}};
+          auto ta_type = stmt / Type;
+          if (contains_typevar(ta_type))
+          {
+            // TypeVar assertions are initial seeds — use merge
+            // so they don't overwrite refined types.
+            merge(loc, clone(ta_type));
+          }
+          else
+          {
+            // Concrete assertions are hard constraints.
+            env[loc] = {clone(ta_type), {}};
+          }
         }
         else if (stmt->in({New, Stack}))
         {
