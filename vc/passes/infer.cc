@@ -1460,7 +1460,7 @@ namespace vc
       {
         bool needs_reinfer = false;
         for (auto& t : *ta)
-          if (direct_typeparam(top, t))
+          if (direct_typeparam(top, t) || contains_angelic(t))
           {
             needs_reinfer = true;
             break;
@@ -2170,11 +2170,18 @@ namespace vc
 
       // Resolve param constraint variables: if a param's angelic has
       // been tightened, replace it in the env with the resolved type.
+      // Only resolve param_var angelics — literal angelics must stay
+      // as angelics for constrain_type tracking.
       for (auto& [loc, info] : env)
       {
         auto var_id = get_angelic_var_id(info.type);
         if (!var_id.has_value())
           continue;
+        // Only resolve if this is a param_var constraint variable.
+        if (var_id.value() >= constraints.size())
+          continue;
+        if (constraints.entries[var_id.value()].concrete)
+          continue; // Concrete = literal, not param.
         auto resolved = resolve_var(var_id.value(), label_idx);
         if (resolved && resolved->front() != TypeVar)
           info.type = resolved;
