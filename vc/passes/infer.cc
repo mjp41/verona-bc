@@ -1426,6 +1426,27 @@ namespace vc
       }
     }
 
+    // Also need inference when existing TypeArgs contain angelics
+    // that may have been tightened since the last run.
+    if (!needs_inference)
+    {
+      for (auto& scope : scopes)
+      {
+        auto ta = scope.name_elem / TypeArgs;
+        auto tps = scope.def / TypeParams;
+        if (tps->empty() || ta->empty())
+          continue;
+        for (auto& t : *ta)
+          if (contains_angelic(t))
+          {
+            needs_inference = true;
+            break;
+          }
+        if (needs_inference)
+          break;
+      }
+    }
+
     if (!needs_inference)
       return false;
 
