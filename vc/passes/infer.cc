@@ -2289,31 +2289,6 @@ namespace vc
                     ft = apply_subst(top, f / Type, subst);
                   if (ft)
                     merge(dst_loc, ref_type(ft));
-
-                  // Backward refinement: store refined field type
-                  // in side table (not AST) for lambda fields.
-                  auto class_ident = class_def / Ident;
-                  bool lambda_field =
-                    class_ident->location().view().rfind("lambda$", 0) == 0;
-                  if (lambda_field)
-                  {
-                    auto dst_it = env.find(dst_loc);
-                    if (dst_it != env.end())
-                    {
-                      auto field_inner =
-                        extract_ref_inner(dst_it->second.type);
-                      if (field_inner &&
-                          !contains_typevar(field_inner) &&
-                          !contains_angelic(field_inner) &&
-                          (override_it == field_type_overrides.end() ||
-                           contains_typevar(override_it->second) ||
-                           contains_angelic(override_it->second)))
-                      {
-                        field_type_overrides[override_key] =
-                          clone(field_inner);
-                      }
-                    }
-                  }
                   break;
                 }
               }
