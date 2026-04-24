@@ -1581,6 +1581,11 @@ namespace vc
     // FieldRef reads from this; finalize writes to the AST.
     std::map<std::pair<const void*, std::string>, TypeVarId> field_var;
 
+    // Parameter type constraint variables: for each param with TypeVar
+    // type, a constraint variable tracks the refined type. Callers
+    // tighten via add_upper_bound; forward_transfer resolves.
+    std::map<std::pair<const void*, std::string>, TypeVarId> param_var;
+
     // ===== Domain concept implementation =====
 
     Env empty_env() const { return {}; }
@@ -1644,6 +1649,19 @@ namespace vc
     {
       if (!ai_)
         return false;
+
+      // Use constraint variable if this param has one.
+      auto pv_key = std::make_pair(
+        func_def.get(), std::string(param_loc.view()));
+      auto pv_it = param_var.find(pv_key);
+      if (pv_it != param_var.end())
+      {
+        auto enqueue_cb = [&](size_t lbl) { ai_->enqueue(lbl); };
+        return constraints.add_upper_bound(
+          pv_it->second, type, enqueue_cb);
+      }
+
+      // Fallback for non-TypeVar params (shouldn't normally happen).
       auto entry_it = ai_->func_entry().find(func_def);
       if (entry_it == ai_->func_entry().end())
         return false;
@@ -1679,7 +1697,6 @@ namespace vc
           continue;
 
         Node resolved;
-        bool allow_default = false;
         if (parent_cls)
         {
           auto pname = (param / Ident)->location().view();
@@ -1691,8 +1708,6 @@ namespace vc
               continue;
             if (!contains_typevar(child / Type))
               resolved = child / Type;
-            else if (is_lambda_function(func_def))
-              allow_default = true;
             break;
           }
         }
@@ -1705,10 +1720,17 @@ namespace vc
             arg_it == caller_env.end() ||
             contains_typevar(arg_it->second.type))
             continue;
-          if (
-            contains_angelic(arg_it->second.type) && !allow_default)
-            continue;
-          resolved = arg_it->second.type;
+
+          // If arg contains angelics mixed with concrete types,
+          // extract only the concrete part as the upper bound.
+          // Pure angelics are passed through for constraint tracking.
+          if (contains_angelic(arg_it->second.type))
+          {
+            auto concrete = extract_concrete_part(arg_it->second.type);
+            resolved = concrete ? concrete : arg_it->second.type;
+          }
+          else
+            resolved = arg_it->second.type;
         }
 
         push_param_type(
@@ -2057,25 +2079,33 @@ namespace vc
       return id;
     }
 
-    // Read the callee's inferred return type from its constraint variable.
-    // Register the caller as an observer. Returns {} if no info yet.
-    Node infer_callee_return(
-      Node callee_func,
-      size_t caller_label)
+    // Get or create a constraint variable for a function parameter.
+    TypeVarId get_param_var(
+      const void* func_ptr, const std::string& param_name)
     {
-      auto id = get_func_return_var(callee_func);
-      constraints.add_observer(id, caller_label);
+      auto key = std::make_pair(func_ptr, param_name);
+      auto it = param_var.find(key);
+      if (it != param_var.end())
+        return it->second;
+      auto id = constraints.fresh(false, {});
+      param_var[key] = id;
+      return id;
+    }
+
+    // Resolve a constraint variable to its current best type.
+    // Registers the label as an observer. Returns {} if unresolved.
+    Node resolve_var(TypeVarId id, size_t label_idx)
+    {
+      constraints.add_observer(id, label_idx);
 
       auto& ms = constraints.member_set(id);
       if (ms.size() == 1)
         return primitive_type(ms[0]);
 
-      // If upper bounds contain angelics, return them directly.
       auto& ubs = constraints.upper_bounds(id);
       if (ubs.size() == 1)
         return clone(ubs[0]);
 
-      // Multiple upper bounds — join them.
       if (ubs.size() > 1)
       {
         Node result = clone(ubs[0]);
@@ -2089,6 +2119,16 @@ namespace vc
       }
 
       return {};
+    }
+
+    // Read the callee's inferred return type from its constraint variable.
+    // Register the caller as an observer. Returns {} if no info yet.
+    Node infer_callee_return(
+      Node callee_func,
+      size_t caller_label)
+    {
+      auto id = get_func_return_var(callee_func);
+      return resolve_var(id, caller_label);
     }
 
     // Called from return labels: tighten the function's return
@@ -2127,6 +2167,18 @@ namespace vc
 
       // Enqueue callback for constraint resolution notifications.
       auto enqueue_cb = [&](size_t lbl) { ai.enqueue(lbl); };
+
+      // Resolve param constraint variables: if a param's angelic has
+      // been tightened, replace it in the env with the resolved type.
+      for (auto& [loc, info] : env)
+      {
+        auto var_id = get_angelic_var_id(info.type);
+        if (!var_id.has_value())
+          continue;
+        auto resolved = resolve_var(var_id.value(), label_idx);
+        if (resolved && resolved->front() != TypeVar)
+          info.type = resolved;
+      }
 
       auto merge = [&](const Location& loc, const Node& type,
                        Node call_node = {}) -> bool {
@@ -3181,7 +3233,9 @@ namespace vc
                       if (arg_it == env.end())
                         continue;
                       auto ci = extract_cown_inner(arg_it->second.type);
-                      if (!ci || contains_typevar(ci) || is_any_type(ci))
+                      if (
+                        !ci || contains_typevar(ci) ||
+                        contains_angelic(ci) || is_any_type(ci))
                         continue;
                       push_param_type(
                         apply_func,
@@ -3295,7 +3349,24 @@ namespace vc
         for (auto& pd : *(func / Params))
         {
           auto type = pd / Type;
-          param_env[(pd / Ident)->location()] = {clone(type), {}};
+          auto param_name = std::string(
+            (pd / Ident)->location().view());
+
+          if (type->front() == TypeVar)
+          {
+            // Create a constraint variable for this TypeVar param.
+            auto id = get_param_var(func.get(), param_name);
+            // Push angelic referencing the constraint variable.
+            param_env[(pd / Ident)->location()] = {
+              make_angelic_var(id, false, {}), {}};
+            // Register entry label as observer so re-processing
+            // happens when the param type is refined.
+            constraints.add_observer(id, entry_idx);
+          }
+          else
+          {
+            param_env[(pd / Ident)->location()] = {clone(type), {}};
+          }
         }
         if (!param_env.empty())
           ai.push_fwd(entry_idx, param_env);
@@ -3313,9 +3384,7 @@ namespace vc
       ai_ = nullptr;
 
       auto& cfg = ctx.cfg;
-      auto& fwd = ctx.fwd;
       auto& fwd_exit = ctx.fwd_exit;
-      auto& func_entry = ctx.func_entry;
       auto& func_returns = ctx.func_returns;
 
       size_t n = cfg.size();
@@ -3620,13 +3689,19 @@ namespace vc
           if (type->front() != TypeVar)
             continue;
           auto ident = pd / Ident;
+          auto param_name = std::string(ident->location().view());
           bool found = false;
-          for (size_t i = range.first; i < range.second && !found; i++)
+
+          // Check param constraint variable first.
+          auto pv_key = std::make_pair(func.get(), param_name);
+          auto pv_it = param_var.find(pv_key);
+          if (pv_it != param_var.end())
           {
-            auto it = fwd_exit[i].find(ident->location());
-            if (it != fwd_exit[i].end() && it->second.type->front() != TypeVar)
+            auto& ms = constraints.member_set(pv_it->second);
+            if (ms.size() == 1)
             {
-              pd->replace(type, clone(it->second.type));
+              auto resolved = primitive_type(ms[0]);
+              pd->replace(type, clone(resolved));
               if (parent_cls)
               {
                 for (auto& child : *(parent_cls / ClassBody))
@@ -3634,41 +3709,123 @@ namespace vc
                   if (child != FieldDef)
                     continue;
                   if (
-                    (child / Ident)->location().view() !=
-                    ident->location().view())
+                    (child / Ident)->location().view() != param_name)
                     continue;
                   if (contains_typevar(child / Type))
-                    child->replace(child / Type, clone(it->second.type));
+                    child->replace(child / Type, clone(resolved));
                   break;
                 }
               }
               found = true;
             }
-          }
-          if (!found)
-          {
-            auto entry_it = func_entry.find(func);
-            if (entry_it != func_entry.end())
+            else
             {
-              auto it = fwd[entry_it->second].find(ident->location());
-              if (
-                it != fwd[entry_it->second].end() &&
-                it->second.type->front() != TypeVar)
+              auto& ubs = constraints.upper_bounds(pv_it->second);
+              if (!ubs.empty())
               {
-                pd->replace(type, clone(it->second.type));
-                if (parent_cls)
+                // Try concrete non-angelic bounds first.
+                for (auto rit = ubs.rbegin(); rit != ubs.rend(); ++rit)
                 {
-                  for (auto& child : *(parent_cls / ClassBody))
+                  if (!contains_typevar(*rit) && !contains_angelic(*rit))
                   {
-                    if (child != FieldDef)
-                      continue;
-                    if (
-                      (child / Ident)->location().view() !=
-                      ident->location().view())
-                      continue;
-                    if (contains_typevar(child / Type))
-                      child->replace(child / Type, clone(it->second.type));
+                    pd->replace(type, clone(*rit));
+                    if (parent_cls)
+                    {
+                      for (auto& child : *(parent_cls / ClassBody))
+                      {
+                        if (child != FieldDef)
+                          continue;
+                        if (
+                          (child / Ident)->location().view() !=
+                          param_name)
+                          continue;
+                        if (contains_typevar(child / Type))
+                          child->replace(child / Type, clone(*rit));
+                        break;
+                      }
+                    }
+                    found = true;
                     break;
+                  }
+                }
+                // If only angelic bounds, resolve through their
+                // constraint variable IDs.
+                if (!found)
+                {
+                  for (auto rit = ubs.rbegin();
+                       rit != ubs.rend();
+                       ++rit)
+                  {
+                    auto aid = get_angelic_var_id(*rit);
+                    if (aid.has_value())
+                    {
+                      auto& ams =
+                        constraints.member_set(aid.value());
+                      if (ams.size() == 1)
+                      {
+                        auto resolved = primitive_type(ams[0]);
+                        pd->replace(type, clone(resolved));
+                        if (parent_cls)
+                        {
+                          for (auto& child :
+                               *(parent_cls / ClassBody))
+                          {
+                            if (child != FieldDef)
+                              continue;
+                            if (
+                              (child / Ident)->location().view() !=
+                              param_name)
+                              continue;
+                            if (contains_typevar(child / Type))
+                              child->replace(
+                                child / Type, clone(resolved));
+                            break;
+                          }
+                        }
+                        found = true;
+                        break;
+                      }
+                      // Unconstrained concrete angelic: use default.
+                      if (ams.size() > 1 &&
+                          constraints.entries[aid.value()].concrete)
+                      {
+                        // Default: first member in intset=u64,
+                        // floatset=f64.
+                        auto& e = constraints.entries[aid.value()];
+                        Token def_tok = ams[0]; // Fallback.
+                        bool has_u64 = false, has_f64 = false;
+                        for (auto& m : ams)
+                        {
+                          if (m == U64) has_u64 = true;
+                          if (m == F64) has_f64 = true;
+                        }
+                        if (has_u64) def_tok = U64;
+                        else if (has_f64) def_tok = F64;
+                        snmalloc::UNUSED(e);
+
+                        auto resolved = primitive_type(def_tok);
+                        pd->replace(type, clone(resolved));
+                        if (parent_cls)
+                        {
+                          for (auto& child :
+                               *(parent_cls / ClassBody))
+                          {
+                            if (child != FieldDef)
+                              continue;
+                            if (
+                              (child / Ident)->location().view() !=
+                              param_name)
+                              continue;
+                            if (contains_typevar(child / Type))
+                              child->replace(
+                                child / Type, clone(resolved));
+                            break;
+                          }
+                        }
+                        found = true;
+                        break;
+                      }
+                    }
                   }
                 }
               }

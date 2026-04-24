@@ -91,6 +91,9 @@ namespace vc
         if (structural_eq(existing, type))
         { is_new = false; break; }
 
+      if (!is_new)
+        return false;
+
       e.upper_bounds.push_back(clone(type));
       bool tightened = tighten(var, enqueue);
 
@@ -316,10 +319,6 @@ namespace vc
     bool is_concrete,
     const std::vector<Token>& member_set)
   {
-    Node bound = Isect;
-    if (is_concrete)
-      bound << Concrete;
-
     // Add member set indicator.
     // Check for full IntSet/FloatSet.
     static const std::vector<Token> int_members = {
@@ -362,13 +361,40 @@ namespace vc
         }
       }
 
-    if (is_full_intset)
-      bound << IntSet;
+    // Build the bound node. For non-concrete with no member set,
+    // use an empty AngelicSubtype (unconstrained variable).
+    Node bound;
+    if (is_concrete && (is_full_intset || is_full_floatset))
+    {
+      bound = Isect;
+      bound << Concrete;
+      if (is_full_intset)
+        bound << IntSet;
+      else
+        bound << FloatSet;
+    }
+    else if (is_concrete)
+    {
+      bound = Isect;
+      bound << Concrete;
+    }
+    else if (is_full_intset)
+    {
+      bound = IntSet;
+    }
     else if (is_full_floatset)
-      bound << FloatSet;
+    {
+      bound = FloatSet;
+    }
+    else
+    {
+      // Unconstrained variable — use TypeVar as sentinel bound.
+      bound = TypeVar;
+    }
 
-    return Type
-      << ((AngelicSubtype ^ std::to_string(id)) << bound);
+    auto angelic = AngelicSubtype ^ std::to_string(id);
+    angelic << bound;
+    return Type << angelic;
   }
 
   // Extract the TypeVarId from an AngelicSubtype node.
