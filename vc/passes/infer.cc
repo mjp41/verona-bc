@@ -3219,6 +3219,20 @@ namespace vc
           tighten_func_return(func, ret_it->second.type, enqueue_cb);
         }
       }
+      else if (term == Raise)
+      {
+        // Raise carries the enclosing function's return type
+        // (from lambda lifting). Constrain the raised value.
+        auto raise_loc = (term / LocalId)->location();
+        auto raise_it = env.find(raise_loc);
+        if (raise_it != env.end())
+        {
+          auto raise_ret = term / Type;
+          if (!contains_typevar(raise_ret))
+            constrain_type(
+              raise_it->second.type, raise_ret, enqueue_cb);
+        }
+      }
     }
 
     // ===== split_cond (typetest narrowing) =====
