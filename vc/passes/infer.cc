@@ -1576,6 +1576,12 @@ namespace vc
     // return labels tighten it.
     std::map<const void*, TypeVarId> func_return_var;
 
+    // Field type overrides: refined field types computed during
+    // solve, without mutating the AST. Keyed by (ClassDef*, field_name).
+    // FieldRef consults this before reading the AST FieldDef.
+    // Finalize writes these back to the AST.
+    std::map<std::pair<const void*, std::string>, Node> field_type_overrides;
+
     // ===== Domain concept implementation =====
 
     Env empty_env() const { return {}; }
@@ -2271,14 +2277,21 @@ namespace vc
                     continue;
                   if ((f / Ident)->location().view() != fname)
                     continue;
-                  auto ft = apply_subst(top, f / Type, subst);
+                  // Check field_type_overrides first, then AST.
+                  auto override_key = std::make_pair(
+                    class_def.get(), std::string(fname));
+                  auto override_it =
+                    field_type_overrides.find(override_key);
+                  Node ft;
+                  if (override_it != field_type_overrides.end())
+                    ft = clone(override_it->second);
+                  else
+                    ft = apply_subst(top, f / Type, subst);
                   if (ft)
                     merge(dst_loc, ref_type(ft));
 
-                  // Refine lambda FieldDef from env: when the env
-                  // already has a refined type for the FieldRef dst,
-                  // update the FieldDef. This propagates captured
-                  // variable types from the enclosing scope.
+                  // Backward refinement: store refined field type
+                  // in side table (not AST) for lambda fields.
                   auto class_ident = class_def / Ident;
                   bool lambda_field =
                     class_ident->location().view().rfind("lambda$", 0) == 0;
@@ -2291,11 +2304,13 @@ namespace vc
                         extract_ref_inner(dst_it->second.type);
                       if (field_inner &&
                           !contains_typevar(field_inner) &&
-                          (contains_typevar(f / Type) ||
-                           contains_angelic(f / Type)))
+                          !contains_angelic(field_inner) &&
+                          (override_it == field_type_overrides.end() ||
+                           contains_typevar(override_it->second) ||
+                           contains_angelic(override_it->second)))
                       {
-                        if (!contains_angelic(field_inner))
-                          f->replace(f / Type, clone(field_inner));
+                        field_type_overrides[override_key] =
+                          clone(field_inner);
                       }
                     }
                   }
@@ -2528,24 +2543,24 @@ namespace vc
                       arg_it->second, ft, enqueue_cb);
                   }
 
-                  // Refine FieldDef type from the NewArg value when
-                  // the field has TypeVar or angelic types. This
-                  // propagates captured variable types into lambda
-                  // fields as they refine.
+                  // Refine field type from NewArg value when
+                  // the field has TypeVar or angelic types.
+                  // Store in side table, not AST.
                   if (ft &&
                       (contains_typevar(ft) || contains_angelic(ft)) &&
                       !contains_typevar(arg_it->second.type))
                   {
+                    auto key = std::make_pair(
+                      class_def.get(), std::string(fname));
+                    auto prev = field_type_overrides.find(key);
                     auto& arg_type = arg_it->second.type;
-                    // Update the FieldDef AST with the refined type.
-                    // This may include angelics — they'll be further
-                    // refined as constraints tighten.
-                    if (!same_type_tree(f / Type, arg_type))
+                    if (prev == field_type_overrides.end() ||
+                        !same_type_tree(prev->second, arg_type))
                     {
-                      f->replace(f / Type, clone(arg_type));
+                      field_type_overrides[key] = clone(arg_type);
 
-                      // Re-enqueue the lambda's function labels so
-                      // they re-process with the refined field type.
+                      // Re-enqueue lambda functions so they see
+                      // the refined field type on next processing.
                       for (auto& child : *(class_def / ClassBody))
                       {
                         if (child != Function)
