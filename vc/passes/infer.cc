@@ -2335,8 +2335,15 @@ namespace vc
               // Constrain Angelic stored value from field type.
               auto val_it2 = env.find(val_loc);
               if (val_it2 != env.end() && !is_any_type(inner))
+              {
                 constrain_type(
                   val_it2->second.type, inner, enqueue_cb);
+
+                // Refine Call TypeArgs when stored value's generic
+                // TypeArgs differ from the ref's inner type.
+                refine_call_typeargs(
+                  val_it2->second, inner, enqueue_cb);
+              }
 
               auto rtt = ref_to_tuple.find(ref_loc);
               if (rtt != ref_to_tuple.end())
@@ -2661,9 +2668,10 @@ namespace vc
               if (arg_it != env.end())
               {
                 push_shape_to_lambda(pt, arg_it->second.type);
-                // Constrain Angelic arg from param type.
                 constrain_type(
                   arg_it->second.type, pt, enqueue_cb);
+                refine_call_typeargs(
+                  arg_it->second, pt, enqueue_cb);
               }
             }
           }
