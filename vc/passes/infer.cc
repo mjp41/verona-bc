@@ -2488,9 +2488,8 @@ namespace vc
           auto ta_type = stmt / Type;
           if (contains_typevar(ta_type))
           {
-            // TypeVar assertions are initial seeds — use merge
-            // so they don't overwrite refined types.
-            merge(loc, clone(ta_type));
+            // TypeVar assertions carry no information — skip.
+            // The actual type will arrive from a subsequent Copy.
           }
           else
           {
