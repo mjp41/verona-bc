@@ -2493,6 +2493,35 @@ namespace vc
                     refine_call_typeargs(
                       arg_it->second, ft, enqueue_cb);
                   }
+
+                  // Refine FieldDef type from the NewArg value when
+                  // the field has TypeVar or angelic types. This
+                  // propagates captured variable types into lambda
+                  // fields as they refine.
+                  if (ft &&
+                      (contains_typevar(ft) || contains_angelic(ft)) &&
+                      !contains_typevar(arg_it->second.type))
+                  {
+                    auto& arg_type = arg_it->second.type;
+                    // Update the FieldDef AST with the refined type.
+                    // This may include angelics — they'll be further
+                    // refined as constraints tighten.
+                    if (!same_type_tree(f / Type, arg_type))
+                    {
+                      f->replace(f / Type, clone(arg_type));
+
+                      // Re-enqueue the lambda's function labels so
+                      // they re-process with the refined field type.
+                      for (auto& child : *(class_def / ClassBody))
+                      {
+                        if (child != Function)
+                          continue;
+                        auto fit = ai_->func_entry().find(child);
+                        if (fit != ai_->func_entry().end())
+                          ai_->enqueue(fit->second);
+                      }
+                    }
+                  }
                   break;
                 }
               }
