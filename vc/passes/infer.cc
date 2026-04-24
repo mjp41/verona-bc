@@ -3679,7 +3679,9 @@ namespace vc
         {
           for (auto& child : *(parent_cls / ClassBody))
           {
-            if (child != FieldDef || (child / Type)->front() != TypeVar)
+            if (child != FieldDef)
+              continue;
+            if (!contains_typevar(child / Type))
               continue;
             auto fname_view =
               (child / Ident)->location().view();
