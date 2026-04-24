@@ -168,7 +168,6 @@ namespace vc
   {
     const CFG& cfg;
     const std::vector<Env>& fwd;
-    const std::vector<Env>& fwd_exit;
     const std::map<Node, size_t>& func_entry;
     const std::map<Node, std::vector<size_t>>& func_returns;
   };
@@ -279,20 +278,8 @@ namespace vc
 
     void finalize()
     {
-      // Compute final exit environments by running the transfer
-      // function once on each label's converged fwd state.
-      size_t n = cfg_.size();
-      std::vector<Env> fwd_exit(n);
-      for (size_t i = 0; i < n; i++)
-      {
-        fwd_exit[i] = domain_.clone_env(fwd_[i]);
-        auto body = cfg_.labels[i].label / Body;
-        auto func = cfg_.labels[i].function;
-        domain_.forward_transfer(fwd_exit[i], body, func, i, *this);
-      }
-
       FinalizeContext<Env> ctx{
-        cfg_, fwd_, fwd_exit, func_entry_, func_returns_};
+        cfg_, fwd_, func_entry_, func_returns_};
       domain_.finalize(ctx);
     }
 

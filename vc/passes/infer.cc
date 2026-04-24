@@ -1582,6 +1582,12 @@ namespace vc
     // Finalize writes these back to the AST.
     std::map<std::pair<const void*, std::string>, Node> field_type_overrides;
 
+    // Per-statement final types: for every value-producing statement,
+    // records the most refined type seen during the solve. Finalize
+    // reads from this instead of re-running the transfer function.
+    // Keyed by statement AST node pointer.
+    std::map<const void*, Node> stmt_final_types;
+
     // ===== Domain concept implementation =====
 
     Env empty_env() const { return {}; }
@@ -3177,6 +3183,18 @@ namespace vc
         {
           merge((stmt / LocalId)->location(), primitive_type(Bool));
         }
+
+        // Record the statement's output type for finalize.
+        if (!stmt->empty() && stmt->front() == LocalId)
+        {
+          auto loc = stmt->front()->location();
+          auto it = env.find(loc);
+          if (it != env.end())
+          {
+            auto key = stmt.get();
+            stmt_final_types[key] = clone(it->second.type);
+          }
+        }
       }
 
       // ---- Return terminator: constrain returned value ----
@@ -3272,6 +3290,93 @@ namespace vc
 
     // ===== Finalize =====
 
+    // Look up a statement's final type from the side tables,
+    // resolving angelics from the constraint store.
+    Node get_stmt_type(const Node& stmt) const
+    {
+      // Check stmt_final_types first.
+      auto sft = stmt_final_types.find(stmt.get());
+      if (sft != stmt_final_types.end())
+      {
+        auto& type = sft->second;
+        if (!contains_angelic(type) && !contains_typevar(type))
+          return clone(type);
+
+        // Resolve angelic components from constraint store.
+        if (is_angelic(type))
+        {
+          auto id = get_angelic_var_id(type);
+          if (id.has_value())
+          {
+            auto& ms = constraints.member_set(id.value());
+            if (ms.size() == 1)
+              return primitive_type(ms[0]);
+          }
+        }
+        else if (type->front() == Union)
+        {
+          // Resolve each component.
+          Nodes resolved;
+          bool all_ok = true;
+          for (auto& child : *(type->front()))
+          {
+            if (child == AngelicSubtype)
+            {
+              auto ct = Type << clone(child);
+              auto id = get_angelic_var_id(ct);
+              if (id.has_value())
+              {
+                auto& ms = constraints.member_set(id.value());
+                if (ms.size() == 1)
+                  resolved.push_back(primitive_type(ms[0]));
+                else
+                  all_ok = false;
+              }
+              else
+                all_ok = false;
+            }
+            else
+              resolved.push_back(Type << clone(child));
+          }
+          if (all_ok && !resolved.empty())
+          {
+            if (resolved.size() == 1)
+              return resolved[0];
+            // Deduplicate.
+            Nodes deduped;
+            for (auto& r : resolved)
+            {
+              bool covered = false;
+              for (auto& d : deduped)
+                if (same_type_tree(d, r)) { covered = true; break; }
+              if (!covered)
+                deduped.push_back(r);
+            }
+            if (deduped.size() == 1)
+              return deduped[0];
+            Node u = Union;
+            for (auto& d : deduped)
+              u << clone(d->front());
+            return Type << u;
+          }
+        }
+
+        // Return as-is if can't resolve.
+        return clone(type);
+      }
+
+      // For Consts: check constraint variable.
+      auto svit = stmt_var_ids.find(stmt.get());
+      if (svit != stmt_var_ids.end())
+      {
+        auto& ms = constraints.member_set(svit->second);
+        if (ms.size() == 1)
+          return primitive_type(ms[0]);
+      }
+
+      return {};
+    }
+
     void finalize(FinalizeContext<Env>& ctx)
     {
       // Clear AI reference.
@@ -3279,7 +3384,6 @@ namespace vc
 
       auto& cfg = ctx.cfg;
       auto& fwd = ctx.fwd;
-      auto& fwd_exit = ctx.fwd_exit;
       auto& func_entry = ctx.func_entry;
       auto& func_returns = ctx.func_returns;
 
@@ -3291,6 +3395,23 @@ namespace vc
       for (size_t i = 0; i < n; i++)
       {
         auto body = cfg.labels[i].label / Body;
+
+        // Build location → statement index for this label.
+        std::map<std::string, Node> loc_to_stmt;
+        for (auto& stmt : *body)
+        {
+          if (!stmt->empty() && stmt->front() == LocalId)
+            loc_to_stmt[std::string(
+              stmt->front()->location().view())] = stmt;
+        }
+
+        // Helper: look up a location's type via the defining stmt.
+        auto get_loc_type = [&](const Location& loc) -> Node {
+          auto it = loc_to_stmt.find(std::string(loc.view()));
+          if (it != loc_to_stmt.end())
+            return get_stmt_type(it->second);
+          return {};
+        };
 
         // Compute final tuple/array types.
         struct FinalTupleInfo
@@ -3356,22 +3477,22 @@ namespace vc
                 uniform = false;
                 break;
               }
-              auto env_it = fwd_exit[i].find(value_loc);
-              if (env_it == fwd_exit[i].end())
+              auto env_type = get_loc_type(value_loc);
+              if (!env_type)
               {
                 uniform = false;
                 break;
               }
-              auto prim = extract_primitive(env_it->second.type);
+              auto prim = extract_primitive(env_type);
               if (!prim)
               {
                 uniform = false;
                 break;
               }
               if (!common)
-                common = clone(env_it->second.type);
+                common = clone(env_type);
               else if (
-                env_it->second.type->front()->type() !=
+                env_type->front()->type() !=
                 common->front()->type())
               {
                 uniform = false;
@@ -3393,13 +3514,13 @@ namespace vc
               complete = false;
               break;
             }
-            auto env_it = fwd_exit[i].find(value_loc);
-            if (env_it == fwd_exit[i].end())
+            auto env_type = get_loc_type(value_loc);
+            if (!env_type)
             {
               complete = false;
               break;
             }
-            elems.push_back(clone(env_it->second.type));
+            elems.push_back(clone(env_type));
           }
 
           if (!complete || elems.empty())
@@ -3435,10 +3556,10 @@ namespace vc
             // Resolve the Const's type from fwd_exit, resolving any
             // angelic components from the constraint store.
             Node final_type;
-            auto env_it = fwd_exit[i].find(loc);
-            if (env_it != fwd_exit[i].end())
+            auto env_type = get_loc_type(loc);
+            if (env_type)
             {
-              auto& etype = env_it->second.type;
+              auto& etype = env_type;
               if (!contains_angelic(etype))
               {
                 // Pure concrete — use directly.
@@ -3551,21 +3672,21 @@ namespace vc
             if (final_it != final_newarray_types.end())
               (*it)->replace((*it) / Type, clone(final_it->second));
 
-            auto env_it = fwd_exit[i].find(nloc);
-            if (env_it != fwd_exit[i].end())
+            auto env_type = get_loc_type(nloc);
+            if (env_type)
             {
-              auto inner = env_it->second.type->front();
+              auto inner = env_type->front();
               if (inner == TupleType)
-                (*it)->replace((*it) / Type, clone(env_it->second.type));
+                (*it)->replace((*it) / Type, clone(env_type));
               else
               {
-                auto prim = extract_primitive(env_it->second.type);
+                auto prim = extract_primitive(env_type);
                 if (
                   prim &&
                   !Subtype.invariant(
-                    top, (*it) / Type, env_it->second.type))
+                    top, (*it) / Type, env_type))
                   (*it)->replace(
-                    (*it) / Type, clone(env_it->second.type));
+                    (*it) / Type, clone(env_type));
               }
             }
           }
@@ -3574,7 +3695,7 @@ namespace vc
         }
       }
 
-      // ---- 3. Update params and fields from fwd_exit envs ----
+      // ---- 3. Update params and fields ----
       for (auto& [func, range] : cfg.func_label_range)
       {
         auto parent_cls = func->parent(ClassDef);
@@ -3586,10 +3707,14 @@ namespace vc
             continue;
           auto ident = pd / Ident;
           bool found = false;
-          for (size_t i = range.first; i < range.second && !found; i++)
+
+          // Check fwd[entry] for pushed param types.
+          auto entry_it = func_entry.find(func);
+          if (entry_it != func_entry.end())
           {
-            auto it = fwd_exit[i].find(ident->location());
-            if (it != fwd_exit[i].end() && it->second.type->front() != TypeVar)
+            auto it = fwd[entry_it->second].find(ident->location());
+            if (it != fwd[entry_it->second].end() &&
+                it->second.type->front() != TypeVar)
             {
               pd->replace(type, clone(it->second.type));
               if (parent_cls)
@@ -3648,17 +3773,15 @@ namespace vc
           {
             if (child != FieldDef || (child / Type)->front() != TypeVar)
               continue;
-            auto fname = (child / Ident)->location();
-            for (size_t i = range.first; i < range.second; i++)
+            auto fname_view = (child / Ident)->location().view();
+            // Check field_type_overrides.
+            auto fto_key = std::make_pair(
+              parent_cls.get(), std::string(fname_view));
+            auto fto_it = field_type_overrides.find(fto_key);
+            if (fto_it != field_type_overrides.end() &&
+                !contains_typevar(fto_it->second))
             {
-              auto it = fwd_exit[i].find(fname);
-              if (
-                it != fwd_exit[i].end() &&
-                it->second.type->front() != TypeVar)
-              {
-                child->replace(child / Type, clone(it->second.type));
-                break;
-              }
+              child->replace(child / Type, clone(fto_it->second));
             }
           }
         }
@@ -3683,15 +3806,8 @@ namespace vc
               for (auto& stmt : *lbl_body)
                 if (stmt->in({CallDyn, TryCallDyn}))
                 {
-                  auto loc = (stmt / LocalId)->location();
-                  bool f = false;
-                  for (size_t j = range.first; j < range.second; j++)
-                    if (fwd_exit[j].find(loc) != fwd_exit[j].end())
-                    {
-                      f = true;
-                      break;
-                    }
-                  if (!f)
+                  auto sft = stmt_final_types.find(stmt.get());
+                  if (sft == stmt_final_types.end())
                     unresolved = true;
                 }
             }
@@ -3706,10 +3822,16 @@ namespace vc
               if (term != Return)
                 continue;
               auto ret_loc = (term / LocalId)->location();
-              auto eit = fwd_exit[idx].find(ret_loc);
-              if (
-                eit == fwd_exit[idx].end() ||
-                eit->second.type->front() == TypeVar)
+              // Find the stmt that defines ret_loc in this label.
+              Node ret_type;
+              auto ret_body = cfg.labels[idx].label / Body;
+              for (auto& stmt : *ret_body)
+              {
+                if (!stmt->empty() && stmt->front() == LocalId &&
+                    stmt->front()->location().view() == ret_loc.view())
+                  ret_type = get_stmt_type(stmt);
+              }
+              if (!ret_type || ret_type->front() == TypeVar)
               {
                 if (in_generic)
                   unresolved = true;
@@ -3717,13 +3839,13 @@ namespace vc
               }
               bool covered = false;
               for (auto& rt : ret_types)
-                if (Subtype(ctx, eit->second.type, rt))
+                if (Subtype(ctx, ret_type, rt))
                 {
                   covered = true;
                   break;
                 }
               if (!covered)
-                ret_types.push_back(clone(eit->second.type));
+                ret_types.push_back(clone(ret_type));
             }
           }
 
