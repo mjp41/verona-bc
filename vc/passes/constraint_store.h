@@ -75,7 +75,7 @@ namespace vc
     }
 
     // Add an upper bound: 'a <: T.
-    // Returns true if the member set was tightened.
+    // Returns true if the member set was tightened or observers notified.
     bool add_upper_bound(
       TypeVarId var,
       Node type,
@@ -85,8 +85,23 @@ namespace vc
         return false;
       auto& e = entries[var];
 
+      // Check if this is a genuinely new upper bound.
+      bool is_new = true;
+      for (auto& existing : e.upper_bounds)
+        if (structural_eq(existing, type))
+        { is_new = false; break; }
+
       e.upper_bounds.push_back(clone(type));
-      return tighten(var, enqueue);
+      bool tightened = tighten(var, enqueue);
+
+      // For non-concrete variables (fields, returns), notify
+      // observers on any new upper bound, even if tighten didn't
+      // find a member_set change. The observer may read the
+      // upper bounds directly.
+      if (is_new && !tightened && !e.concrete)
+        notify(e, enqueue);
+
+      return tightened || is_new;
     }
 
     // Add a lower bound: T <: 'a.
