@@ -2058,14 +2058,7 @@ namespace vc
       if (ms.size() == 1)
         return primitive_type(ms[0]);
 
-      // Check stability map for non-primitive resolved type.
-      auto stable = constraints.check_stability_by_id(id);
-      if (stable)
-        return stable;
-
       // If upper bounds contain angelics, return them directly.
-      // The caller can constrain the angelic's TypeVarId, and
-      // the observer cascade flows through the AI worklist.
       auto& ubs = constraints.upper_bounds(id);
       if (ubs.size() == 1)
         return clone(ubs[0]);
@@ -2153,16 +2146,9 @@ namespace vc
           }
           else
           {
-            // Untyped literal — check stability map first, then
-            // create a fresh constraint variable.
-            auto stable = constraints.check_stability(stmt);
-            if (stable)
-            {
-              type = stable;
-            }
-            else
-            {
-              auto lit = stmt->back();
+            // Untyped literal — reuse existing constraint variable
+            // or create a fresh one.
+            auto lit = stmt->back();
               if (lit->in({Bin, Oct, Int, Hex, Char}))
               {
                 auto sit = stmt_var_ids.find(stmt.get());
@@ -2172,7 +2158,7 @@ namespace vc
                 else
                 {
                   id = constraints.fresh(
-                    true, std::vector<Token>(intset_members()), stmt);
+                    true, std::vector<Token>(intset_members()));
                   stmt_var_ids[stmt.get()] = id;
                 }
                 auto& cur = constraints.member_set(id);
@@ -2193,7 +2179,7 @@ namespace vc
                 else
                 {
                   id = constraints.fresh(
-                    true, std::vector<Token>(floatset_members()), stmt);
+                    true, std::vector<Token>(floatset_members()));
                   stmt_var_ids[stmt.get()] = id;
                 }
                 auto& cur = constraints.member_set(id);
@@ -2211,7 +2197,6 @@ namespace vc
                 type = primitive_type(None);
               else
                 type = make_type(); // Fallback.
-            }
           }
           merge(dst->location(), type);
         }
@@ -2781,7 +2766,7 @@ namespace vc
                     else
                     {
                       id = constraints.fresh(
-                        true, std::vector<Token>(ret_prims), stmt);
+                        true, std::vector<Token>(ret_prims));
                       stmt_var_ids[stmt.get()] = id;
                     }
                     auto& cur = constraints.member_set(id);
@@ -2960,7 +2945,7 @@ namespace vc
                   else
                   {
                     id = constraints.fresh(
-                      concrete, std::vector<Token>(result_prims), stmt);
+                      concrete, std::vector<Token>(result_prims));
                     stmt_var_ids[stmt.get()] = id;
                   }
                   auto& cur = constraints.member_set(id);
@@ -3520,12 +3505,16 @@ namespace vc
               }
             }
 
-            // Stability map fallback.
+            // Fallback: look up constraint variable by stmt.
             if (!final_type)
             {
-              auto stable = constraints.check_stability(*it);
-              if (stable)
-                final_type = stable;
+              auto svit = stmt_var_ids.find((*it).get());
+              if (svit != stmt_var_ids.end())
+              {
+                auto& ms = constraints.member_set(svit->second);
+                if (ms.size() == 1)
+                  final_type = primitive_type(ms[0]);
+              }
             }
 
             Node final_prim;

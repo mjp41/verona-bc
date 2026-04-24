@@ -19,8 +19,11 @@
 //   - Enqueue labels for reprocessing (observer notifications)
 //
 // State per label:
-//   fwd_[label]      — forward entry: what predecessors provide (join point)
-//   fwd_exit_[label] — forward exit: result of forward_transfer
+//   fwd_[label] — join of predecessor outputs (entry state)
+//
+// Transfer function output is pushed directly to successors,
+// not stored persistently. The constraint store and side tables
+// hold all information needed for finalization.
 //
 // Worklist ordering:
 //   Forward: ascending RPO (predecessors before successors).
@@ -237,7 +240,6 @@ namespace vc
     // --- Read accessors (used by domain during transfer) ---
 
     const Env& get_fwd(size_t label) const { return fwd_[label]; }
-    const Env& get_fwd_exit(size_t label) const { return fwd_exit_[label]; }
 
     const CFG& cfg() const { return cfg_; }
     const std::map<Node, size_t>& func_entry() const { return func_entry_; }
@@ -253,12 +255,8 @@ namespace vc
       cfg_.build(top_);
       size_t n = cfg_.size();
       fwd_.resize(n);
-      fwd_exit_.resize(n);
       for (size_t i = 0; i < n; i++)
-      {
         fwd_[i] = domain_.empty_env();
-        fwd_exit_[i] = domain_.empty_env();
-      }
 
       // Build func_entry_ and func_returns_.
       for (auto& [func, range] : cfg_.func_label_range)
@@ -281,8 +279,20 @@ namespace vc
 
     void finalize()
     {
+      // Compute final exit environments by running the transfer
+      // function once on each label's converged fwd state.
+      size_t n = cfg_.size();
+      std::vector<Env> fwd_exit(n);
+      for (size_t i = 0; i < n; i++)
+      {
+        fwd_exit[i] = domain_.clone_env(fwd_[i]);
+        auto body = cfg_.labels[i].label / Body;
+        auto func = cfg_.labels[i].function;
+        domain_.forward_transfer(fwd_exit[i], body, func, i, *this);
+      }
+
       FinalizeContext<Env> ctx{
-        cfg_, fwd_, fwd_exit_, func_entry_, func_returns_};
+        cfg_, fwd_, fwd_exit, func_entry_, func_returns_};
       domain_.finalize(ctx);
     }
 
@@ -303,7 +313,6 @@ namespace vc
     CFG cfg_;
 
     std::vector<Env> fwd_;
-    std::vector<Env> fwd_exit_;
 
     std::map<Node, size_t> func_entry_;
     std::map<Node, std::vector<size_t>> func_returns_;
@@ -363,12 +372,11 @@ namespace vc
         auto body = li.label / Body;
         auto func = li.function;
 
-        // Clone entry → exit, run transfer.
-        fwd_exit_[label] = domain_.clone_env(fwd_[label]);
-        domain_.forward_transfer(
-          fwd_exit_[label], body, func, label, *this);
+        // Clone entry, run transfer on the clone.
+        Env env = domain_.clone_env(fwd_[label]);
+        domain_.forward_transfer(env, body, func, label, *this);
 
-        // Push exit to successors.
+        // Push output to successors.
         auto term = li.label / Return;
         if (term == Cond)
         {
@@ -380,10 +388,9 @@ namespace vc
           auto f_it = func_idx.find(
             std::string((term / Rhs)->location().view()));
 
-          Env true_env = domain_.clone_env(fwd_exit_[label]);
-          Env false_env = domain_.clone_env(fwd_exit_[label]);
-          domain_.split_cond(
-            term, body, fwd_exit_[label], true_env, false_env);
+          Env true_env = domain_.clone_env(env);
+          Env false_env = domain_.clone_env(env);
+          domain_.split_cond(term, body, env, true_env, false_env);
 
           if (t_it != func_idx.end())
             push_fwd(t_it->second, true_env);
@@ -398,7 +405,7 @@ namespace vc
           auto t_it = func_idx.find(
             std::string((term / LabelId)->location().view()));
           if (t_it != func_idx.end())
-            push_fwd(t_it->second, fwd_exit_[label]);
+            push_fwd(t_it->second, env);
         }
       }
 

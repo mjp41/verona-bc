@@ -38,7 +38,6 @@ namespace vc
     std::vector<Node> upper_bounds; // 'a <: T (from use sites).
     std::vector<Node> lower_bounds; // T <: 'a (from definition sites).
     std::vector<size_t> observers; // Labels to re-enqueue on tightening.
-    Node source_stmt; // AST stmt that created this variable.
   };
 
   // Callback type for observer notification.
@@ -48,22 +47,15 @@ namespace vc
   {
     std::vector<ConstraintEntry> entries;
 
-    // Stability map: statement → resolved type.
-    // When a variable reaches a singleton, we record which stmt created it
-    // so re-runs of that label use the resolved type directly.
-    std::map<const void*, Node> stability_map;
-
     // Create a fresh type variable.
     TypeVarId fresh(
       bool is_concrete,
-      std::vector<Token> members,
-      Node stmt = {})
+      std::vector<Token> members)
     {
       TypeVarId id = entries.size();
       ConstraintEntry entry;
       entry.concrete = is_concrete;
       entry.member_set = std::move(members);
-      entry.source_stmt = stmt;
       entries.push_back(std::move(entry));
       return id;
     }
@@ -122,44 +114,6 @@ namespace vc
         if (o == label)
           return; // Already registered.
       obs.push_back(label);
-    }
-
-    // Check the stability map for a statement.
-    // Returns the previously resolved type if this stmt's variable
-    // reached a singleton in a prior iteration.
-    Node check_stability(const Node& stmt) const
-    {
-      if (!stmt)
-        return {};
-      auto it = stability_map.find(stmt.get());
-      if (it != stability_map.end())
-        return clone(it->second);
-      return {};
-    }
-
-    // Check stability map by TypeVarId (for variables without source_stmt,
-    // like function return type variables).
-    Node check_stability_by_id(TypeVarId var) const
-    {
-      if (var >= entries.size())
-        return {};
-      // For non-concrete vars, check if all upper bounds agree.
-      auto& e = entries[var];
-      if (!e.upper_bounds.empty())
-      {
-        bool all_agree = true;
-        for (size_t i = 1; i < e.upper_bounds.size(); i++)
-        {
-          if (!structural_eq(e.upper_bounds[i], e.upper_bounds[0]))
-          {
-            all_agree = false;
-            break;
-          }
-        }
-        if (all_agree)
-          return clone(e.upper_bounds[0]);
-      }
-      return {};
     }
 
     size_t size() const { return entries.size(); }
@@ -221,7 +175,6 @@ namespace vc
         if (!candidates.empty() && candidates.size() < e.member_set.size())
         {
           e.member_set = std::move(candidates);
-          update_stability(e);
           notify(e, enqueue);
           return true;
         }
@@ -233,14 +186,13 @@ namespace vc
         if (ub_prims.size() == 1 && e.member_set.empty())
         {
           e.member_set = {ub_prims[0]};
-          update_stability(e);
           notify(e, enqueue);
           return true;
         }
       }
 
       // Non-primitive upper bounds with no member set:
-      // if all agree structurally, create a singleton.
+      // if all agree structurally, notify observers.
       if (e.member_set.empty() && !e.upper_bounds.empty())
       {
         bool all_agree = true;
@@ -254,21 +206,12 @@ namespace vc
         }
         if (all_agree)
         {
-          // Store as non-primitive resolved type in stability map.
-          if (e.source_stmt)
-            stability_map[e.source_stmt.get()] = clone(e.upper_bounds[0]);
           notify(e, enqueue);
           return true;
         }
       }
 
       return false;
-    }
-
-    void update_stability(ConstraintEntry& e)
-    {
-      if (e.source_stmt && e.member_set.size() == 1)
-        stability_map[e.source_stmt.get()] = make_prim_type(e.member_set[0]);
     }
 
     void notify(ConstraintEntry& e, const EnqueueCallback& enqueue)
