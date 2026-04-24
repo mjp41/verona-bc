@@ -324,26 +324,18 @@ growing unboundedly with redundant subtypes.
 
 ## 10. Finalize
 
-After the solve converges, finalize writes types to the AST using
-only the constraint store and side tables — no `fwd` or `fwd_exit`:
+After the solve converges, finalize writes types to the AST.
 
-1. **Const types**: For each Const statement, look up
-   `stmt_var_ids[stmt]` → read `member_set(id)`. Singleton → write
-   that type. Otherwise → write the default (u64 for int, f64 for float).
+**Primary sources** (constraint store + side tables):
+- Const types: `stmt_var_ids[stmt]` → `member_set(id)` → singleton or default
+- Lambda field types: `field_type_overrides[(class, name)]`
+- Function return types: `func_return_var[func]` → `upper_bounds`
+- Param types: `fwd[entry_label][param_loc]` (fwd is retained)
+- Angelic sweep: TypeVarId → `member_set` → default
 
-2. **Lambda field types**: For each `(class, field)` in
-   `field_type_overrides`, update the FieldDef's Type child.
-
-3. **Function return types**: For each function with TypeVar return,
-   look up `func_return_var[func]` → read `member_set` or
-   `check_stability_by_id`. If concrete, write return type.
-   Otherwise error "Cannot infer return type."
-
-4. **Sweep**: Traverse the AST for remaining `AngelicSubtype` nodes.
-   Look up by TypeVarId → read `member_set`. Singleton → replace
-   with concrete. IntSet default → u64. FloatSet default → f64.
-
-5. **Remove TypeAssertions**: Strip from bodies.
-
-6. **Error checking**: Non-generic functions with TypeVar params or
-   return types after the above steps → compile error.
+**Derived** (tuple/array element types): finalize re-runs the
+transfer function once per label on the converged `fwd` state to
+reconstruct exit environments for tuple element type computation.
+This is a non-iterative pass — no worklist, no constraint updates.
+A future simplification could track tuple element types in a
+dedicated side table during the solve.
