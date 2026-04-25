@@ -2134,6 +2134,32 @@ namespace vc
       constraints.add_upper_bound(id, ret_type, enqueue_cb);
     }
 
+    // Resolve a callee param type. During solve, the AST may still
+    // have TypeVar even though param_var has a resolved type.
+    // This is the single path for reading callee param types.
+    Node resolve_param_type(
+      const Node& func,
+      const Node& param,
+      const NodeMap<Node>& subst,
+      size_t label_idx)
+    {
+      auto pt = apply_subst(top, param / Type, subst);
+      if (pt && pt->front() == TypeVar)
+      {
+        auto pname = std::string(
+          (param / Ident)->location().view());
+        auto pv_key = std::make_pair(func.get(), pname);
+        auto pv_it = param_var.find(pv_key);
+        if (pv_it != param_var.end())
+        {
+          auto resolved = resolve_var(pv_it->second, label_idx);
+          if (resolved && resolved->front() != TypeVar)
+            return resolved;
+        }
+      }
+      return pt;
+    }
+
     // ===== Forward Transfer Function =====
 
     void forward_transfer(
@@ -2705,7 +2731,8 @@ namespace vc
 
           for (size_t i = 0; i < params->size() && i < args->size(); i++)
           {
-            auto pt = apply_subst(top, params->at(i) / Type, subst);
+            auto pt = resolve_param_type(
+              func_def, params->at(i), subst, label_idx);
             if (pt && pt->front() != TypeVar)
             {
               auto arg_loc = (args->at(i) / Rhs)->location();
@@ -3125,8 +3152,8 @@ namespace vc
                   i < params->size() && i < args->size();
                   i++)
                 {
-                  auto pt =
-                    apply_subst(top, params->at(i) / Type, info.subst);
+                  auto pt = resolve_param_type(
+                    info.func, params->at(i), info.subst, label_idx);
                   if (pt && pt->front() != TypeVar)
                   {
                     auto arg_loc = (args->at(i) / Rhs)->location();
@@ -3135,7 +3162,6 @@ namespace vc
                     {
                       push_shape_to_lambda(
                         pt, arg_it->second.type);
-                      // Constrain Angelic arg from param type.
                       constrain_type(
                         arg_it->second.type, pt, enqueue_cb);
                     }
