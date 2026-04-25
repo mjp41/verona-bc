@@ -821,13 +821,7 @@ namespace vc
             auto in_mems = members(in_bound);
             std::vector<Token> widened = ex_mems;
             for (auto& m : in_mems)
-            {
-              bool dup = false;
-              for (auto& w : widened)
-                if (w == m) { dup = true; break; }
-              if (!dup)
-                widened.push_back(m);
-            }
+              push_unique(widened, m);
             bool is_c = has_concrete(ex_bound) || has_concrete(in_bound);
             auto nb = make_angelic_bound(widened, is_c);
             result_angelic[j] =
@@ -1750,6 +1744,25 @@ namespace vc
       return changed;
     }
 
+    // Collect all angelic primitive members from a type.
+    // Handles direct AngelicSubtype and Union containing angelics.
+    static std::vector<Token> collect_angelic_members(const Node& type)
+    {
+      std::vector<Token> result;
+      auto collect = [&](const Node& n) {
+        if (n == AngelicSubtype && !n->empty())
+          for (auto& m : members(n->front()))
+            push_unique(result, m);
+      };
+      if (is_angelic(type))
+        collect(type->front());
+      else if (type == Type && !type->empty() && type->front() == Union)
+        for (auto& child : *(type->front()))
+          if (child == AngelicSubtype)
+            collect(child);
+      return result;
+    }
+
     // ===== Constraint decomposition =====
     //
     // Adds upper bound constraints to all type variables in a type.
@@ -1906,56 +1919,43 @@ namespace vc
     // a constraint variable for the callee's inferred return type.
     // The caller observes this variable. Return labels tighten it.
 
-    TypeVarId get_func_return_var(Node callee_func)
+    // Get or create a constraint variable in a map.
+    template<typename K>
+    TypeVarId get_or_create_var(std::map<K, TypeVarId>& map, const K& key)
     {
-      auto key = callee_func.get();
-      auto it = func_return_var.find(key);
-      if (it != func_return_var.end())
+      auto it = map.find(key);
+      if (it != map.end())
         return it->second;
-
-      // Create a non-concrete variable with no member set.
       auto id = constraints.fresh(false, {});
-      func_return_var[key] = id;
+      map[key] = id;
       return id;
     }
 
-    // Get or create a constraint variable for a lambda field.
+    TypeVarId get_func_return_var(Node callee_func)
+    {
+      auto key = static_cast<const void*>(callee_func.get());
+      return get_or_create_var(func_return_var, key);
+    }
+
     TypeVarId get_field_var(
       const void* class_ptr, const std::string& field_name)
     {
-      auto key = std::make_pair(class_ptr, field_name);
-      auto it = field_var.find(key);
-      if (it != field_var.end())
-        return it->second;
-      auto id = constraints.fresh(false, {});
-      field_var[key] = id;
-      return id;
+      return get_or_create_var(
+        field_var, std::make_pair(class_ptr, field_name));
     }
 
-    // Get or create a constraint variable for a function parameter.
     TypeVarId get_param_var(
       const void* func_ptr, const std::string& param_name)
     {
-      auto key = std::make_pair(func_ptr, param_name);
-      auto it = param_var.find(key);
-      if (it != param_var.end())
-        return it->second;
-      auto id = constraints.fresh(false, {});
-      param_var[key] = id;
-      return id;
+      return get_or_create_var(
+        param_var, std::make_pair(func_ptr, param_name));
     }
 
-    // Get or create a TypeArg constraint variable for a Call.
     TypeVarId get_typearg_var(
       const void* call_ptr, const std::string& tp_name)
     {
-      auto key = std::make_pair(call_ptr, tp_name);
-      auto it = typearg_var.find(key);
-      if (it != typearg_var.end())
-        return it->second;
-      auto id = constraints.fresh(false, {});
-      typearg_var[key] = id;
-      return id;
+      return get_or_create_var(
+        typearg_var, std::make_pair(call_ptr, tp_name));
     }
 
     // Resolve a constraint variable to its current best type.
@@ -2160,6 +2160,31 @@ namespace vc
       return pt;
     }
 
+    // Get or create a stable constraint variable for a statement,
+    // and return its current type (concrete or angelic).
+    Node resolve_stmt_var(
+      const Node& stmt,
+      bool concrete,
+      const std::vector<Token>& initial_members,
+      size_t label_idx)
+    {
+      auto sit = stmt_var_ids.find(stmt.get());
+      TypeVarId id;
+      if (sit != stmt_var_ids.end())
+        id = sit->second;
+      else
+      {
+        id = constraints.fresh(concrete, std::vector<Token>(initial_members));
+        stmt_var_ids[stmt.get()] = id;
+      }
+      auto& cur = constraints.member_set(id);
+      if (cur.size() == 1)
+        return primitive_type(cur[0]);
+      auto& mems = cur.empty() ? initial_members : cur;
+      constraints.add_observer(id, label_idx);
+      return make_angelic_var(id, concrete, mems);
+    }
+
     // ===== Forward Transfer Function =====
 
     void forward_transfer(
@@ -2227,51 +2252,15 @@ namespace vc
           }
           else
           {
-            // Untyped literal — reuse existing constraint variable
-            // or create a fresh one.
             auto lit = stmt->back();
               if (lit->in({Bin, Oct, Int, Hex, Char}))
-              {
-                auto sit = stmt_var_ids.find(stmt.get());
-                TypeVarId id;
-                if (sit != stmt_var_ids.end())
-                  id = sit->second;
-                else
-                {
-                  id = constraints.fresh(
-                    true, std::vector<Token>(intset_members()));
-                  stmt_var_ids[stmt.get()] = id;
-                }
-                auto& cur = constraints.member_set(id);
-                if (cur.size() == 1)
-                  type = primitive_type(cur[0]);
-                else
-                {
-                  type = make_angelic_var(id, true, cur);
-                  constraints.add_observer(id, label_idx);
-                }
-              }
+                type = resolve_stmt_var(
+                  stmt, true, intset_members(),
+                  label_idx);
               else if (lit->in({Float, HexFloat}))
-              {
-                auto sit = stmt_var_ids.find(stmt.get());
-                TypeVarId id;
-                if (sit != stmt_var_ids.end())
-                  id = sit->second;
-                else
-                {
-                  id = constraints.fresh(
-                    true, std::vector<Token>(floatset_members()));
-                  stmt_var_ids[stmt.get()] = id;
-                }
-                auto& cur = constraints.member_set(id);
-                if (cur.size() == 1)
-                  type = primitive_type(cur[0]);
-                else
-                {
-                  type = make_angelic_var(id, true, cur);
-                  constraints.add_observer(id, label_idx);
-                }
-              }
+                type = resolve_stmt_var(
+                  stmt, true, floatset_members(),
+                  label_idx);
               else if (lit->in({True, False}))
                 type = primitive_type(Bool);
               else if (lit == None)
@@ -2786,29 +2775,8 @@ namespace vc
             // Handle angelic part: resolve method for each member.
             if (contains_angelic(src_it->second.type))
             {
-              // Collect all angelic bounds' members.
-              std::vector<Token> all_mems;
-              auto collect_angelic_mems = [&](const Node& n) {
-                if (n == AngelicSubtype && !n->empty())
-                {
-                  auto b = n->front();
-                  auto m = members(b);
-                  for (auto& t : m)
-                  {
-                    bool dup = false;
-                    for (auto& a : all_mems)
-                      if (a == t) { dup = true; break; }
-                    if (!dup)
-                      all_mems.push_back(t);
-                  }
-                }
-              };
-              if (is_angelic(src_it->second.type))
-                collect_angelic_mems(src_it->second.type->front());
-              else if (src_it->second.type->front() == Union)
-                for (auto& child : *(src_it->second.type->front()))
-                  if (child == AngelicSubtype)
-                    collect_angelic_mems(child);
+              auto all_mems =
+                collect_angelic_members(src_it->second.type);
 
               if (!all_mems.empty())
               {
@@ -2842,35 +2810,12 @@ namespace vc
                     auto rp = extract_primitive(ret);
                     if (!rp)
                       continue;
-                    bool dup = false;
-                    for (auto& r : ret_prims)
-                      if (r == rp->type()) { dup = true; break; }
-                    if (!dup)
-                      ret_prims.push_back(rp->type());
+                    push_unique(ret_prims, rp->type());
                   }
                   if (!ret_prims.empty())
-                  {
-                    auto sit = stmt_var_ids.find(stmt.get());
-                    TypeVarId id;
-                    if (sit != stmt_var_ids.end())
-                      id = sit->second;
-                    else
-                    {
-                      id = constraints.fresh(
-                        true, std::vector<Token>(ret_prims));
-                      stmt_var_ids[stmt.get()] = id;
-                    }
-                    auto& cur = constraints.member_set(id);
-                    auto& mems = cur.empty() ? ret_prims : cur;
-                    if (mems.size() == 1)
-                      merge(dst_loc, primitive_type(mems[0]));
-                    else
-                    {
-                      merge(dst_loc,
-                        make_angelic_var(id, true, mems));
-                      constraints.add_observer(id, label_idx);
-                    }
-                  }
+                    merge(dst_loc, resolve_stmt_var(
+                      stmt, true, ret_prims,
+                      label_idx));
                 }
               }
             }
@@ -2912,24 +2857,8 @@ namespace vc
               auto method_ta = lookup_node / TypeArgs;
               auto arity = from_chars_sep_v<size_t>(lookup_node / Int);
 
-              // Collect all angelic members from receiver.
-              std::vector<Token> recv_mems;
-              auto collect_mems = [&](const Node& n) {
-                if (n == AngelicSubtype && !n->empty())
-                  for (auto& m : members(n->front()))
-                  {
-                    bool dup = false;
-                    for (auto& r : recv_mems)
-                      if (r == m) { dup = true; break; }
-                    if (!dup) recv_mems.push_back(m);
-                  }
-              };
-              if (is_angelic(recv_it->second.type))
-                collect_mems(recv_it->second.type->front());
-              else if (recv_it->second.type->front() == Union)
-                for (auto& child : *(recv_it->second.type->front()))
-                  if (child == AngelicSubtype)
-                    collect_mems(child);
+              auto recv_mems =
+                collect_angelic_members(recv_it->second.type);
 
               // Collect arg member sets.
               std::vector<std::vector<Token>> arg_mem_sets;
@@ -3006,17 +2935,7 @@ namespace vc
 
                 auto ret_prim = extract_primitive(ret);
                 if (ret_prim)
-                {
-                  bool dup = false;
-                  for (auto& r : result_prims)
-                    if (r == ret_prim->type())
-                    {
-                      dup = true;
-                      break;
-                    }
-                  if (!dup)
-                    result_prims.push_back(ret_prim->type());
-                }
+                  push_unique(result_prims, ret_prim->type());
                 else if (!result_nonprim)
                   result_nonprim = ret;
               }
@@ -3027,29 +2946,9 @@ namespace vc
                 if (result_prims.size() == 1)
                   merge(dst_loc, primitive_type(result_prims[0]));
                 else
-                {
-                  bool concrete = true;
-                  auto sit = stmt_var_ids.find(stmt.get());
-                  TypeVarId id;
-                  if (sit != stmt_var_ids.end())
-                    id = sit->second;
-                  else
-                  {
-                    id = constraints.fresh(
-                      concrete, std::vector<Token>(result_prims));
-                    stmt_var_ids[stmt.get()] = id;
-                  }
-                  auto& cur = constraints.member_set(id);
-                  auto& mems = cur.empty() ? result_prims : cur;
-                  if (mems.size() == 1)
-                    merge(dst_loc, primitive_type(mems[0]));
-                  else
-                  {
-                    merge(dst_loc,
-                      make_angelic_var(id, concrete, mems));
-                    constraints.add_observer(id, label_idx);
-                  }
-                }
+                  merge(dst_loc, resolve_stmt_var(
+                    stmt, true, result_prims,
+                    label_idx));
               }
               else if (result_nonprim)
                 merge(dst_loc, result_nonprim);

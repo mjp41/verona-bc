@@ -31,6 +31,15 @@ namespace vc
 {
   using TypeVarId = size_t;
 
+  inline bool push_unique(std::vector<Token>& vec, Token tok)
+  {
+    for (auto& t : vec)
+      if (t == tok)
+        return false;
+    vec.push_back(tok);
+    return true;
+  }
+
   struct ConstraintEntry
   {
     bool concrete = false; // Must resolve to one type (literals).
@@ -180,17 +189,7 @@ namespace vc
       {
         auto toks = extract_primitive_tokens(ub);
         for (auto& t : toks)
-        {
-          bool dup = false;
-          for (auto& u : ub_prims)
-            if (u == t)
-            {
-              dup = true;
-              break;
-            }
-          if (!dup)
-            ub_prims.push_back(t);
-        }
+          push_unique(ub_prims, t);
       }
 
       if (e.concrete && !e.member_set.empty() && !ub_prims.empty())
@@ -273,17 +272,7 @@ namespace vc
           {
             auto tok = extract_single_primitive(child);
             if (tok.has_value())
-            {
-              bool dup = false;
-              for (auto& r : result)
-                if (r == tok.value())
-                {
-                  dup = true;
-                  break;
-                }
-              if (!dup)
-                result.push_back(tok.value());
-            }
+              push_unique(result, tok.value());
           }
         }
       }
