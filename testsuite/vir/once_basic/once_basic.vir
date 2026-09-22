@@ -1,0 +1,55 @@
+lib
+  @set_exit_code = "set_exit_code"(i32): none
+
+
+class @Payload
+  @value : i32
+
+
+func @make_payload() : @Payload
+  $value = const i32 42
+  $payload = new @Payload($value)
+  ret $payload
+
+
+once @answer() : i32
+  // Eager initialization happens before main. Calls from main must use the
+  // cached value and must not repeat this observable side effect.
+  $initialized = const i32 7
+  $_ = ffi @set_exit_code($initialized)
+  $answer = const i32 42
+  ret $answer
+
+
+once @owner() : cown @Payload
+  $owner = when @make_payload() : @Payload
+  ret $owner
+
+
+func @main() : none
+  $success = const i32 0
+  $_success = ffi @set_exit_code($success)
+
+  $first = call @answer()
+  $second = call @answer()
+  $expected = const i32 42
+  $first_ok = eq $first $expected
+  cond $first_ok ^check_second ^fail
+
+^check_second
+  $second_ok = eq $second $expected
+  cond $second_ok ^check_owner ^fail
+
+^check_owner
+  $first_owner = call @owner()
+  $second_owner = call @owner()
+  drop $first_owner
+  drop $second_owner
+  $_none = const none
+  ret $_none
+
+^fail
+  $failure = const i32 1
+  $_failure = ffi @set_exit_code($failure)
+  $_none = const none
+  ret $_none

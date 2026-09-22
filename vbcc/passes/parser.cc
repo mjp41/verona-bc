@@ -2,8 +2,8 @@
 
 namespace vbcc
 {
-  const auto wfParserTokens = Lib | Type | Primitive | Class | Func | Vars |
-    Source | GlobalId | LocalId | LabelId | Equals | LParen | RParen |
+  const auto wfParserTokens = Lib | Type | Primitive | Class | Func | Once |
+    Vars | Source | GlobalId | LocalId | LabelId | Equals | LParen | RParen |
     LBracket | RBracket | Comma | Colon | Union | TupleType | Vararg |
     wfRegionType | wfPrimitiveType | Dyn | Ref | Cown | wfStatement |
     wfTerminator | wfLiteral | String | RawString;
@@ -33,6 +33,7 @@ namespace vbcc
         "primitive\\b" >> [](auto& m) { m.add(Primitive); },
         "class\\b" >> [](auto& m) { m.add(Class); },
         "func\\b" >> [](auto& m) { m.add(Func); },
+        "once\\b" >> [](auto& m) { m.add(Once); },
         "var\\b" >> [](auto& m) { m.add(Vars); },
 
         // Region types.
@@ -58,6 +59,7 @@ namespace vbcc
         "usize\\b" >> [](auto& m) { m.add(USize); },
         "ptr\\b" >> [](auto& m) { m.add(Ptr); },
         "dyn\\b" >> [](auto& m) { m.add(Dyn); },
+        "cown\\b" >> [](auto& m) { m.add(Cown); },
         "tuple\\b" >> [](auto& m) { m.add(TupleType); },
 
         // Op codes.

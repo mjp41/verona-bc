@@ -13,7 +13,7 @@ namespace vbcc
       dir::bottomup,
       {
         // Function.
-        T(Func)[Func] * T(Label)[Label] >>
+        T(Func, FuncOnce)[Func] * T(Label)[Label] >>
           [](Match& _) {
             (_(Func) / Labels) << _(Label);
             return _(Func);

@@ -29,8 +29,8 @@ namespace vbcc
   const auto wfPassStatements =
       wfIR
     | (Top <<= (
-        Lib | Primitive | Class | Type | Func | LabelId | wfStatement
-      | wfTerminator)++)
+        Lib | Primitive | Class | Type | Func | FuncOnce | LabelId
+      | wfStatement | wfTerminator)++)
     ;
   // clang-format on
 
@@ -215,6 +215,7 @@ namespace vbcc
           Field,
           Symbol,
           Func,
+          FuncOnce,
           Param,
           VarDef,
           NewArray,
@@ -318,6 +319,21 @@ namespace vbcc
             return Seq << (Func << (FunctionId ^ _(GlobalId))
                                 << paramdef(_[Params]) << _(Type)
                                 << vardef(_[Vars]) << Labels)
+                       << (LabelId ^ start);
+          },
+
+        // Once function (memoized).
+        (T(Once) << End) * T(GlobalId)[GlobalId] * ParamDef[Params] *
+            T(Colon) * TypePat[Type] *
+            ~(T(Vars) *
+              (T(LocalId) * ~(T(Colon) * TypePat) *
+               (T(Comma) * T(LocalId) * ~(T(Colon) * TypePat))++)[Vars]) >>
+          [](Match& _) {
+            auto start = std::string(_(GlobalId)->location().view());
+            start.at(0) = '^';
+            return Seq << (FuncOnce << (FunctionId ^ _(GlobalId))
+                                    << paramdef(_[Params]) << _(Type)
+                                    << vardef(_[Vars]) << Labels)
                        << (LabelId ^ start);
           },
 
