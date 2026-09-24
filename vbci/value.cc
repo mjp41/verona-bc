@@ -940,6 +940,10 @@ namespace vbci
         arr->immortalize();
         break;
 
+      case ValueType::Cown:
+        cown->immortalize();
+        break;
+
       default:
         break;
     }
