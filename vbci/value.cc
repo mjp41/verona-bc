@@ -513,6 +513,21 @@ namespace vbci
     }
   }
 
+  Value Value::remap_reference(Header* base) const
+  {
+    switch (tag)
+    {
+      case ValueType::FieldRef:
+        return Value(static_cast<Object*>(base), idx, readonly);
+
+      case ValueType::ArrayRef:
+        return Value(static_cast<Array*>(base), idx, readonly);
+
+      default:
+        Value::error(Error::BadConversion);
+    }
+  }
+
   Object* Value::get_object() const
   {
     if (tag != ValueType::Object)
