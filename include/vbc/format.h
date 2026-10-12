@@ -291,9 +291,6 @@ namespace vbc
     Pin,
     Unpin,
 
-    // Merge two values into the same region. Returns None.
-    Merge,
-
     // Compute FFI struct layout metadata for a leaf type or flat tuple type.
     // Arg0 = dst.
     // Arg1 = layout type ID.

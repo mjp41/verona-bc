@@ -282,7 +282,7 @@ namespace vc
   inline const auto wfExprDot =
     (wfExprSugar | CallDyn | TryCallDyn | Convert | Binop | Nulop | FFI |
      NewArray | ArrayRef | MakeCallback | CodePtrCallback | FreeCallback |
-     Freeze | Pin | Unpin | Merge | FFIStruct | FFILoad | FFIStore | ArrayCopy |
+     Freeze | Pin | Unpin | FFIStruct | FFILoad | FFIStore | ArrayCopy |
      ArrayFill | ArrayCompare) -
     Dot - TripleColon;
 
@@ -301,7 +301,6 @@ namespace vc
     | (Freeze <<= Args)
     | (Pin <<= Args)
     | (Unpin <<= Args)
-    | (Merge <<= Args)
     | (FFIStruct <<= Type * Args)
     | (FFILoad <<= Type * Args)
     | (FFIStore <<= Type * Args)
@@ -331,7 +330,7 @@ namespace vc
     NewArray | NewArrayConst | Load | Store | Lookup | Call | CallDyn |
     TryCallDyn | Var | When | wfBinop | wfUnop | wfNulop | FFI | Typetest |
     TypeAssertion | GetRaise | SetRaise | SplatOp | ArrayRefFromEnd |
-    MakeCallback | CodePtrCallback | FreeCallback | Freeze | Pin | Unpin | Merge |
+    MakeCallback | CodePtrCallback | FreeCallback | Freeze | Pin | Unpin |
     FFIStruct | FFILoad | FFIStore | ArrayCopy | ArrayFill | ArrayCompare;
 
   // clang-format off
@@ -442,7 +441,6 @@ namespace vc
     | (Freeze <<= wfDst * wfSrc)
     | (Pin <<= wfDst * wfSrc)
     | (Unpin <<= wfDst * wfSrc)
-    | (Merge <<= wfDst * wfLhs * wfRhs)
     | (FFIStruct <<= wfDst * (Type >>= wfType))
     | (FFILoad <<= wfDst * wfLhs * wfRhs * wfKind * (Type >>= wfType))
     | (FFIStore <<=

@@ -7,7 +7,6 @@
 #include "drag.h"
 #include "freeze.h"
 #include "function_signature.h"
-#include "merge.h"
 #include "object.h"
 #include "program.h"
 #include "region_ext.h"
@@ -796,8 +795,6 @@ namespace vbc
         return os << "Pin";
       case Op::Unpin:
         return os << "Unpin";
-      case Op::Merge:
-        return os << "Merge";
       case Op::FFIStruct:
         return os << "FFIStruct";
       case Op::FFILoad:
@@ -1808,15 +1805,6 @@ namespace vbci
       {
         process([](Register& dst, const Register& src) INLINE {
           src->unpin();
-          dst = ValueImmortal(Value::none());
-        });
-        break;
-      }
-
-      case Op::Merge:
-      {
-        process([](Register& dst, const Register& a, const Register& b) INLINE {
-          merge(a, b);
           dst = ValueImmortal(Value::none());
         });
         break;

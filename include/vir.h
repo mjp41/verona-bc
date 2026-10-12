@@ -67,7 +67,6 @@ namespace vir
   inline const auto Freeze = TokenDef("freeze");
   inline const auto Pin = TokenDef("pin");
   inline const auto Unpin = TokenDef("unpin");
-  inline const auto Merge = TokenDef("merge");
   inline const auto FFIStruct = TokenDef("ffistruct");
   inline const auto FFILoad = TokenDef("ffiload");
   inline const auto FFIStore = TokenDef("ffistore");
@@ -240,7 +239,7 @@ namespace vir
 
   inline const auto wfStatement = Source | Offset | Const | ConstStr | Convert |
     Singleton | New | NewArray | NewArrayConst | Copy | Move | Drop |
-    AtTeardown | Freeze | Pin | Unpin | Merge | FFIStruct | FFILoad | FFIStore |
+    AtTeardown | Freeze | Pin | Unpin | FFIStruct | FFILoad | FFIStore |
     RegisterRef | FieldRef | ArrayRef | ArrayRefConst | Load | Store | Lookup |
     Arg | Call | CallDyn | TryCallDyn | FFI | When | WhenDyn | GetRaise |
     SetRaise | wfBinop | wfUnop | wfNulop | Typetest | MakeCallback |
@@ -309,7 +308,6 @@ namespace vir
     | (Freeze <<= wfDst * wfSrc)
     | (Pin <<= wfDst * wfSrc)
     | (Unpin <<= wfDst * wfSrc)
-    | (Merge <<= wfDst * wfLhs * wfRhs)
     | (FFIStruct <<= wfDst * (Type >>= wfType))
     | (FFILoad <<= wfDst * wfLhs * wfRhs * wfKind * (Type >>= wfType))
     | (FFIStore <<=

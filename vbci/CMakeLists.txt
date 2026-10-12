@@ -10,7 +10,6 @@ add_executable(vbci
   frame.cc
   freeze.cc
   main.cc
-  merge.cc
   program.cc
   region.cc
   region_rc.cc

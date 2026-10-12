@@ -2626,7 +2626,6 @@ namespace vc
                      FreeCallback,
                      Pin,
                      Unpin,
-                     Merge,
                      AddExternal,
                      RemoveExternal,
                    }))

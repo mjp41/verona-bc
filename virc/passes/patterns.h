@@ -102,7 +102,6 @@ namespace virc
       FreeCallback,
       Pin,
       Unpin,
-      Merge,
       FFIStruct,
       FFILoad,
       FFIStore,
