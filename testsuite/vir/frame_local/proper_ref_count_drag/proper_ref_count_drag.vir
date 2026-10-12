@@ -12,16 +12,15 @@ class @C
 
 func @main(): none 
     $true = const bool true 
-    $b = region rc @B($true)
+    $b = new @B($true)
     $a = new @A($b)
-    $c = region rc @C($a)
+    $c = new @C($a)
 
     $ret_val = const i32 42 
     $_ = ffi @set_exit_code($ret_val)
     $_none = const none
     ret $_none
     
-
 
 
 

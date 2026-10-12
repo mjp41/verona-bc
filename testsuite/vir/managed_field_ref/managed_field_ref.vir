@@ -11,9 +11,9 @@ class @Holder
 
 func @main(): none
   $one = const i32 1
-  $target = region rc @Target($one)
+  $target = new @Target($one)
   $target_ref = ref $target @value
-  $holder = region rc @Holder($target_ref)
+  $holder = new @Holder($target_ref)
 
   drop $target_ref
   drop $target

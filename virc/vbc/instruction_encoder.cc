@@ -179,23 +179,6 @@ namespace virc::vbc_backend
           arguments(statement / Args);
           output << uleb(+Op::New) << dst(statement) << cls(statement);
         }
-        else if (statement == Stack)
-        {
-          arguments(statement / Args);
-          output << uleb(+Op::Stack) << dst(statement) << cls(statement);
-        }
-        else if (statement == Heap)
-        {
-          arguments(statement / Args);
-          output << uleb(+Op::Heap) << dst(statement) << rhs(statement)
-                 << cls(statement);
-        }
-        else if (statement == Region)
-        {
-          arguments(statement / Args);
-          output << uleb(+Op::Region) << dst(statement)
-                 << encode_region(statement) << cls(statement);
-        }
         else if (statement == NewArray)
         {
           output << uleb(+Op::NewArray) << dst(statement) << rhs(statement)
@@ -204,43 +187,6 @@ namespace virc::vbc_backend
         else if (statement == NewArrayConst)
         {
           output << uleb(+Op::NewArrayConst) << dst(statement)
-                 << uleb(compilation.type_id(statement / Type))
-                 << uleb(from_chars_sep_v<uint64_t>(statement / Rhs));
-        }
-        else if (statement == StackArray)
-        {
-          output << uleb(+Op::StackArray) << dst(statement) << rhs(statement)
-                 << uleb(compilation.type_id(statement / Type));
-        }
-        else if (statement == StackArrayConst)
-        {
-          output << uleb(+Op::StackArrayConst) << dst(statement)
-                 << uleb(compilation.type_id(statement / Type))
-                 << uleb(from_chars_sep_v<uint64_t>(statement / Rhs));
-        }
-        else if (statement == HeapArray)
-        {
-          output << uleb(+Op::HeapArray) << dst(statement) << lhs(statement)
-                 << rhs(statement)
-                 << uleb(compilation.type_id(statement / Type));
-        }
-        else if (statement == HeapArrayConst)
-        {
-          output << uleb(+Op::HeapArrayConst) << dst(statement)
-                 << lhs(statement)
-                 << uleb(compilation.type_id(statement / Type))
-                 << uleb(from_chars_sep_v<uint64_t>(statement / Rhs));
-        }
-        else if (statement == RegionArray)
-        {
-          output << uleb(+Op::RegionArray) << dst(statement)
-                 << encode_region(statement) << rhs(statement)
-                 << uleb(compilation.type_id(statement / Type));
-        }
-        else if (statement == RegionArrayConst)
-        {
-          output << uleb(+Op::RegionArrayConst) << dst(statement)
-                 << encode_region(statement)
                  << uleb(compilation.type_id(statement / Type))
                  << uleb(from_chars_sep_v<uint64_t>(statement / Rhs));
         }

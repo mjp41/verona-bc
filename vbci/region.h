@@ -14,6 +14,12 @@ namespace vbci
 {
   struct Header;
 
+  enum class RegionType
+  {
+    RegionRC,
+    RegionArena
+  };
+
   struct Region
   {
   private:

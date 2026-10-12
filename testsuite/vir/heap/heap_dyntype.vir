@@ -7,9 +7,9 @@ class @Foo
     
 func @main(): none
     $true = const bool true
-    $a1 = region rc @Foo($true)
-    $a2 = heap $a1 @Foo($true)
-    $a3 = heap $a2 @Foo($true)
+    $a1 = new @Foo($true)
+    $a2 = new @Foo($true)
+    $a3 = new @Foo($true)
     $r2 = ref $a2 @f
     $r3 = ref $a3 @f
     $old1 = store $r2 $a1

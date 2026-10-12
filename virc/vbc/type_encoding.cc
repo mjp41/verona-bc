@@ -38,19 +38,6 @@ namespace virc::vbc_backend
   static_assert(+PrimitiveKind::F64 == +PrimitiveType::F64);
   static_assert(+PrimitiveKind::Ptr == +PrimitiveType::Ptr);
 
-  uleb<size_t> encode_region(Node node)
-  {
-    auto region = node / Region;
-
-    if (region == RegionRC)
-      return +RegionType::RegionRC;
-    if (region == RegionArena)
-      return +RegionType::RegionArena;
-
-    assert(false);
-    return size_t(-1);
-  }
-
   void encode_type_table(ByteBuffer& output, const std::vector<TypeInfo>& types)
   {
     output << uleb(types.size());

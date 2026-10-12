@@ -3770,8 +3770,8 @@ namespace vc
         if (it != env.end())
           it->second.is_fixed = true;
       }
-      // ----- New / Stack -----
-      else if (stmt->in({New, Stack}))
+      // ----- New -----
+      else if (stmt == New)
       {
         InferStmtScope stmt_scope(InferStmtFamily::NewOps);
         auto dst_loc = (stmt / LocalId)->location();

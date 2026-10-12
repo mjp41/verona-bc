@@ -8,7 +8,7 @@ class @Foo
 
 func @main(): none
   $x = const i32 99
-  $foo = stack @Foo($x)
+  $foo = new @Foo($x)
   $ref = ref $foo @a
   $r0 = call @func1($foo)
   $r1 = call @func1($x)

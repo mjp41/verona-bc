@@ -9,10 +9,10 @@ class @A
 
 func @main(): none 
     $true = const bool true 
-    $b1 = region rc @B($true)
-    // add reference from frame local to a region, then parent the region
+    $b1 = new @B($true)
+    // Create two objects that share the same child in the opposite order.
     $a1 = new @A($b1)
-    $a2 = region rc @A($b1)
+    $a2 = new @A($b1)
     
     $ret_val = const i32 42 
     $_ = ffi @set_exit_code($ret_val)

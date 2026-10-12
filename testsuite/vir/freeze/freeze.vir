@@ -15,32 +15,32 @@ class @Pair
     @fst : dyn
     @snd : dyn
 
-// Test 1: Simple freeze of a single-object region.
+// Test 1: Simple freeze of a single object.
 func @test_simple() : i32
     $v = const i32 10
-    $a = region rc @Leaf($v)
+    $a = new @Leaf($v)
     $frozen = freeze $a
     $ref = ref $frozen @val
     $r = load $ref
     ret $r
 
-// Test 2: Box -> Leaf in same region. Read val from Box itself.
+// Test 2: Box -> Leaf chain. Read val from Box itself.
 func @test_chain() : i32
     $v1 = const i32 2
-    $leaf = region rc @Leaf($v1)
+    $leaf = new @Leaf($v1)
     $v2 = const i32 99
-    $box = heap $leaf @Box($leaf, $v2)
+    $box = new @Box($leaf, $v2)
     $frozen = freeze $box
     $ref_val = ref $frozen @val
     $r = load $ref_val
     ret $r
 
-// Test 3: Two objects in same region, freeze from one.
+// Test 3: Freeze an object that refers to another object.
 func @test_forward() : i32
     $v1 = const i32 5
-    $leaf = region rc @Leaf($v1)
+    $leaf = new @Leaf($v1)
     $v2 = const i32 88
-    $box = heap $leaf @Box($leaf, $v2)
+    $box = new @Box($leaf, $v2)
     $frozen = freeze $box
     $ref_val = ref $frozen @val
     $r = load $ref_val
@@ -49,25 +49,25 @@ func @test_forward() : i32
 // Test 4: Diamond. Multiple paths to same leaf. Read val from Pair child.
 func @test_diamond() : i32
     $v = const i32 42
-    $leaf = region rc @Leaf($v)
+    $leaf = new @Leaf($v)
     $v1 = const i32 10
-    $b1 = heap $leaf @Box($leaf, $v1)
+    $b1 = new @Box($leaf, $v1)
     $v2 = const i32 20
-    $b2 = heap $leaf @Box($leaf, $v2)
-    $pair = heap $leaf @Pair($b1, $b2)
+    $b2 = new @Box($leaf, $v2)
+    $pair = new @Pair($b1, $b2)
     $_frozen = freeze $pair
     // Read val from b2 directly (we still hold the register).
     $ref_val = ref $b2 @val
     $r = load $ref_val
     ret $r
 
-// Test 5: Partial freeze. Region has objects not reachable from root.
+// Test 5: Freezing one object does not affect an unreachable object.
 func @test_partial() : i32
     $v1 = const i32 100
-    $a = region rc @Leaf($v1)
+    $a = new @Leaf($v1)
     $v2 = const i32 200
-    $b = heap $a @Leaf($v2)
-    // Freeze only $a. $b is in the same region but not reachable from $a.
+    $b = new @Leaf($v2)
+    // Freeze only $a. $b is not reachable from $a.
     $frozen = freeze $a
     $ref_a = ref $frozen @val
     $ra = load $ref_a
@@ -76,7 +76,7 @@ func @test_partial() : i32
     $r = add $ra $rb
     ret $r
 
-// Test 6: Frame-local freeze.
+// Test 6: Freeze another single object.
 func @test_frame_local() : i32
     $v = const i32 77
     $a = new @Leaf($v)
@@ -85,12 +85,12 @@ func @test_frame_local() : i32
     $r = load $ref
     ret $r
 
-// Test 7: Sub-region freeze.
-func @test_subregion() : i32
+// Test 7: Freeze a nested object graph.
+func @test_nested() : i32
     $v1 = const i32 11
-    $inner = region rc @Leaf($v1)
+    $inner = new @Leaf($v1)
     $v2 = const i32 22
-    $outer = region rc @Box($inner, $v2)
+    $outer = new @Box($inner, $v2)
     $frozen = freeze $outer
     $ref_val = ref $frozen @val
     $r = load $ref_val
@@ -99,7 +99,7 @@ func @test_subregion() : i32
 // Test 8: Freeze the same source twice by explicitly retaining it.
 func @test_double_freeze() : i32
     $v = const i32 55
-    $a = region rc @Leaf($v)
+    $a = new @Leaf($v)
     $a_to_freeze = copy $a
     $_f1 = freeze $a_to_freeze
     $f2 = freeze $a
@@ -189,7 +189,7 @@ func @main(): none
     jump ^t7a
     ^t7a
 
-    $r7 = call @test_subregion()
+    $r7 = call @test_nested()
     $e7 = const i32 22
     $ok7 = eq $r7 $e7
     cond $ok7 ^t8 ^f7

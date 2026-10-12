@@ -38,9 +38,9 @@ func @test_return_drag(): i32
 func @test_aliasing(): i32
   $three = const i32 3
   $four = const i32 4
-  $target = region rc @Target($three)
+  $target = new @Target($three)
   $target_ref = ref $target @value
-  $aliases = heap $target @Aliases($target_ref, $target_ref)
+  $aliases = new @Aliases($target_ref, $target_ref)
 
   drop $target_ref
   drop $target
@@ -64,12 +64,12 @@ func @test_cycle_freeze(): i32
   $none = const none
   $five = const i32 5
   $six = const i32 6
-  $root = region rc @Node($none, $five)
-  $child = heap $root @Node($root, $six)
+  $root = new @Node($none, $five)
+  $child = new @Node($root, $six)
   $next_ref = ref $root @next
   $previous = store $next_ref $child
   $value_ref = ref $root @value
-  $graph = heap $root @FrozenGraph($root, $value_ref)
+  $graph = new @FrozenGraph($root, $value_ref)
 
   drop $previous
   drop $value_ref

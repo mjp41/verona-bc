@@ -146,9 +146,9 @@ namespace virc
             kill(node / Rhs);
             def(node / LocalId);
           }
-          else if (node->in({HeapArray, Add, Sub, Mul, Div,     Mod,  Pow, And,
-                             Or,        Xor, Shl, Shr, Eq,      Ne,   Lt,  Le,
-                             Gt,        Ge,  Min, Max, LogBase, Atan2}))
+          else if (node->in({Add, Sub, Mul, Div,     Mod,  Pow, And,
+                             Or,  Xor, Shl, Shr,     Eq,   Ne,  Lt,
+                             Le,  Gt,  Ge,  Min,     Max,  LogBase, Atan2}))
           {
             use(node / Lhs);
             use(node / Rhs);
@@ -199,11 +199,6 @@ namespace virc
             use(node / Rhs);
             def(node / LocalId);
           }
-          else if (node == HeapArrayConst)
-          {
-            use(node / Lhs);
-            def(node / LocalId);
-          }
           else if (node == Merge)
           {
             use(node / Lhs);
@@ -240,7 +235,7 @@ namespace virc
 
             def(node / LocalId);
           }
-          else if (node->in({NewArray, StackArray, RegionArray}))
+          else if (node == NewArray)
           {
             use(node / Rhs);
             def(node / LocalId);
@@ -249,8 +244,6 @@ namespace virc
                      {Const,
                       ConstStr,
                       NewArrayConst,
-                      StackArrayConst,
-                      RegionArrayConst,
                       FieldRef,
                       ArrayRefConst,
                       FFI,
@@ -301,12 +294,12 @@ namespace virc
         },
         [&](auto node) {
           // Handle these in post, because the arguments will be pushed first.
-          if (node->in({Heap, CallDyn, TryCallDyn, WhenDyn}))
+          if (node->in({CallDyn, TryCallDyn, WhenDyn}))
           {
             use(node / Rhs);
             def(node / LocalId);
           }
-          else if (node->in({New, Stack, Region, Call, When}))
+          else if (node->in({New, Call, When}))
           {
             def(node / LocalId);
           }

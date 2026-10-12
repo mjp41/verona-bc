@@ -778,28 +778,10 @@ namespace vbc
         return os << "Convert";
       case Op::New:
         return os << "New";
-      case Op::Stack:
-        return os << "Stack";
-      case Op::Heap:
-        return os << "Heap";
-      case Op::Region:
-        return os << "Region";
       case Op::NewArray:
         return os << "NewArray";
       case Op::NewArrayConst:
         return os << "NewArrayConst";
-      case Op::StackArray:
-        return os << "StackArray";
-      case Op::StackArrayConst:
-        return os << "StackArrayConst";
-      case Op::HeapArray:
-        return os << "HeapArray";
-      case Op::HeapArrayConst:
-        return os << "HeapArrayConst";
-      case Op::RegionArray:
-        return os << "RegionArray";
-      case Op::RegionArrayConst:
-        return os << "RegionArrayConst";
       case Op::Copy:
         return os << "Copy";
       case Op::Move:
@@ -1173,52 +1155,6 @@ namespace vbci
         break;
       }
 
-      case Op::Stack:
-      {
-        process(
-          [](
-            Register& dst, Class& cls, Thread& self, Frame& frame, Stack& stack)
-            INLINE {
-              self.check_args(cls.fields);
-              auto mem = stack.alloc(cls.size);
-              auto obj =
-                &Object::create(mem, cls, frame.frame_id)->init(frame, cls);
-              frame.push_finalizer(obj);
-              dst = ValueTransfer(obj);
-            });
-        break;
-      }
-
-      case Op::Heap:
-      {
-        process([](
-                  Register& dst,
-                  const Register& region_loc,
-                  Class& cls,
-                  Thread& self,
-                  Frame& frame) INLINE {
-          auto region = region_loc->region();
-          self.check_args(cls.fields);
-          dst = ValueTransfer(&region->object(cls)->init(frame, cls));
-        });
-        break;
-      }
-
-      case Op::Region:
-      {
-        process([](
-                  Register& dst,
-                  Constant<RegionType> region_type,
-                  Class& cls,
-                  Thread& self,
-                  Frame& frame) INLINE {
-          self.check_args(cls.fields);
-          auto region = Region::create(region_type);
-          dst = ValueTransfer(&region->object(cls)->init(frame, cls));
-        });
-        break;
-      }
-
       case Op::NewArray:
       {
         process([](
@@ -1239,85 +1175,6 @@ namespace vbci
                   Constant<size_t> size,
                   Frame& frame) INLINE {
           dst = ValueTransfer(frame.region->array(type_id, size));
-        });
-        break;
-      }
-
-      case Op::StackArray:
-      {
-        process([](
-                  Register& dst,
-                  Stack& stack,
-                  const Register& size,
-                  Constant<size_t> type_id,
-                  Frame& frame) INLINE {
-          dst = ValueTransfer(
-            stack.array(frame.frame_id, type_id, size->get_size()));
-        });
-        break;
-      }
-
-      case Op::StackArrayConst:
-      {
-        process([](
-                  Register& dst,
-                  Constant<size_t> type_id,
-                  Constant<size_t> size,
-                  Stack& stack,
-                  Frame& frame) INLINE {
-          dst = ValueTransfer(stack.array(frame.frame_id, type_id, size));
-        });
-        break;
-      }
-
-      case Op::HeapArray:
-      {
-        process([](
-                  Register& dst,
-                  const Register& region_loc,
-                  const Register& size,
-                  Constant<size_t> type_id) INLINE {
-          auto region = region_loc->region();
-          dst = ValueTransfer(region->array(type_id, size->get_size()));
-        });
-        break;
-      }
-
-      case Op::HeapArrayConst:
-      {
-        process([](
-                  Register& dst,
-                  const Register& region_loc,
-                  Constant<size_t> type_id,
-                  Constant<size_t> size) INLINE {
-          auto region = region_loc->region();
-          dst = ValueTransfer(region->array(type_id, size));
-        });
-        break;
-      }
-
-      case Op::RegionArray:
-      {
-        process([](
-                  Register& dst,
-                  Constant<RegionType> region_type,
-                  const Register& size,
-                  Constant<size_t> type_id) INLINE {
-          auto region = Region::create(region_type);
-          dst = ValueTransfer(region->array(type_id, size->get_size()));
-        });
-        break;
-      }
-
-      case Op::RegionArrayConst:
-      {
-        process([](
-                  Register& dst,
-                  Constant<RegionType> region_type,
-                  Constant<size_t> type_id,
-                  Constant<size_t> size) INLINE {
-          auto region = Region::create(region_type);
-          dst = ValueTransfer(region->array(type_id, size));
         });
         break;
       }

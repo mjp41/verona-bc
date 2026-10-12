@@ -402,7 +402,7 @@ namespace vc
     Node create_params = Params;
     Node create_args = Args;
     Node new_args = NewArgs;
-    Node stack_new_args = NewArgs;
+    Node block_new_args = NewArgs;
 
     // Prepend self param to apply_params.
     // Use $self to avoid conflicts with a captured outer "self".
@@ -420,9 +420,7 @@ namespace vc
       create_args << field.create_arg;
       new_args
         << (NewArg << (Ident ^ field.name) << (Expr << (LocalId ^ field.name)));
-      // For blocks, build NewArgs with the actual creation-site expressions
-      // instead of LocalId references (since there's no create method).
-      stack_new_args
+      block_new_args
         << (NewArg << (Ident ^ field.name) << clone(field.create_arg));
     }
 
@@ -431,8 +429,6 @@ namespace vc
 
     if (is_block)
     {
-      // Blocks don't have a create method. The object is stack-allocated
-      // directly at the call site, so it never escapes.
       class_def =
         ClassDef << None << (Ident ^ id) << typeparams << Where
                  << (classbody
@@ -440,7 +436,8 @@ namespace vc
                                   << full_apply_params << apply_ret_type
                                   << Where << apply_body));
 
-      create_expr = Stack << (Type << clone(fq_tn_create)) << stack_new_args;
+      create_expr =
+        NewWithType << (Type << clone(fq_tn_create)) << block_new_args;
     }
     else
     {

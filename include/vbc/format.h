@@ -44,90 +44,24 @@ namespace vbc
     // Arg1 = class ID.
     Singleton,
 
-    // Allocates a new object in the frame-local region. Fields are initialized
-    // from arguments. The class must not be a singleton (i.e. must have at
-    // least one field); use Singleton for empty classes instead.
+    // Allocates a new managed object. Fields are initialized from arguments.
+    // The class must not be a singleton (i.e. must have at least one field);
+    // use Singleton for empty classes instead.
     // Arg0 = dst.
     // Arg1 = class ID.
     New,
 
-    // Allocates a new object in the current frame. Fields are initialized from
-    // arguments. The class must not be a singleton; use Singleton for empty
-    // classes instead.
-    // Arg0 = dst.
-    // Arg1 = class ID.
-    Stack,
-
-    // Allocates a new object in the same region. Fields are initialized from
-    // arguments. The class must not be a singleton; use Singleton for empty
-    // classes instead.
-    // Arg0 = dst.
-    // Arg1 = allocation in the target region.
-    // Arg2 = class ID.
-    Heap,
-
-    // Allocates a new object in a new region. Fields are initialized from
-    // arguments. The class must not be a singleton — singletons are immortal
-    // and cannot be region entry points; this is enforced by the compiler
-    // and asserted by the runtime.
-    // Arg0 = dst.
-    // Arg1 = region type.
-    // Arg2 = class ID.
-    Region,
-
-    // Allocates a new array in the frame-local region. The array is
-    // uninitialized.
+    // Allocates a new managed array. The array is uninitialized.
     // Arg0 = dst.
     // Arg1 = size.
     // Arg2 = content type ID.
     NewArray,
 
-    // Allocates a new array in the frame-local region. The array is
-    // uninitialized.
+    // Allocates a new managed array. The array is uninitialized.
     // Arg0 = dst.
     // Arg1 = content type ID.
     // Arg2 = constant size.
     NewArrayConst,
-
-    // Allocates a new array in the current frame. The array is uninitialized.
-    // Arg0 = dst.
-    // Arg1 = size.
-    // Arg2 = content type ID.
-    StackArray,
-
-    // Allocates a new array in the current frame. The array is uninitialized.
-    // Arg0 = dst.
-    // Arg1 = content type ID.
-    // Arg2 = constant size.
-    StackArrayConst,
-
-    // Allocates a new array in the same region. The array is uninitialized.
-    // Arg0 = dst.
-    // Arg1 = allocation in the target region.
-    // Arg2 = size.
-    // Arg3 = content type ID.
-    HeapArray,
-
-    // Allocates a new array in the same region. The array is uninitialized.
-    // Arg0 = dst.
-    // Arg1 = allocation in the target region.
-    // Arg2 = content type ID.
-    // Arg3 = constant size.
-    HeapArrayConst,
-
-    // Allocates a new array in a new region. The array is uninitialized.
-    // Arg0 = dst.
-    // Arg1 = region type.
-    // Arg2 = size.
-    // Arg3 = content type ID.
-    RegionArray,
-
-    // Allocates a new array in a new region. The array is uninitialized.
-    // Arg0 = dst.
-    // Arg1 = region type.
-    // Arg2 = content type ID.
-    // Arg3 = constant size.
-    RegionArrayConst,
 
     // Copies the value.
     // Arg0 = dst.
@@ -483,12 +417,6 @@ namespace vbc
     Tuple,
   };
 
-  enum class RegionType : uint8_t
-  {
-    RegionRC,
-    RegionArena
-  };
-
   enum class DIOp : uint8_t
   {
     File,
@@ -510,11 +438,6 @@ namespace vbc
   inline constexpr size_t operator+(TypeTag v)
   {
     return static_cast<size_t>(v);
-  }
-
-  inline constexpr size_t operator+(RegionType r)
-  {
-    return static_cast<size_t>(r);
   }
 
   inline constexpr size_t operator+(DIOp c)

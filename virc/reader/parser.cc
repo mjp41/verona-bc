@@ -5,8 +5,8 @@ namespace virc
   const auto wfParserTokens = Lib | Type | Primitive | Class | Func | Memo |
     Vars | Source | GlobalId | LocalId | LabelId | Equals | LParen | RParen |
     LBracket | RBracket | Comma | Colon | Union | TupleType | Vararg |
-    wfRegionType | wfPrimitiveType | Dyn | Ref | Cown | wfStatement |
-    wfTerminator | wfLiteral | String | RawString;
+    wfPrimitiveType | Dyn | Ref | Cown | wfStatement | wfTerminator |
+    wfLiteral | String | RawString;
 
   // clang-format off
   const auto wfParser =
@@ -36,10 +36,6 @@ namespace virc
         "memo\\b" >> [](auto& m) { m.add(Memo); },
         "var\\b" >> [](auto& m) { m.add(Vars); },
 
-        // Region types.
-        "rc\\b" >> [](auto& m) { m.add(RegionRC); },
-        "arena\\b" >> [](auto& m) { m.add(RegionArena); },
-
         // Types.
         "none\\b" >> [](auto& m) { m.add(None); },
         "bool\\b" >> [](auto& m) { m.add(Bool); },
@@ -66,9 +62,6 @@ namespace virc
         "const\\b" >> [](auto& m) { m.add(Const); },
         "convert\\b" >> [](auto& m) { m.add(Convert); },
         "new\\b" >> [](auto& m) { m.add(New); },
-        "stack\\b" >> [](auto& m) { m.add(Stack); },
-        "heap\\b" >> [](auto& m) { m.add(Heap); },
-        "region\\b" >> [](auto& m) { m.add(Region); },
         "copy\\b" >> [](auto& m) { m.add(Copy); },
         "move\\b" >> [](auto& m) { m.add(Move); },
         "drop\\b" >> [](auto& m) { m.add(Drop); },

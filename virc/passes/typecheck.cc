@@ -683,7 +683,7 @@ namespace virc
           else
             set_type(env, node / LocalId, Dyn);
         }
-        else if (node->in({New, Stack, Heap, Region}))
+        else if (node == New)
         {
           // dst gets the ClassId type. Check arg types vs field types.
           auto class_id = node / ClassId;
@@ -721,18 +721,13 @@ namespace virc
 
           set_type(env, node / LocalId, clone(class_id));
         }
-        else if (node->in({NewArray, StackArray}))
+        else if (node == NewArray)
         {
           // dst gets the array type (node / Type is already the full type,
           // e.g. Array(I32) for [i32]).
           set_type(env, node / LocalId, clone(node / Type));
         }
-        else if (node->in({NewArrayConst, StackArrayConst}))
-        {
-          set_type(env, node / LocalId, clone(node / Type));
-        }
-        else if (node->in(
-                   {HeapArray, HeapArrayConst, RegionArray, RegionArrayConst}))
+        else if (node == NewArrayConst)
         {
           set_type(env, node / LocalId, clone(node / Type));
         }

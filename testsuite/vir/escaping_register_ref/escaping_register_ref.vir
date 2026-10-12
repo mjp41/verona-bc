@@ -8,9 +8,9 @@ class @Holder
 
 func @main(): none var $value
   $one = const i32 1
-  $target = region rc @Target($one)
+  $target = new @Target($one)
   $target_ref = ref $target @value
-  $holder = heap $target @Holder($target_ref)
+  $holder = new @Holder($target_ref)
 
   $value = const i32 1
   $register_ref = ref $value

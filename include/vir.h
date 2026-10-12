@@ -30,10 +30,6 @@ namespace vir
   inline const auto LocalId = TokenDef("localid", flag::print);
   inline const auto LabelId = TokenDef("labelid", flag::print);
 
-  // Region types.
-  inline const auto RegionRC = TokenDef("rc");
-  inline const auto RegionArena = TokenDef("arena");
-
   // Types.
   inline const auto None = TokenDef("none");
   inline const auto Bool = TokenDef("bool");
@@ -62,17 +58,8 @@ namespace vir
   inline const auto Convert = TokenDef("convert");
   inline const auto Singleton = TokenDef("singleton");
   inline const auto New = TokenDef("new");
-  inline const auto Stack = TokenDef("stack");
-  inline const auto Heap = TokenDef("heap");
-  inline const auto Region = TokenDef("region");
   inline const auto NewArray = TokenDef("newarray");
   inline const auto NewArrayConst = TokenDef("newarrayconst");
-  inline const auto StackArray = TokenDef("stackarray");
-  inline const auto StackArrayConst = TokenDef("stackarrayconst");
-  inline const auto HeapArray = TokenDef("heaparray");
-  inline const auto HeapArrayConst = TokenDef("heaparrayconst");
-  inline const auto RegionArray = TokenDef("regionarray");
-  inline const auto RegionArrayConst = TokenDef("regionarrayconst");
   inline const auto Copy = TokenDef("copy");
   inline const auto Move = TokenDef("move");
   inline const auto Drop = TokenDef("drop");
@@ -228,8 +215,6 @@ namespace vir
   inline const auto Kind = TokenDef("kind");
   inline const auto ValueSrc = TokenDef("valuesrc");
 
-  inline const auto wfRegionType = RegionRC | RegionArena;
-
   inline const auto wfIntType =
     I8 | I16 | I32 | I64 | U8 | U16 | U32 | U64 | ILong | ULong | ISize | USize;
   inline const auto wfFloatType = F32 | F64;
@@ -254,14 +239,13 @@ namespace vir
     Const_E | Const_Pi | Const_Inf | Const_NaN | AddExternal | RemoveExternal;
 
   inline const auto wfStatement = Source | Offset | Const | ConstStr | Convert |
-    Singleton | New | Stack | Heap | Region | NewArray | NewArrayConst |
-    StackArray | StackArrayConst | HeapArray | HeapArrayConst | RegionArray |
-    RegionArrayConst | Copy | Move | Drop | AtTeardown | Freeze | Pin | Unpin |
-    Merge | FFIStruct | FFILoad | FFIStore | RegisterRef | FieldRef | ArrayRef |
-    ArrayRefConst | Load | Store | Lookup | Arg | Call | CallDyn | TryCallDyn |
-    FFI | When | WhenDyn | GetRaise | SetRaise | wfBinop | wfUnop | wfNulop |
-    Typetest | MakeCallback | CodePtrCallback | FreeCallback | MemoSlot |
-    ArrayCopy | ArrayFill | ArrayCompare;
+    Singleton | New | NewArray | NewArrayConst | Copy | Move | Drop |
+    AtTeardown | Freeze | Pin | Unpin | Merge | FFIStruct | FFILoad | FFIStore |
+    RegisterRef | FieldRef | ArrayRef | ArrayRefConst | Load | Store | Lookup |
+    Arg | Call | CallDyn | TryCallDyn | FFI | When | WhenDyn | GetRaise |
+    SetRaise | wfBinop | wfUnop | wfNulop | Typetest | MakeCallback |
+    CodePtrCallback | FreeCallback | MemoSlot | ArrayCopy | ArrayFill |
+    ArrayCompare;
 
   inline const auto wfTerminator =
     Tailcall | TailcallDyn | Return | Raise | Cond | Jump;
@@ -270,7 +254,6 @@ namespace vir
   inline const auto wfSrc = (Rhs >>= LocalId);
   inline const auto wfLhs = (Lhs >>= LocalId);
   inline const auto wfRhs = (Rhs >>= LocalId);
-  inline const auto wfRgn = (Region >>= wfRegionType);
   inline const auto wfLit = (Rhs >>= wfIntLiteral);
   inline const auto wfKind = (Kind >>= LocalId);
   inline const auto wfValueSrc = (ValueSrc >>= LocalId);
@@ -317,17 +300,8 @@ namespace vir
     | (Convert <<= wfDst * (Type >>= wfPrimitiveType) * wfSrc)
     | (Singleton <<= wfDst * ClassId)
     | (New <<= wfDst * ClassId * Args)
-    | (Stack <<= wfDst * ClassId * Args)
-    | (Heap <<= wfDst * wfSrc * ClassId * Args)
-    | (Region <<= wfDst * wfRgn * ClassId * Args)
     | (NewArray <<= wfDst * (Type >>= wfType) * wfRhs)
     | (NewArrayConst <<= wfDst * (Type >>= wfType) * wfLit)
-    | (StackArray <<= wfDst * (Type >>= wfType) * wfRhs)
-    | (StackArrayConst <<= wfDst * (Type >>= wfType) * wfLit)
-    | (HeapArray <<= wfDst * wfLhs * (Type >>= wfType) * wfRhs)
-    | (HeapArrayConst <<= wfDst * wfLhs * (Type >>= wfType) * wfLit)
-    | (RegionArray <<=  wfDst * wfRgn * (Type >>= wfType) * wfRhs)
-    | (RegionArrayConst <<= wfDst * wfRgn * (Type >>= wfType) * wfLit)
     | (Copy <<= wfDst * wfSrc)
     | (Move <<= wfDst * wfSrc)
     | (Drop <<= LocalId)

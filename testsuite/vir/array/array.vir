@@ -26,8 +26,8 @@ func @ref_i32_store($a: ref i32, $v: i32): i32
 
 func @main(): none
   $i = const usize 10
-  $a = stack [i32] $i
-  $b = stack [i32] 10
+  $a = new [i32] $i
+  $b = new [i32] 10
   $c = call @array_i32_create($i)
   $a0 = ref $a 0
   $idx = const usize 0

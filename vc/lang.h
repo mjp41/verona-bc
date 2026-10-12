@@ -79,6 +79,7 @@ namespace vc
   inline const auto Binop = TokenDef("binop");
   inline const auto Unop = TokenDef("unop");
   inline const auto Nulop = TokenDef("nulop");
+  inline const auto NewWithType = TokenDef("newwithtype");
   inline const auto NewArgs = TokenDef("newargs");
   inline const auto NewArg = TokenDef("newarg");
 
@@ -117,7 +118,7 @@ namespace vc
       FieldRef,
       Load,
       New,
-      Stack,
+      NewWithType,
       If,
       Else,
       While,
@@ -151,7 +152,7 @@ namespace vc
 
   inline const auto wfExprStructure = ExprSeq | DontCare | TripleColon |
     wfLiteral | Char | String | RawString | Tuple | ArrayLit | Let | Var | New |
-    Stack | Lambda | Ref | FuncName | Dot | If | Else | While | When | Equals |
+    Lambda | Ref | FuncName | Dot | If | Else | While | When | Equals |
     Hash | FieldRef | GetRaise | SetRaise | MatchExpr | SplatLet |
     SplatDontCare;
 
@@ -216,7 +217,6 @@ namespace vc
     | (Var <<= Ident * Type)[Ident]
     | (SplatLet <<= Ident)[Ident]
     | (New <<= NewArgs)
-    | (Stack <<= Type * NewArgs)
     | (NewArgs <<= NewArg++)
     | (NewArg <<= Ident * Expr)
     | (Break <<= Expr)
@@ -243,8 +243,8 @@ namespace vc
   // clang-format on
 
   inline const auto wfExprSugar =
-    (wfExprIdent | Load | Call | GetRaise | SetRaise | Stack | Typetest | Unop |
-     TryCallDyn) -
+    (wfExprIdent | Load | Call | GetRaise | SetRaise | Typetest | Unop |
+     TryCallDyn | NewWithType) -
     Lambda - MatchExpr;
   inline const auto wfBodySugar = wfBodyIdent | TypedMove;
 
@@ -252,6 +252,7 @@ namespace vc
   inline const auto wfPassSugar =
       wfPassIdent
     | (Body <<= wfBodySugar++)
+    | (NewWithType <<= Type * NewArgs)
     | (When <<= Args * Type * Expr)
     | (ParamDef <<= Ident * Type)[Ident]
     | (Call <<= FuncName * Args)
@@ -326,7 +327,7 @@ namespace vc
   // clang-format on
 
   inline const auto wfBodyANF = Const | ConstStr | Convert | Copy | Move |
-    TypedMove | RegisterRef | FieldRef | ArrayRef | ArrayRefConst | New | Stack |
+    TypedMove | RegisterRef | FieldRef | ArrayRef | ArrayRefConst | New |
     NewArray | NewArrayConst | Load | Store | Lookup | Call | CallDyn |
     TryCallDyn | Var | When | wfBinop | wfUnop | wfNulop | FFI | Typetest |
     TypeAssertion | GetRaise | SetRaise | SplatOp | ArrayRefFromEnd |
@@ -356,7 +357,6 @@ namespace vc
     | (SplatOp <<=
         wfDst * Arg * (Lhs >>= wfIntLiteral) * (Rhs >>= wfIntLiteral))
     | (New <<= wfDst * Type * NewArgs)
-    | (Stack <<= wfDst * Type * NewArgs)
     | (NewArg <<= Ident * wfSrc)
     | (NewArray <<= wfDst * Type * wfSrc)
     | (NewArrayConst <<= wfDst * Type * wfLit)

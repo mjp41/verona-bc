@@ -9,8 +9,8 @@ class @B
 
 func @main(): none 
     $true = const bool true
-    $b1 = region rc @B($true)
-    $a1 = heap $b1 @A($b1) 
+    $b1 = new @B($true)
+    $a1 = new @A($b1)
     $ret_val = const i32 42 
     $_ = ffi @set_exit_code($ret_val)
     $_none = const none

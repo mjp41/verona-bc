@@ -47,14 +47,14 @@ func @behavior2_apply($self: @behavior2, $promise_v: ref i32): none
 
 func @main(): none var $_: none
   $bool = const bool true
-  $closure_bool = region arena @closure_bool($bool)
+  $closure_bool = new @closure_bool($bool)
   $be1 = lookup $closure_bool @apply
   $cown1 = when $be1($closure_bool): bool
   $i32 = const i32 42
-  $closure_i32 = region arena @closure_i32($i32)
+  $closure_i32 = new @closure_i32($i32)
   $cown2 = when @closure_i32_apply($closure_i32): i32
   $ro_cown2 = read $cown2
-  $closure1 = region arena @behavior1($i32)
+  $closure1 = new @behavior1($i32)
   $promise = when @behavior1_apply($closure1, $cown1, $ro_cown2): i32
   $ro_promise = read $promise
   $closure2 = new @behavior2()

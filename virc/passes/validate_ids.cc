@@ -180,7 +180,7 @@ namespace virc
           return NoChange;
         },
 
-        T(New, Stack, Heap, Region)[New] >> [state](Match& _) -> Node {
+        T(New)[New] >> [state](Match& _) -> Node {
           auto alloc = _(New);
           auto id = state->get_class_id(alloc / ClassId);
 

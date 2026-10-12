@@ -10,10 +10,10 @@ func @main(): none
   $len = const usize 1
   $zero = const usize 0
   $two = const i32 2
-  $array = region rc [i32] $len
+  $array = new [i32] $len
   $element_ref = ref $array $zero
   $previous = store $element_ref $two
-  $holder = region rc @Holder($element_ref)
+  $holder = new @Holder($element_ref)
 
   drop $previous
   drop $element_ref

@@ -94,6 +94,18 @@ namespace vc
           },
 
         // New.
+        In(Expr) * T(NewWithType)
+            << (T(Type)[Type] * T(NewArgs)[NewArgs]) >>
+          [](Match& _) {
+            auto args = _(NewArgs);
+            auto type = _(Type);
+            auto id = _.fresh(l_local);
+            return Seq << (Lift << Body
+                                << (New << (LocalId ^ id) << type << args))
+                       << (LocalId ^ id);
+          },
+
+        // New.
         In(Expr) * T(New) << T(NewArgs)[NewArgs] >>
           [](Match& _) {
             auto args = _(NewArgs);
@@ -101,17 +113,6 @@ namespace vc
             return Seq << (Lift << Body
                                 << (New << (LocalId ^ id)
                                         << make_selftype(args, true) << args))
-                       << (LocalId ^ id);
-          },
-
-        // Stack (block allocation).
-        In(Expr) * T(Stack) << (T(Type)[Type] * T(NewArgs)[NewArgs]) >>
-          [](Match& _) {
-            auto args = _(NewArgs);
-            auto type = _(Type);
-            auto id = _.fresh(l_local);
-            return Seq << (Lift << Body
-                                << (Stack << (LocalId ^ id) << type << args))
                        << (LocalId ^ id);
           },
 

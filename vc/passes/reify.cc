@@ -399,7 +399,7 @@ namespace vc
                     merge_refined_type(dst_it->second, src_it->second);
                 }
               }
-              else if (stmt->in({New, Stack}))
+              else if (stmt == New)
               {
                 local_types[(stmt / LocalId)->location()] =
                   clone(stmt / ClassId);
@@ -2548,7 +2548,7 @@ namespace vc
                   break;
 
                 if (
-                  stmt->in({New, Stack}) &&
+                  stmt == New &&
                   ((stmt / LocalId)->location() == trace_loc))
                 {
                   callback_type = clone(stmt / ClassId);
@@ -2822,7 +2822,7 @@ namespace vc
             var_locs.push_back((n / Ident)->location());
             remove.push_back(n);
           }
-          else if (n->in({New, Stack}))
+          else if (n == New)
           {
             // Save the type before reify_new transforms the node.
             auto new_type = reify_emitted_type(
@@ -3265,7 +3265,7 @@ namespace vc
             }
           }
 
-          // Check local_types first (works for New/Stack and typed function
+          // Check local_types first (works for New and typed function
           // wrappers that resolve to a concrete lambda class).
           auto it = local_types.find(ret_loc);
 

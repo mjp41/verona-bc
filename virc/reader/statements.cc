@@ -16,7 +16,6 @@ namespace virc
   const auto FloatLiteral = T(Float, HexFloat);
 
   const auto Dst = T(LocalId)[LocalId] * T(Equals);
-  const auto RegionType = T(RegionRC, RegionArena);
   const auto SymbolParams = T(LParen) *
     (~(TypePat * (T(Comma) * TypePat)++))[Params] *
     ~(T(Comma) * T(Vararg)[Vararg]) * T(RParen);
@@ -219,12 +218,6 @@ namespace virc
           VarDef,
           NewArray,
           NewArrayConst,
-          StackArray,
-          StackArrayConst,
-          HeapArray,
-          HeapArrayConst,
-          RegionArray,
-          RegionArrayConst,
           Typetest) *
             T(GlobalId)[GlobalId] >>
           [](Match& _) { return ClassId ^ _(GlobalId); },
@@ -370,26 +363,6 @@ namespace virc
                        << callargs(_[Args]);
           },
 
-        Dst * T(Stack) * T(GlobalId)[GlobalId] * CallArgs[Args] >>
-          [](Match& _) {
-            return Stack << _(LocalId) << (ClassId ^ _(GlobalId))
-                         << callargs(_[Args]);
-          },
-
-        Dst * T(Heap) * T(LocalId)[Rhs] * T(GlobalId)[GlobalId] *
-            CallArgs[Args] >>
-          [](Match& _) {
-            return Heap << _(LocalId) << _(Rhs) << (ClassId ^ _(GlobalId))
-                        << callargs(_[Args]);
-          },
-
-        Dst * T(Region) * RegionType[Rhs] * T(GlobalId)[GlobalId] *
-            CallArgs[Args] >>
-          [](Match& _) {
-            return Region << _(LocalId) << _(Rhs) << (ClassId ^ _(GlobalId))
-                          << callargs(_[Args]);
-          },
-
         // Array allocation.
         Dst * T(New) * T(Array)[Type] * T(LocalId)[Rhs] >>
           [](Match& _) { return NewArray << _(LocalId) << _(Type) << _(Rhs); },
@@ -401,49 +374,6 @@ namespace virc
               return r;
 
             return NewArrayConst << _(LocalId) << _(Type) << _(Rhs);
-          },
-
-        Dst * T(Stack) * T(Array)[Type] * T(LocalId)[Rhs] >>
-          [](Match& _) {
-            return StackArray << _(LocalId) << _(Type) << _(Rhs);
-          },
-
-        Dst * T(Stack) * T(Array)[Type] * IntLiteral[Rhs] >>
-          [](Match& _) {
-            auto r = check_literal(U64, _(Rhs));
-            if (r)
-              return r;
-
-            return StackArrayConst << _(LocalId) << _(Type) << _(Rhs);
-          },
-
-        Dst * T(Heap) * T(LocalId)[Lhs] * T(Array)[Type] * T(LocalId)[Rhs] >>
-          [](Match& _) {
-            return HeapArray << _(LocalId) << _(Lhs) << _(Type) << _(Rhs);
-          },
-
-        Dst * T(Heap) * T(LocalId)[Lhs] * T(Array)[Type] * IntLiteral[Rhs] >>
-          [](Match& _) {
-            auto r = check_literal(U64, _(Rhs));
-            if (r)
-              return r;
-
-            return HeapArrayConst << _(LocalId) << _(Lhs) << _(Type) << _(Rhs);
-          },
-
-        Dst * T(Region) * RegionType[Lhs] * T(Array)[Type] * T(LocalId)[Rhs] >>
-          [](Match& _) {
-            return RegionArray << _(LocalId) << _(Lhs) << _(Type) << _(Rhs);
-          },
-
-        Dst * T(Region) * RegionType[Lhs] * T(Array)[Type] * IntLiteral[Rhs] >>
-          [](Match& _) {
-            auto r = check_literal(U64, _(Rhs));
-            if (r)
-              return r;
-
-            return RegionArrayConst << _(LocalId) << _(Lhs) << _(Type)
-                                    << _(Rhs);
           },
 
         // Register operations.

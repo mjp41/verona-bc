@@ -6,7 +6,7 @@ class @Box
 
 func @main(): none
     $zero = const i32 0
-    $box = region rc @Box($zero)
+    $box = new @Box($zero)
     $p = pin $box
     $u = unpin $box
     $_ = ffi @set_exit_code($zero)

@@ -10,7 +10,7 @@ class @B
 func @main(): none
     $i = const i32 42
     $a =  new @A($i)
-    $b = region rc @B($a)
+    $b = new @B($a)
     $_ = ffi @set_exit_code($i)
     $_none = const none
     ret $_none

@@ -12,10 +12,10 @@ func @Foo_final($self: @Foo): i32
 
 func @main(): none
   $a = const i32 99
-  $foo0 = stack @Foo($a)
-  $foo1 = region rc @Foo($a)
-  $foo2 = heap $foo1 @Foo($a)
-  $foo3 = region arena @Foo($a)
+  $foo0 = new @Foo($a)
+  $foo1 = new @Foo($a)
+  $foo2 = new @Foo($a)
+  $foo3 = new @Foo($a)
   $r = const i32 3
   $_ = ffi @set_exit_code($r)
   $_none = const none

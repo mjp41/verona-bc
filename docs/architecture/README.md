@@ -10,6 +10,10 @@ This directory contains cross-component decisions and policies. See
 Accepted ADRs are historical records. If a decision changes, add a new ADR that
 supersedes the old one rather than rewriting the original context.
 
+## Design Audits
+
+- [Copy runtime opcode audit](copy-runtime-opcode-audit.md)
+
 ## Component Flow
 
 **Current:** the migration described by ADR 0001 implements this component

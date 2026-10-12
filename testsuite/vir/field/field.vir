@@ -6,7 +6,7 @@ class @A
 
 func @main(): none
   $i = const i32 99
-  $a = stack @A($i)
+  $a = new @A($i)
   $ref = ref $a @f
   $j = load $ref
   $_ = ffi @set_exit_code($j)
