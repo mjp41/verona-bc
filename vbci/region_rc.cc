@@ -80,4 +80,18 @@ namespace vbci
 
     delete this;
   }
+
+  void RegionRC::absorb(Region* source_region)
+  {
+    assert(source_region != this);
+    auto* source = static_cast<RegionRC*>(source_region);
+    assert(!source->finalizing);
+
+    for (auto* header : source->headers)
+      header->set_location(Location(this));
+
+    headers.merge(source->headers);
+    source->transfer_stack_rc_to(this);
+    delete source;
+  }
 }

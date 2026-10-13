@@ -1,6 +1,5 @@
 #pragma once
 
-#include "region.h"
 #include "register.h"
 #include "stack.h"
 #include "value.h"
@@ -12,7 +11,6 @@ namespace vbci
 {
   struct Frame
   {
-    Region* region;
     Function* func;
     Location frame_id;
     Stack::Idx save;
@@ -42,7 +40,6 @@ namespace vbci
     void push_finalizer(Object* obj);
     void drop();
     void drop_args(size_t& args);
-    Region& get_frame_local_region() const;
     void check_var_type(size_t reg_idx, Program& prog) const;
   };
 }

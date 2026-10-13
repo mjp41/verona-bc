@@ -12,6 +12,7 @@ material.
 
 ## Contributors
 
+- [Known implementation issues](known-issues.md)
 - [Architecture decisions and policies](architecture/README.md)
 - [VC compiler pipeline](../vc/docs/20-compiler-pipeline.md)
 - [VIRC internals](../virc/docs/README.md)

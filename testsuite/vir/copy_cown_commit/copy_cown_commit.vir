@@ -1,6 +1,7 @@
-// Acquiring a writable cown does not copy its state. The state is copied back
-// when the behavior completes, including on error. Readonly acquisitions
-// observe the committed state without another copy. Expected exit: 0.
+// Acquiring a writable cown does not copy its state. Every writable cown,
+// including the result cown, receives a fresh copy when the behavior completes,
+// including on error. Readonly acquisitions observe the committed state
+// without another copy. Expected exit: 0.
 
 lib
   @set_exit_code = "set_exit_code"(i32): none
@@ -61,12 +62,13 @@ func @mutate_then_error($state_ref: ref @State): none
 
   $original_ref = ref $state @original_address
   $original_address = load $original_ref
-  $address_ok = eq $left_address $original_address
+  $same_original = eq $left_address $original_address
+  $address_ok = not $same_original
 
   $count_ref = ref $state @copy_count
   $count = load $count_ref
-  $zero = const i32 0
-  $count_ok = eq $count $zero
+  $count_one = const i32 1
+  $count_ok = eq $count $count_one
   $execution_ok = and $address_ok $count_ok
   $execution_ok_ref = ref $state @execution_ok
   $_old_ok = store $execution_ok_ref $execution_ok
@@ -110,8 +112,8 @@ func @check_committed($state_ref: ref @State): none
 
   $count_ref = ref $state @copy_count
   $count = load $count_ref
-  $one = const i32 1
-  $count_ok = eq $count $one
+  $two = const i32 2
+  $count_ok = eq $count $two
   $execution_ok_ref = ref $state @execution_ok
   $execution_ok = load $execution_ok_ref
   $value_ref = ref $state @value

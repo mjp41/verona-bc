@@ -27,9 +27,7 @@ namespace vbci
     pc(pc),
     dst(dst),
     raise_target(frame_id)
-  {
-    region = Region::create(RegionType::RegionRC, frame_id.stack_index() + 1);
-  }
+  {}
 
   Register& Frame::local(size_t idx)
   {
@@ -95,11 +93,6 @@ namespace vbci
 
     for (size_t i = 0; i < num_args; i++)
       locals[base + func->registers + i].clear();
-  }
-
-  Region& Frame::get_frame_local_region() const
-  {
-    return *region;
   }
 
   void Frame::check_var_type(size_t idx, Program& prog) const

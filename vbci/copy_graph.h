@@ -3,6 +3,7 @@
 namespace vbci
 {
   struct Cown;
+  struct Region;
   struct Register;
 
   /**
@@ -10,6 +11,7 @@ namespace vbci
    * whose semantic lifetimes continue in the copy.
    */
   Register copy_graph_and_consume(Register root);
+  Register copy_graph_and_consume(Register root, Region& destination);
 
   void copy_graph_and_consume(Cown& cown);
 }

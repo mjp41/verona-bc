@@ -1,6 +1,6 @@
 #pragma once
 
-#include "drag.h"
+
 #include "ident.h"
 #include "location.h"
 #include "region.h"
@@ -105,34 +105,8 @@ namespace vbci
       to->insert(this);
     }
 
-    bool sendable()
-    {
-      if (loc.is_stack())
-        return false;
-
-      if (loc.is_region())
-      {
-        auto r = loc.to_region();
-
-        if (r->is_frame_local())
-        {
-          // Drag a frame-local allocation to a fresh region.
-          auto nr = Region::create(RegionType::RegionRC);
-
-          if (!drag_allocation<false>(nr, this))
-            return false;
-
-          return nr->sendable();
-        }
-
-        return r->sendable();
-      }
-
-      return true;
-    }
-
-    // Increment RC for a reference held in a register or frame-local context.
-    // Adjusts both object RC and region stack_rc.
+    // Increment RC for a reference held outside the object's allocation group.
+    // Adjusts both object RC and the allocation group's stack_rc.
     void reg_inc()
     {
       if (loc.is_scc_ptr())
@@ -147,8 +121,8 @@ namespace vbci
         loc.to_region()->stack_inc();
     }
 
-    // Decrement RC for a reference held in a register or frame-local context.
-    // Adjusts both object RC and region stack_rc. Collects if RC hits 0.
+    // Decrement RC for a reference held outside the object's allocation group.
+    // Adjusts both object RC and the allocation group's stack_rc.
     void reg_dec()
     {
       if (loc.is_scc_ptr())

@@ -1,4 +1,5 @@
-// A wrapper caches its state's address. After freeze, the post-copy hook repairs
+// A wrapper caches its state's address. After freeze, the post-copy hook
+// allocates a replacement state in the destination allocation group and repairs
 // the copied wrapper's cache. Both resulting graphs must cache their own state
 // address, and the two state objects must be disjoint. This does not assume
 // whether freeze copies the returned graph or the continuation's graph.
@@ -16,6 +17,8 @@ class @Wrapper
 
 func @wrapper_post_copy($self: @Wrapper): none
   $state_ref = ref $self @state
+  $replacement = new @State()
+  $_old_state = store $state_ref $replacement
   $state = load $state_ref
   $state_ptr = makeptr $state
   $state_address = convert usize $state_ptr

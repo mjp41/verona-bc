@@ -5,7 +5,6 @@ add_executable(vbci
   classes.cc
   collect.cc
   copy_graph.cc
-  drag.cc
   dynlib.cc
   frame.cc
   freeze.cc

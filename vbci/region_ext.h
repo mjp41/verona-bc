@@ -4,37 +4,18 @@
 #include "object.h"
 #include "program.h"
 #include "region.h"
-#include "region_arena.h"
 #include "region_rc.h"
 
 namespace vbci
 {
   void Region::trace_fn(auto&& fn) const
   {
-    switch (type)
-    {
-      case RegionType::RegionRC:
-        static_cast<const RegionRC*>(this)->trace_fn(fn);
-        break;
-
-      case RegionType::RegionArena:
-        static_cast<const RegionArena*>(this)->trace_fn(fn);
-        break;
-    }
+    static_cast<const RegionRC*>(this)->trace_fn(fn);
   }
 
   void Region::for_each_header(auto&& fn) const
   {
-    switch (type)
-    {
-      case RegionType::RegionRC:
-        static_cast<const RegionRC*>(this)->for_each_header(fn);
-        break;
-
-      case RegionType::RegionArena:
-        static_cast<const RegionArena*>(this)->for_each_header(fn);
-        break;
-    }
+    static_cast<const RegionRC*>(this)->for_each_header(fn);
   }
 
   void RegionRC::trace_fn(auto&& fn) const

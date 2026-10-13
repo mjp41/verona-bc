@@ -191,17 +191,21 @@ array stores, `arraycopy`, and `arrayfill` must share that rule after the
 region-specific write-barrier logic is removed.
 
 Reference counting and backup cycle detection remain memory-management
-mechanisms. Removing regions must preserve the finalization contract for
-acyclic graphs: an abandoned source image is reclaimed without its user
-finalizer, while each surviving destination image finalizes when its semantic
-lifetime ends. The `freeze`, scheduling, and behavior-completion split paths
-all require this rule. Frame teardown and registered object finalizers must
-continue to participate in the same lifetime accounting. Backup cycle
-detection is deferred, so a cyclic source image may survive source-root
-consumption and later finalize in addition to its destination image. The
-migration must preserve this limitation explicitly, rather than accidentally
-changing finalizer ordering or suppressing unrelated finalizers. The
-reproductions are recorded in
+mechanisms. The prototype retains a cut-down allocation group containing the
+set of allocated object headers. Each dormant cown has a group, and each
+executing behavior has a group that absorbs its writable cown state and
+captured closure. Group membership determines only bulk reclamation
+responsibility; it does not restrict references or operations.
+
+Allocation groups preserve the finalization contract for acyclic graphs: an
+abandoned source image is reclaimed without its user finalizer, while each
+surviving destination image finalizes when its semantic lifetime ends. The
+`freeze`, scheduling, and behavior-completion split paths all require this
+rule. Backup cycle detection is deferred, so a cyclic source image may survive
+source-root consumption and later finalize in addition to its destination
+image. The migration must preserve this limitation explicitly, rather than
+accidentally changing finalizer ordering or suppressing unrelated finalizers.
+The reproductions are recorded in
 [Known Issues](../known-issues.md).
 
 ## Migration order
@@ -232,10 +236,11 @@ reproductions are recorded in
    pinning. All managed allocations already use the generic lifetime model.
 6. **Remove region validation.** Delete region-based sendability and the
    remaining storage-topology error paths.
-7. **Delete unreachable machinery.** Remove region implementations, parent
-   tracking, dragging, merging, and their tests only after frame allocation,
-   cown state, callback capture, pinning, ownership-split copying,
-   finalization, and teardown have no remaining region dependency.
+7. **Reduce regions to allocation groups.** Remove parent tracking, region
+   kinds, frame-local placement, dragging, merging, and their topology tests.
+   Retain only header membership, external-root accounting, and two-phase bulk
+   reclamation. Lins' cyclic reference-counting algorithm can later replace
+   the allocation group's interim role in cyclic garbage collection.
 
 The first implementation work package is allocation canonicalization. The
 second removes `merge` across every producer and consumer. Keeping these as

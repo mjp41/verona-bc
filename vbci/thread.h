@@ -13,7 +13,7 @@
 #include <sched/work.h>
 #include <source_location>
 #include <type_traits>
-#include <unordered_set>
+#include <utility>
 
 namespace vbci
 {
@@ -30,6 +30,7 @@ namespace vbci
     std::vector<Object*> finalize;
 
     Program* program;
+    Region* allocation_group;
     Frame* frame;
     Function* behavior;
     PC current_pc;
@@ -42,9 +43,26 @@ namespace vbci
 #endif
 
   public:
+    class ScopeAllocationGroup
+    {
+      Region* previous;
+
+    public:
+      explicit ScopeAllocationGroup(Region& group)
+      : previous(std::exchange(Thread::get().allocation_group, &group))
+      {}
+
+      ~ScopeAllocationGroup()
+      {
+        Thread::get().allocation_group = previous;
+      }
+
+      ScopeAllocationGroup(const ScopeAllocationGroup&) = delete;
+      ScopeAllocationGroup& operator=(const ScopeAllocationGroup&) = delete;
+    };
+
     static ValueTransfer run_async(uint32_t type_id, Function* func);
     static Register& get_register(uint64_t id);
-    static Region* frame_region_for_stack(Location stack_loc);
     static void check_var_type_for_register(uint64_t raw_idx, const Value& v);
 
     template<typename... Ts>
@@ -82,6 +100,8 @@ namespace vbci
     Thread& operator=(Thread&&) = delete;
 
   private:
+    class EnsureAllocationGroup;
+
     Thread();
     static Thread& get();
     static void run_behavior(verona::rt::Work* work) noexcept;

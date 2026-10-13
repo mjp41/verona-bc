@@ -134,7 +134,6 @@ namespace vbci
     bool is_object() const;
     bool is_array() const;
     bool is_function() const;
-    bool is_sendable() const;
     bool is_cown() const;
     bool is_error() const;
     bool get_bool() const;

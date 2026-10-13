@@ -11,7 +11,6 @@ namespace vbci
   {
     UnknownString,
     UnknownFFI,
-    UnknownRegionType,
     UnknownOpcode,
     BadRaiseTarget,
     BadAllocTarget,
@@ -56,8 +55,6 @@ namespace vbci
         return "unknown string";
       case Error::UnknownFFI:
         return "unknown FFI";
-      case Error::UnknownRegionType:
-        return "unknown region type";
       case Error::UnknownOpcode:
         return "unknown opcode";
       case Error::BadRaiseTarget:

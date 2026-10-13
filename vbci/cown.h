@@ -1,6 +1,5 @@
 #pragma once
 
-#include "drag.h"
 #include "header.h"
 #include "program.h"
 #include "region.h"
@@ -37,8 +36,12 @@ namespace vbci
     LifetimeState lifetime;
     uint32_t type_id;
     Value content;
+    Region* allocation_group;
 
-    Cown(uint32_t type_id) : type_id(type_id) {}
+    Cown(uint32_t type_id)
+    : type_id(type_id),
+      allocation_group(Region::create())
+    {}
 
     static void destroy(Cown* cown) noexcept
     {
@@ -77,26 +80,11 @@ namespace vbci
     ~Cown()
     {
       LOG(Trace) << "Destroying cown @" << this;
-      auto loc = content.location();
-      Region* r = nullptr;
-
-      // Temporarily protect the region from premature free during field_dec.
-      if (loc.is_region())
-      {
-        r = loc.to_region();
-        r->stack_inc();
-      }
-
-      content.field_dec();
+      assert(allocation_group);
+      allocation_group->stack_inc();
+      content.reg_dec();
       content = Value();
-
-      // Release cown ownership of the region.
-      if (r)
-      {
-        r->clear_cown_owner();
-        r->stack_dec();
-      }
-
+      allocation_group->stack_dec();
       LOG(Trace) << "Destroyed cown @" << this;
     }
 
@@ -143,66 +131,43 @@ namespace vbci
       return content;
     }
 
+    Region& get_allocation_group()
+    {
+      assert(allocation_group);
+      return *allocation_group;
+    }
+
+    Region* take_allocation_group()
+    {
+      assert(allocation_group);
+      auto* result = allocation_group;
+      allocation_group = nullptr;
+      return result;
+    }
+
+    void set_allocation_group(Region* region)
+    {
+      assert(region);
+
+      if (allocation_group)
+        allocation_group->free_region();
+
+      allocation_group = region;
+    }
+
     template<bool is_move>
     bool add_reference(Reg<is_move>& next)
     {
-      auto next_loc = next->location();
-
       // Can't store a stack value in a cown.
-      if (next_loc.is_stack())
+      if (next->location().is_stack())
         return false;
 
-      Region* r = nullptr;
-
-      if (next_loc.is_region())
-      {
-        r = next_loc.to_region();
-
-        if (r->is_frame_local())
-        {
-          // Frame-local: drag to a fresh region first.
-          auto nr = Region::create(RegionType::RegionRC);
-          LOG(Trace) << "Dragging frame-local allocation to new region: " << nr;
-
-          if constexpr (is_move)
-            nr->stack_inc();
-
-          if (!drag_allocation<is_move>(nr, next->get_base_header()))
-          {
-            if constexpr (is_move)
-              nr->stack_dec();
-            else
-              nr->free_region();
-
-            return false;
-          }
-
-          r = nr;
-        }
-        else if (r->has_owner())
-        {
-          return false;
-        }
-      }
-
-      // Store the value.
       if constexpr (is_move)
         content = next.extract();
       else
       {
-        next->field_inc();
+        next->reg_inc();
         content = next.borrow();
-      }
-
-      // Set cown ownership on the region.
-      if (r)
-      {
-        r->set_cown_owner(this, content.get_base_header());
-
-        // Remove the register's stack reference, or the temporary guard used
-        // while moving a frame-local graph. The cown now owns the region.
-        if constexpr (is_move)
-          r->stack_dec();
       }
 
       return true;
@@ -217,51 +182,8 @@ namespace vbci
         Value::error(Error::BadType);
 
       Value prev = content;
-      auto prev_loc = prev.location();
-      auto next_loc = next->location();
-
-      // Same location/region: simple swap, no region ownership changes.
-      if (next_loc == prev_loc)
-      {
-        if constexpr (is_move)
-        {
-          content = next.extract();
-        }
-        else
-        {
-          next->field_inc();
-          content = next.borrow();
-
-          if (prev_loc.is_region())
-            prev_loc.to_region()->stack_inc();
-        }
-
-        return ValueTransfer(prev);
-      }
-
-      // Unparent the outgoing region before trying to add the incoming
-      // reference, since add_reference may drag into a region that needs
-      // the cown ownership slot freed.
-      Region* prev_region = nullptr;
-
-      if (prev_loc.is_region())
-      {
-        prev_region = prev_loc.to_region();
-        prev_region->stack_inc();
-        prev_region->clear_cown_owner();
-      }
-
       if (!add_reference<is_move>(next))
-      {
-        // Restore outgoing region ownership on failure.
-        if (prev_region)
-        {
-          prev_region->set_cown_owner(this, content.get_base_header());
-          prev_region->stack_dec();
-        }
-
         Value::error(Error::BadStore);
-      }
 
       return ValueTransfer(prev);
     }

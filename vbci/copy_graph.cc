@@ -126,6 +126,7 @@ namespace vbci
           [&](Header* source) { fill(source); });
 
         // A hook can follow a back edge to a copy that has not yet been filled.
+        Thread::ScopeAllocationGroup scope(region);
         for (auto [post_copy, copy] : post_copies)
           Thread::run_sync(post_copy, ValueBorrow(copy));
 
@@ -133,7 +134,7 @@ namespace vbci
       }
     };
 
-    Register copy_graph_heap(ValueBorrow root)
+    Register copy_graph(ValueBorrow root, Region& region)
     {
       if (!root.is_header())
         return root;
@@ -142,8 +143,13 @@ namespace vbci
       if (loc.is_immutable() || loc.is_immortal())
         return root;
 
-      auto region = Region::create(RegionType::RegionRC);
-      return GraphCopy(*region).run(root);
+      return GraphCopy(region).run(root);
+    }
+
+    Register copy_graph_heap(ValueBorrow root)
+    {
+      auto* region = Region::create();
+      return copy_graph(root, *region);
     }
   }
 
@@ -156,10 +162,21 @@ namespace vbci
     return copy;
   }
 
+  Register copy_graph_and_consume(Register root, Region& destination)
+  {
+    Register copy = copy_graph(root.borrow(), destination);
+
+    SuppressFinalizers suppress;
+    root.clear();
+    return copy;
+  }
+
   void copy_graph_and_consume(Cown& cown)
   {
-    Register copy = copy_graph_heap(cown.load());
+    auto* region = Region::create();
+    Register copy = copy_graph(cown.load(), *region);
     Register source = cown.exchange<true>(std::move(copy));
+    cown.set_allocation_group(region);
 
     SuppressFinalizers suppress;
     source.clear();

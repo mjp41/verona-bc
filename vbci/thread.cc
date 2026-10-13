@@ -4,7 +4,6 @@
 #include "callback.h"
 #include "cown.h"
 #include "copy_graph.h"
-#include "drag.h"
 #include "freeze.h"
 #include "function_signature.h"
 #include "object.h"
@@ -25,6 +24,47 @@
 
 namespace vbci
 {
+  namespace
+  {
+    struct BehaviorBody
+    {
+      Value function;
+      Value closure;
+      Region* closure_group;
+    };
+  }
+
+  class Thread::EnsureAllocationGroup
+  {
+    Region* owned_group = nullptr;
+
+  public:
+    EnsureAllocationGroup()
+    {
+      auto& thread = Thread::get();
+      if (thread.allocation_group != nullptr)
+        return;
+
+      owned_group = Region::create();
+      owned_group->acquire_owner();
+      thread.allocation_group = owned_group;
+    }
+
+    ~EnsureAllocationGroup()
+    {
+      if (owned_group == nullptr)
+        return;
+
+      auto& thread = Thread::get();
+      assert(thread.allocation_group == owned_group);
+      thread.allocation_group = nullptr;
+      owned_group->release_owner();
+    }
+
+    EnsureAllocationGroup(const EnsureAllocationGroup&) = delete;
+    EnsureAllocationGroup& operator=(const EnsureAllocationGroup&) = delete;
+  };
+
   template<typename>
   struct always_false : std::false_type
   {};
@@ -326,6 +366,12 @@ namespace vbci
           process<F, Args..., Thread&>(
             self, fun, std::forward<Args>(args)..., self);
         }
+        else if constexpr (std::is_same_v<T, Region&>)
+        {
+          assert(self.allocation_group != nullptr);
+          process<F, Args..., Region&>(
+            self, fun, std::forward<Args>(args)..., *self.allocation_group);
+        }
         else if constexpr (std::is_same_v<T, Class&>)
         {
           load_class_param<F, Args...>(self, fun, std::forward<Args>(args)...);
@@ -377,17 +423,15 @@ namespace vbci
     if (!Program::get().subtype(func->return_type, result->content_type_id()))
       Value::error(Error::BadType);
 
-    auto construction =
-      BehaviourCore::make(1, sizeof(Value) * 2, alignof(Value), run_behavior);
+    auto construction = BehaviourCore::make(
+      1, sizeof(BehaviorBody), alignof(BehaviorBody), run_behavior);
     BehaviourCore::initialise_request(
       construction,
       0,
       result,
       verona::rt::AccessMode::Write,
       verona::rt::Ownership::Borrowed);
-    auto values = static_cast<Value*>(construction.body);
-    new (&values[0]) Value(func);
-    new (&values[1]) Value();
+    new (construction.body) BehaviorBody{Value(func), Value(), nullptr};
     BehaviourCore::schedule(BehaviourCore::finish_construction(construction));
 
     // Safe to convert to use Register this only contains a cown pointer, so
@@ -405,19 +449,14 @@ namespace vbci
       return {t.behavior, t.current_pc};
   }
 
-  Thread::Thread() : program(&Program::get()), frame(nullptr), args(0)
+  Thread::Thread()
+  : program(&Program::get()),
+    allocation_group(nullptr),
+    frame(nullptr),
+    args(0)
   {
     frames.reserve(16);
     locals.resize(1024);
-  }
-
-  Region* Thread::frame_region_for_stack(Location stack_loc)
-  {
-    assert(stack_loc.is_stack());
-    auto& t = get();
-    auto idx = stack_loc.stack_index();
-    assert(idx < t.frames.size());
-    return t.frames.at(idx).region;
   }
 
   Thread& Thread::get()
@@ -440,25 +479,20 @@ namespace vbci
   {
     assert(!frame);
     assert(!args);
+    assert(allocation_group == nullptr);
+    allocation_group = Region::create();
+    allocation_group->acquire_owner();
     auto b = BehaviourCore::from_work(work);
-    auto values = b->get_body<Value>();
-    behavior = values[0].function();
-    auto& closure = values[1];
+    auto* body = b->get_body<BehaviorBody>();
+    behavior = body->function.function();
+    auto& closure = body->closure;
 
     if (!closure.is_invalid())
     {
-      if (closure.is_header())
+      if (body->closure_group)
       {
-        auto r = closure.get_header()->region();
-
-        if (r && r->has_cown_owner())
-        {
-          // stack_inc to prevent auto-free during clear_cown_owner.
-          // This becomes the register's stack ref — reg_dec on
-          // teardown will balance it.
-          r->stack_inc();
-          r->clear_cown_owner();
-        }
+        allocation_group->absorb(body->closure_group);
+        body->closure_group = nullptr;
       }
 
       locals.at(args++) = ValueTransfer(closure);
@@ -480,7 +514,10 @@ namespace vbci
       // cown->inc() — don't add another or it will leak (the readonly
       // slot release path doesn't release the move RC with successors).
       if (!is_readonly)
+      {
+        allocation_group->absorb(cown->take_allocation_group());
         cown->inc();
+      }
 
       locals.at(args++) = ValueTransfer(cown, is_readonly);
     }
@@ -502,14 +539,14 @@ namespace vbci
       outcome = ValueImmortal(error_value);
     }
 
-    for (size_t i = 1; i < num_cowns; i++)
+    // Store the function return value in the result cown.
+    Register r = result->exchange<true>(std::move(outcome));
+
+    for (size_t i = 0; i < num_cowns; i++)
     {
       if (b->acquired_mode(i) != verona::rt::AccessMode::Read)
         copy_graph_and_consume(*b->acquired_cown(i));
     }
-
-    // Store the function return value in the result cown.
-    Register r = result->exchange<true>(std::move(outcome));
 
 #ifndef NDEBUG
     {
@@ -519,11 +556,18 @@ namespace vbci
     }
 #endif
 
+    auto* completed_group = allocation_group;
+    allocation_group = nullptr;
+
+    completed_group->release_owner();
+
     BehaviourCore::finished(work);
   }
 
   Register Thread::thread_run(Function* func)
   {
+    EnsureAllocationGroup ensure_allocation_group;
+
     auto depth = frames.size();
     Register saved;
     bool preserve_parent_local0 = frame != nullptr;
@@ -575,6 +619,7 @@ namespace vbci
     }
 
     LOG(Trace) << "thread_run completed! Result: " << result;
+
     return result;
   }
 
@@ -662,15 +707,6 @@ namespace vbci
     std::unordered_map<Region*, size_t> calc_stack_rcs;
 
     auto visit_region = [&](Region* region) {
-      // Walk parent chain for every region we have not already seen.
-      // This accounts for the edge triggered stack RC from children to parents.
-      while (calc_stack_rcs.find(region) == calc_stack_rcs.end() &&
-             region->has_parent())
-      {
-        calc_stack_rcs[region] = 1;
-        region = region->get_parent();
-      }
-
       calc_stack_rcs[region] += 1;
     };
 
@@ -686,10 +722,6 @@ namespace vbci
 
       auto region = loc.to_region();
 
-      // Frame-local regions skip stack RC accounting.
-      if (region->is_frame_local())
-        return;
-
       visit_region(region);
     };
 
@@ -699,19 +731,20 @@ namespace vbci
       visit_value(reg);
     }
 
-    auto visit_header = [&](Header* h) {
+    auto visit_header = [&](Header* h, Region* store_region = nullptr) {
       if (!h->location().is_region())
         return;
 
       auto r = h->location().to_region();
 
-      if (!r->is_frame_local() && !r->has_cown_owner())
+      if (r != store_region)
         visit_region(r);
     };
 
-    for (auto& frame : frames)
+    if (allocation_group != nullptr)
     {
-      frame.get_frame_local_region().trace_fn(visit_header);
+      allocation_group->trace_fn(
+        [&](Header* h) { visit_header(h, allocation_group); });
     }
 
     stack.visit_headers({}, stack.top, [&](Header* h) {
@@ -1144,11 +1177,15 @@ namespace vbci
 
       case Op::New:
       {
-        process(
-          [](Register& dst, Class& cls, Thread& self, Frame& frame) INLINE {
-            self.check_args(cls.fields);
-            dst = ValueTransfer(&frame.region->object(cls)->init(frame, cls));
-          });
+        process([](
+                  Register& dst,
+                  Class& cls,
+                  Thread& self,
+                  Frame& frame,
+                  Region& allocation_group) INLINE {
+          self.check_args(cls.fields);
+          dst = ValueTransfer(&allocation_group.object(cls)->init(frame, cls));
+        });
         break;
       }
 
@@ -1158,8 +1195,9 @@ namespace vbci
                   Register& dst,
                   const Register& size,
                   Constant<size_t> type_id,
-                  Frame& frame) INLINE {
-          dst = ValueTransfer(frame.region->array(type_id, size->get_size()));
+                  Region& allocation_group) INLINE {
+          dst =
+            ValueTransfer(allocation_group.array(type_id, size->get_size()));
         });
         break;
       }
@@ -1170,8 +1208,8 @@ namespace vbci
                   Register& dst,
                   Constant<size_t> type_id,
                   Constant<size_t> size,
-                  Frame& frame) INLINE {
-          dst = ValueTransfer(frame.region->array(type_id, size));
+                  Region& allocation_group) INLINE {
+          dst = ValueTransfer(allocation_group.array(type_id, size));
         });
         break;
       }
@@ -1204,20 +1242,6 @@ namespace vbci
           auto* apply = callback->method(CallbackMethodId);
           if (!apply)
             Value::error(Error::MethodNotFound);
-
-          auto location = callback->location();
-          if (location.is_stack())
-            Value::error(Error::BadStackEscape);
-
-          if (location.is_region() && location.to_region()->is_frame_local())
-          {
-            auto* region = Region::create(RegionType::RegionRC);
-            if (!drag_allocation<false>(region, callback->get_header()))
-            {
-              region->free_region();
-              Value::error(Error::BadStackEscape);
-            }
-          }
 
           auto* work = verona::rt::Closure::make(
             [callback = std::move(callback), apply](verona::rt::Work*) mutable {
@@ -1815,7 +1839,7 @@ namespace vbci
         process([](
                   Register& dst,
                   Constant<size_t> layout_type_id,
-                  Frame& frame,
+                  Region& allocation_group,
                   Program& program) INLINE {
           std::vector<ValueType> kinds;
           std::vector<ffi_type*> reps;
@@ -1845,9 +1869,9 @@ namespace vbci
           auto kinds_type_id = program.get_typeid_arg();
 
           auto* offsets_arr =
-            frame.region->array(offsets_type_id, offsets.size());
-          auto* kinds_arr = frame.region->array(kinds_type_id, kinds.size());
-          auto* tuple_arr = frame.region->array(result_type_id, 3);
+            allocation_group.array(offsets_type_id, offsets.size());
+          auto* kinds_arr = allocation_group.array(kinds_type_id, kinds.size());
+          auto* tuple_arr = allocation_group.array(result_type_id, 3);
 
           for (size_t i = 0; i < offsets.size(); i++)
           {
@@ -2135,29 +2159,6 @@ namespace vbci
       // The return value can't be stack allocated in this frame.
       Value::error(Error::BadStackEscape);
     }
-    else if (retloc.is_region() && retloc.to_region() == frame->region)
-    {
-      if (frames.size() > 1)
-      {
-        // Drag the frame-local allocation to the previous frame's region.
-        auto& prev_frame = frames.at(frames.size() - 2);
-
-        if (!drag_allocation<false>(prev_frame.region, ret->get_base_header()))
-          Value::error(Error::BadStackEscape);
-      }
-      else
-      {
-        // Drag the frame-local allocation to a fresh region.
-        auto r = Region::create(RegionType::RegionRC);
-        // This is a fresh region, so we need the stack rc from the entry, so do
-        // not count this as a move.
-        if (!drag_allocation<false>(r, ret->get_base_header()))
-        {
-          r->free_region();
-          Value::error(Error::BadStackEscape);
-        }
-      }
-    }
 
     // Check the return type.
     if (
@@ -2201,18 +2202,6 @@ namespace vbci
       Value::error(Error::BadStackEscape);
     }
 
-    if (
-      retloc.is_region() && retloc.to_region()->is_frame_local() &&
-      (retloc.to_region()->get_frame_depth() > (target.stack_index() + 1)))
-    {
-      // Frame-local in a frame younger than the target. Drag it to the
-      // target frame's region so it survives intermediate teardowns.
-      auto target_region = frame_region_for_stack(target);
-
-      if (!drag_allocation<false>(target_region, ret->get_base_header()))
-        Value::error(Error::BadStackEscape);
-    }
-
     // Tear down all intermediate frames.
     while (frame->frame_id != target)
     {
@@ -2231,7 +2220,7 @@ namespace vbci
     if (!func)
       Value::error(Error::MethodNotFound);
 
-    // Preserve the frame-local region.
+    // Preserve the behaviour allocation group.
     teardown(true);
     check_args(func->param_types);
 
@@ -2259,6 +2248,7 @@ namespace vbci
 
   void Thread::teardown(bool tailcall)
   {
+    (void)tailcall;
     LOG(Trace) << "Tearing down frame " << program->di_function(frame->func);
     // Drop all frame registers.
     frame->drop();
@@ -2270,13 +2260,6 @@ namespace vbci
       else
         static_cast<Object*>(h)->finalize();
     });
-
-    // Finalize the frame-local region. A tailcall preserves the region.
-    if (!tailcall)
-    {
-      assert(frame->region->is_frame_local());
-      collect(frame->region);
-    }
 
     // Pop the stack.
     stack.restore(frame->save);
@@ -2443,19 +2426,6 @@ namespace vbci
     {
       closure_copy =
         copy_graph_and_consume(std::move(closure_source));
-
-      if (!closure_copy->is_sendable())
-      {
-        auto h = closure_copy->get_header();
-        auto r = h->region();
-        LOG(Error) << "Closure argument is not sendable: "
-                   << closure_copy.borrow()
-                   << " in region " << r << " stack_rc=" << r->get_stack_rc()
-                   << " has_parent=" << r->has_parent()
-                   << " has_cown=" << r->has_cown_owner()
-                   << " frame_local=" << r->is_frame_local();
-        Value::error(Error::BadStackEscape);
-      }
     }
 
     if (!program->subtype(func->return_type, program->uncown(type_id)))
@@ -2472,7 +2442,10 @@ namespace vbci
 
     // Request 0 is the result cown.
     auto construction = BehaviourCore::make(
-      num_cowns + 1, sizeof(Value) * 2, alignof(Value), run_behavior);
+      num_cowns + 1,
+      sizeof(BehaviorBody),
+      alignof(BehaviorBody),
+      run_behavior);
     BehaviourCore::initialise_request(
       construction,
       0,
@@ -2495,57 +2468,15 @@ namespace vbci
         verona::rt::Ownership::Transferred);
     }
 
-    auto values = static_cast<Value*>(construction.body);
-    new (&values[0]) Value(func);
-    new (&values[1]) Value();
+    auto* body = new (construction.body)
+      BehaviorBody{Value(func), Value(), nullptr};
 
     if (is_closure)
     {
       auto& closure = closure_copy;
-
-      if (closure->is_header())
-      {
-        auto r = closure->get_header()->region();
-
-        // Set the region parent, as it's captured by the behavior.
-        if (r)
-        {
-          if (!r->has_owner())
-          {
-            LOG(Trace) << "Setting closure (" << closure.borrow()
-                       << ") region owner: " << r << " to cown owner.";
-            r->set_cown_owner(nullptr, closure->get_header());
-          }
-          else
-          {
-            LOG(Trace) << "Closure (" << closure.borrow()
-                       << ") region already has owner: " << r;
-          }
-        }
-      }
-
-      // Save the closure region before extract clears the register.
-      Region* closure_region = nullptr;
-
-      if (closure->is_header())
-      {
-        auto h = closure->get_header();
-
-        if (h->region() && !h->region()->is_frame_local())
-          closure_region = h->region();
-      }
-
-      values[1] = closure.extract();
-
-      // The extract moved the value to the behaviour body (raw memory)
-      // without reg_dec. Remove the orphaned stack ref — the behaviour
-      // dispatch will re-establish it with stack_inc.
-      if (closure_region)
-      {
-        LOG(Trace) << "queue_behavior: stack_dec closure region @"
-                   << closure_region;
-        closure_region->stack_dec();
-      }
+      body->closure_group =
+        closure->is_header() ? closure->get_header()->region() : nullptr;
+      body->closure = closure.extract();
     }
 
     BehaviourCore::schedule(BehaviourCore::finish_construction(construction));

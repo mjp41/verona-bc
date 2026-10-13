@@ -18,8 +18,7 @@ namespace vbci
     bool finalizing;
 
   public:
-    RegionRC(RegionType type, size_t frame_depth = 0)
-    : Region(type, frame_depth), finalizing(false)
+    RegionRC() : finalizing(false)
     {
       LOG(Trace) << "Created RegionRC @" << this;
     }
@@ -34,6 +33,7 @@ namespace vbci
     bool begin_finalizing() override;
     void finalize_contents() override;
     void release_dead_objects() override;
+    void absorb(Region* source) override;
 
     ~RegionRC()
     {

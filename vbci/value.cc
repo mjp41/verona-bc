@@ -2,7 +2,6 @@
 
 #include "array.h"
 #include "cown.h"
-#include "drag.h"
 #include "object.h"
 #include "platform.h"
 #include "program.h"
@@ -404,31 +403,6 @@ namespace vbci
   bool Value::is_function() const
   {
     return tag == ValueType::Function;
-  }
-
-  bool Value::is_sendable() const
-  {
-    switch (tag)
-    {
-      case ValueType::Object:
-        return obj->sendable();
-
-      case ValueType::Array:
-        return arr->sendable();
-
-      case ValueType::Cown:
-        return true;
-
-      case ValueType::Ptr:
-      case ValueType::RegisterRef:
-      case ValueType::FieldRef:
-      case ValueType::ArrayRef:
-      case ValueType::CownRef:
-        return false;
-
-      default:
-        return true;
-    }
   }
 
   bool Value::is_cown() const
@@ -857,35 +831,7 @@ namespace vbci
         if (readonly)
           Value::error(Error::BadOperand);
 
-        auto h = get_header();
-        auto loc = h->location();
-
-        if (loc.is_stack())
-          Value::error(Error::BadStackEscape);
-
-        if (loc.is_region() && loc.to_region()->is_frame_local())
-        {
-          auto nr = Region::create(RegionType::RegionRC);
-          LOG(Trace) << "Pin: dragging frame-local allocation to new region @"
-                     << nr;
-
-          if (!drag_allocation<false>(nr, h))
-          {
-            nr->free_region();
-            Value::error(Error::BadStackEscape);
-          }
-        }
-
         reg_inc();
-
-        // Keep the owning cown alive while this object is pinned.
-        if (loc.is_region())
-        {
-          auto* owner = loc.to_region()->get_cown_owner();
-          if (owner)
-            owner->inc();
-        }
-
         return;
       }
 
@@ -904,22 +850,8 @@ namespace vbci
     {
       case ValueType::Object:
       case ValueType::Array:
-      {
-        // Save cown owner before reg_dec (which may modify the region).
-        Cown* owner = nullptr;
-        auto h = get_header();
-        auto loc = h->location();
-        if (loc.is_region())
-          owner = loc.to_region()->get_cown_owner();
-
         reg_dec();
-
-        // Release the cown reference after all region access.
-        if (owner)
-          owner->dec();
-
         return;
-      }
 
       case ValueType::Cown:
         reg_dec();
@@ -1065,26 +997,6 @@ namespace vbci
 
         if (vloc.is_stack() && (vloc.stack_index() > ref_loc.stack_index()))
           Value::error(Error::BadStoreTarget);
-
-        // If the value is in a frame-local region that is younger than the
-        // register's frame, drag it to the register's frame region.
-        if (vloc.is_region())
-        {
-          auto vr = vloc.to_region();
-
-          if (
-            vr->is_frame_local() &&
-            (vr->get_frame_depth() > (ref_loc.stack_index() + 1)))
-          {
-            // Find the target frame's region by matching stack index.
-            auto target_region = Thread::frame_region_for_stack(ref_loc);
-
-            if (
-              !target_region ||
-              !drag_allocation<is_move>(target_region, v->get_base_header()))
-              Value::error(Error::BadStoreTarget);
-          }
-        }
 
         Register& reg = Thread::get_register(u64);
 

@@ -14,6 +14,10 @@ supersedes the old one rather than rewriting the original context.
 
 - [Copy runtime opcode audit](copy-runtime-opcode-audit.md)
 
+## Planned Designs
+
+- [`when` arguments and FFI callback identity](callback-continuations.md)
+
 ## Component Flow
 
 **Current:** the migration described by ADR 0001 implements this component
