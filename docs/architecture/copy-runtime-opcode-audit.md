@@ -72,6 +72,15 @@ Behavior completion has no dedicated opcode. The interpreter must continue to
 copy writable cown state before releasing acquired cowns. This runtime boundary
 is part of the same ownership-split contract as `freeze` and `when`.
 
+### Teardown callbacks
+
+`atteardown` is another scheduling ownership split. Registration copies and
+consumes the callback graph into a fresh allocation group, and the queued work
+owns that group until it executes at scheduler quiescence. Cleanup runs with
+the callback group as its allocation context, so allocations and mutations
+performed by the callback remain within its graph. Reverse-registration
+execution order is unchanged.
+
 ### Cown-owned state
 
 Creating or replacing cown-owned state currently rejects stack values, drags

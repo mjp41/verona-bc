@@ -1237,8 +1237,15 @@ namespace vbci
           if (!apply)
             Value::error(Error::MethodNotFound);
 
+          auto group = AllocationGroup::create();
+          callback = copy_graph_and_consume(
+            std::move(callback), group.get());
+
           auto* work = verona::rt::Closure::make(
-            [callback = std::move(callback), apply](verona::rt::Work*) mutable {
+            [callback = std::move(callback),
+             group = std::move(group),
+             apply](verona::rt::Work*) mutable {
+              Thread::ScopeAllocationGroup scope(group.get());
               Thread::run_cleanup(apply, callback.borrow());
               return true;
             });

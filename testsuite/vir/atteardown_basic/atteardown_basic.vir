@@ -1,15 +1,25 @@
-// AtTeardown registers callable objects for reverse-registration execution.
+// AtTeardown copies callable objects for reverse-registration execution.
+// Mutating an alias after registration must not change the queued callback.
 // Registering exit codes 42 then 7 must run 7 before 42, replacing main's 99.
 // Broken registration leaves 99; FIFO execution leaves 7. Expected exit: 42.
 
 lib
   @set_exit_code = "set_exit_code"(i32): none
 
+class @State
+  @value: i32
+
 class @Callback
   @code: i32
+  @state: @State
   @callback @callback_apply
 
 func @callback_apply($self: @Callback): none
+  $zero = const i32 0
+  $replacement = new @State($zero)
+  $state_ref = ref $self @state
+  $_old_state = store $state_ref $replacement
+
   $code_ref = ref $self @code
   $code = load $code_ref
   $_ = ffi @set_exit_code($code)
@@ -17,11 +27,18 @@ func @callback_apply($self: @Callback): none
   ret $_none
 
 func @main(): none
+  $zero = const i32 0
   $first_code = const i32 42
-  $first = new @Callback($first_code)
+  $first_state = new @State($zero)
+  $first = new @Callback($first_code, $first_state)
+  $first_alias = copy $first
   atteardown $first
+  $first_code_ref = ref $first_alias @code
+  $changed_code = const i32 1
+  $_old_code = store $first_code_ref $changed_code
   $second_code = const i32 7
-  $second = new @Callback($second_code)
+  $second_state = new @State($zero)
+  $second = new @Callback($second_code, $second_state)
   atteardown $second
   $running = const i32 99
   $_ = ffi @set_exit_code($running)
