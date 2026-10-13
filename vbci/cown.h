@@ -36,11 +36,11 @@ namespace vbci
     LifetimeState lifetime;
     uint32_t type_id;
     Value content;
-    Region* allocation_group;
+    AllocationGroup allocation_group;
 
     Cown(uint32_t type_id)
     : type_id(type_id),
-      allocation_group(Region::create())
+      allocation_group(AllocationGroup::create())
     {}
 
     static void destroy(Cown* cown) noexcept
@@ -81,10 +81,8 @@ namespace vbci
     {
       LOG(Trace) << "Destroying cown @" << this;
       assert(allocation_group);
-      allocation_group->stack_inc();
       content.reg_dec();
       content = Value();
-      allocation_group->stack_dec();
       LOG(Trace) << "Destroyed cown @" << this;
     }
 
@@ -134,25 +132,19 @@ namespace vbci
     Region& get_allocation_group()
     {
       assert(allocation_group);
-      return *allocation_group;
+      return allocation_group.get();
     }
 
-    Region* take_allocation_group()
+    AllocationGroup take_allocation_group()
     {
       assert(allocation_group);
-      auto* result = allocation_group;
-      allocation_group = nullptr;
-      return result;
+      return std::move(allocation_group);
     }
 
-    void set_allocation_group(Region* region)
+    void set_allocation_group(AllocationGroup group)
     {
-      assert(region);
-
-      if (allocation_group)
-        allocation_group->free_region();
-
-      allocation_group = region;
+      assert(group);
+      allocation_group = std::move(group);
     }
 
     template<bool is_move>

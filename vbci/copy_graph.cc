@@ -148,8 +148,8 @@ namespace vbci
 
     Register copy_graph_heap(ValueBorrow root)
     {
-      auto* region = Region::create();
-      return copy_graph(root, *region);
+      auto group = AllocationGroup::create();
+      return copy_graph(root, group.get());
     }
   }
 
@@ -173,10 +173,10 @@ namespace vbci
 
   void copy_graph_and_consume(Cown& cown)
   {
-    auto* region = Region::create();
-    Register copy = copy_graph(cown.load(), *region);
+    auto group = AllocationGroup::create();
+    Register copy = copy_graph(cown.load(), group.get());
     Register source = cown.exchange<true>(std::move(copy));
-    cown.set_allocation_group(region);
+    cown.set_allocation_group(std::move(group));
 
     SuppressFinalizers suppress;
     source.clear();

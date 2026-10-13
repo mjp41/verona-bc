@@ -197,6 +197,12 @@ executing behavior has a group that absorbs its writable cown state and
 captured closure. Group membership determines only bulk reclamation
 responsibility; it does not restrict references or operations.
 
+Allocation-group ownership is represented by a move-only `AllocationGroup`
+handle. Dormant cowns, queued behavior captures, and executing behaviors hold
+these handles explicitly and transfer them when groups are absorbed. The
+thread's current-allocation pointer is only a scoped allocation context; it
+does not itself confer ownership.
+
 Allocation groups preserve the finalization contract for acyclic graphs: an
 abandoned source image is reclaimed without its user finalizer, while each
 surviving destination image finalizes when its semantic lifetime ends. The

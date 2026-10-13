@@ -30,13 +30,13 @@ namespace vbci
     {
       Value function;
       Value closure;
-      Region* closure_group;
+      AllocationGroup closure_group;
     };
   }
 
   class Thread::EnsureAllocationGroup
   {
-    Region* owned_group = nullptr;
+    AllocationGroup owned_group;
 
   public:
     EnsureAllocationGroup()
@@ -45,20 +45,18 @@ namespace vbci
       if (thread.allocation_group != nullptr)
         return;
 
-      owned_group = Region::create();
-      owned_group->acquire_owner();
-      thread.allocation_group = owned_group;
+      owned_group = AllocationGroup::create();
+      thread.allocation_group = &owned_group.get();
     }
 
     ~EnsureAllocationGroup()
     {
-      if (owned_group == nullptr)
+      if (!owned_group)
         return;
 
       auto& thread = Thread::get();
-      assert(thread.allocation_group == owned_group);
+      assert(thread.allocation_group == &owned_group.get());
       thread.allocation_group = nullptr;
-      owned_group->release_owner();
     }
 
     EnsureAllocationGroup(const EnsureAllocationGroup&) = delete;
@@ -431,7 +429,7 @@ namespace vbci
       result,
       verona::rt::AccessMode::Write,
       verona::rt::Ownership::Borrowed);
-    new (construction.body) BehaviorBody{Value(func), Value(), nullptr};
+    new (construction.body) BehaviorBody{Value(func), Value(), {}};
     BehaviourCore::schedule(BehaviourCore::finish_construction(construction));
 
     // Safe to convert to use Register this only contains a cown pointer, so
@@ -480,8 +478,8 @@ namespace vbci
     assert(!frame);
     assert(!args);
     assert(allocation_group == nullptr);
-    allocation_group = Region::create();
-    allocation_group->acquire_owner();
+    auto execution_group = AllocationGroup::create();
+    allocation_group = &execution_group.get();
     auto b = BehaviourCore::from_work(work);
     auto* body = b->get_body<BehaviorBody>();
     behavior = body->function.function();
@@ -490,13 +488,12 @@ namespace vbci
     if (!closure.is_invalid())
     {
       if (body->closure_group)
-      {
-        allocation_group->absorb(body->closure_group);
-        body->closure_group = nullptr;
-      }
+        execution_group.absorb(std::move(body->closure_group));
 
       locals.at(args++) = ValueTransfer(closure);
     }
+
+    body->~BehaviorBody();
 
     // Populate cown arguments.
     auto num_cowns = b->get_count();
@@ -515,7 +512,7 @@ namespace vbci
       // slot release path doesn't release the move RC with successors).
       if (!is_readonly)
       {
-        allocation_group->absorb(cown->take_allocation_group());
+        execution_group.absorb(cown->take_allocation_group());
         cown->inc();
       }
 
@@ -556,10 +553,7 @@ namespace vbci
     }
 #endif
 
-    auto* completed_group = allocation_group;
     allocation_group = nullptr;
-
-    completed_group->release_owner();
 
     BehaviourCore::finished(work);
   }
@@ -2383,6 +2377,7 @@ namespace vbci
     size_t first_cown = 0;
     Register closure_source;
     Register closure_copy;
+    AllocationGroup closure_group;
     std::vector<Register> cown_args;
 
     if (args > 0)
@@ -2424,8 +2419,9 @@ namespace vbci
 
     if (is_closure)
     {
-      closure_copy =
-        copy_graph_and_consume(std::move(closure_source));
+      closure_group = AllocationGroup::create();
+      closure_copy = copy_graph_and_consume(
+        std::move(closure_source), closure_group.get());
     }
 
     if (!program->subtype(func->return_type, program->uncown(type_id)))
@@ -2469,13 +2465,11 @@ namespace vbci
     }
 
     auto* body = new (construction.body)
-      BehaviorBody{Value(func), Value(), nullptr};
+      BehaviorBody{Value(func), Value(), std::move(closure_group)};
 
     if (is_closure)
     {
       auto& closure = closure_copy;
-      body->closure_group =
-        closure->is_header() ? closure->get_header()->region() : nullptr;
       body->closure = closure.extract();
     }
 

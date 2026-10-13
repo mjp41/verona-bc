@@ -8,4 +8,9 @@ namespace vbci
   {
     return new RegionRC;
   }
+
+  AllocationGroup AllocationGroup::create()
+  {
+    return AllocationGroup(Region::create());
+  }
 }

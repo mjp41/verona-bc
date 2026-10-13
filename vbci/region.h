@@ -8,24 +8,51 @@
 
 #include <cstdint>
 #include <iostream>
+#include <utility>
 #include <vector>
 
 namespace vbci
 {
   struct Header;
+  class AllocationGroup;
 
   struct Region
   {
   private:
+    friend class AllocationGroup;
+
     RC stack_rc;
     bool owned;
+
+    static Region* create();
+
+    void acquire_owner()
+    {
+      assert(!owned);
+      owned = true;
+    }
+
+    void release_owner()
+    {
+      assert(owned);
+      owned = false;
+
+      if (stack_rc == 0)
+        free_region();
+    }
+
+    void free_region()
+    {
+      assert(!owned);
+      assert(stack_rc == 0);
+      collect(this);
+    }
 
   protected:
     Region() : stack_rc(0), owned(false) {}
 
   public:
     virtual ~Region() = default;
-    static Region* create();
 
     virtual Object* object(Class& cls) = 0;
     virtual Array* array(uint32_t type_id, size_t size) = 0;
@@ -70,28 +97,6 @@ namespace vbci
       return true;
     }
 
-    void acquire_owner()
-    {
-      assert(!owned);
-      owned = true;
-    }
-
-    void release_owner()
-    {
-      assert(owned);
-      owned = false;
-
-      if (stack_rc == 0)
-        free_region();
-    }
-
-    void free_region()
-    {
-      assert(!owned);
-      assert(stack_rc == 0);
-      collect(this);
-    }
-
     RC get_stack_rc() const
     {
       return stack_rc;
@@ -105,6 +110,70 @@ namespace vbci
         target->stack_inc(stack_rc);
 
       stack_rc = 0;
+    }
+  };
+
+  class AllocationGroup
+  {
+    Region* region = nullptr;
+
+    explicit AllocationGroup(Region* region) : region(region)
+    {
+      assert(region);
+      region->acquire_owner();
+    }
+
+    Region* release()
+    {
+      return std::exchange(region, nullptr);
+    }
+
+  public:
+    AllocationGroup() = default;
+
+    static AllocationGroup create();
+
+    ~AllocationGroup()
+    {
+      if (region)
+        region->release_owner();
+    }
+
+    AllocationGroup(AllocationGroup&& other) noexcept
+    : region(other.release())
+    {}
+
+    AllocationGroup& operator=(AllocationGroup&& other) noexcept
+    {
+      if (this == &other)
+        return *this;
+
+      if (region)
+        region->release_owner();
+
+      region = other.release();
+      return *this;
+    }
+
+    AllocationGroup(const AllocationGroup&) = delete;
+    AllocationGroup& operator=(const AllocationGroup&) = delete;
+
+    explicit operator bool() const
+    {
+      return region != nullptr;
+    }
+
+    Region& get() const
+    {
+      assert(region);
+      return *region;
+    }
+
+    void absorb(AllocationGroup source)
+    {
+      assert(region);
+      assert(source.region);
+      region->absorb(source.release());
     }
   };
 }
