@@ -341,11 +341,12 @@ main(): i32
 
 Passing `handler.raw` does not retain `handler`. If native code stores the
 function pointer for later use, the Verona program must keep the callback object
-alive until the handler is deregistered. Pin the callback or retain it in a
-process-lifetime value, then release it only after the native library can no
-longer call the pointer and all in-progress calls have returned. Native code may
-invoke the same callback concurrently on multiple calling threads; Verona does
-not serialize those invocations, so captured state must be safe for that access
+alive until the handler is deregistered. The current FFI has no general
+foreign-retention operation, so wrappers must not retain callback pointers
+unless the callback is held by a process-lifetime Verona value. A dedicated
+callback owner is planned for shorter native lifetimes. Native code may invoke
+the same callback concurrently on multiple calling threads; Verona does not
+serialize those invocations, so captured state must be safe for that access
 pattern. Asynchronous native resources should also use the external-resource
 tracking wrappers described below.
 
@@ -361,8 +362,6 @@ The `_builtin/ffi/` directory contains Verona wrapper functions for common FFI o
 |----------|-----------|-------------|
 | `ffi::external.add` | `(self: external): none` | Add an external resource (increments the external event count) |
 | `ffi::external.remove` | `(self: external): none` | Remove an external resource (decrements the external event count) |
-| `ffi::pin(x)` | `(x: any): none` | Pin a refcounted Verona value (object, array, or cown) for external use. Pinning a readonly object or array is a runtime error. |
-| `ffi::unpin(x)` | `(x: any): none` | Release a prior external pin |
 | `ffi::struct[A]` | layout helper object | Compute and cache C ABI layout metadata for a single FFI-compatible field type `A` or a flat tuple `(A1, A2, ...)` |
 
 ### External Resource Management
@@ -371,7 +370,10 @@ The runtime tracks "external resources" — things outside the Verona scheduler'
 
 - **`ffi::external.add`** — Tells the scheduler an external resource exists. The scheduler will not shut down while external resources remain.
 - **`ffi::external.remove`** — Tells the scheduler an external resource has been released.
-- **`ffi::pin(x)` / `ffi::unpin(x)`** — Add or remove an external root for a refcounted Verona value. This is intended for low-level FFI wrappers that hand Verona-managed memory to external code. Objects, arrays, and cowns can be pinned. Pinning a frame-local object or array first drags it to a fresh heap region. Pinning a stack allocation is an error.
+
+External-resource tracking affects scheduler quiescence only. It does not keep
+a Verona object, array, cown, or callback alive. A separate explicit ownership
+mechanism is required before native code can retain such values.
 
 ### Raw Struct Layout Helpers
 
@@ -399,7 +401,10 @@ Allowed field types are the FFI-compatible leaf types: primitive scalars, `ptr`,
 
 `load[B]` / `store[B]` check that `B` matches the recorded field kind, then read or write raw memory at `ptr + offsets(index)`. This is intentionally low-level: the runtime can validate the expected Verona kind, but it cannot prove that an arbitrary foreign memory block really contains a valid Verona-managed object graph.
 
-If you store Verona-managed pointer-like values (objects, arrays, cowns) into foreign memory, you are responsible for keeping them alive for as long as the foreign code may use them. Use `ffi::pin` / `ffi::unpin` when appropriate.
+Verona-managed pointer-like values loaded from or stored into foreign memory
+are borrowed for the synchronous FFI interaction. Native code must not retain
+them after the call returns. Explicit retained-buffer and callback-owner APIs
+will define asynchronous lifetimes separately.
 
 The `external` class is a singleton (using `once create()`) that serializes add/remove operations through an internal cown. The dot syntax `ffi::external.add` auto-calls `create()` to get the singleton and then dispatches `.add` on it. See [Functions §7.10](07-functions.md) for more on `once` functions.
 

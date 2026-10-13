@@ -5,13 +5,13 @@
 #include "logging.h"
 #include "platform.h"
 #include "program.h"
+#include "region.h"
 #include "register.h"
 #include "stack.h"
 
 #include <bit>
 #include <functional>
 #include <sched/work.h>
-#include <source_location>
 #include <type_traits>
 #include <utility>
 
@@ -43,6 +43,12 @@ namespace vbci
 #endif
 
   public:
+    struct OwnedRegister
+    {
+      AllocationGroup allocation_group;
+      Register value;
+    };
+
     class ScopeAllocationGroup
     {
       Region* previous;
@@ -66,13 +72,13 @@ namespace vbci
     static void check_var_type_for_register(uint64_t raw_idx, const Value& v);
 
     template<typename... Ts>
-    static Register run_sync(Function* func, Ts&&... argv)
+    static OwnedRegister run_sync(Function* func, Ts&&... argv)
     {
       return get().thread_run_sync(func, std::forward<Ts>(argv)...);
     }
 
     template<typename... Ts>
-    static Register run_cleanup(Function* func, Ts&&... argv)
+    static OwnedRegister run_cleanup(Function* func, Ts&&... argv)
     {
       return get().thread_run_cleanup(func, std::forward<Ts>(argv)...);
     }
@@ -107,15 +113,25 @@ namespace vbci
     static void run_behavior(verona::rt::Work* work) noexcept;
 
     template<typename... Ts>
-    Register thread_run_sync(Function* func, Ts&&... argv)
+    OwnedRegister thread_run_sync(Function* func, Ts&&... argv)
     {
-      assert(args == 0);
-      ((arg(args++) = std::forward<Ts>(argv)), ...);
-      return thread_run(func);
+      auto run = [&]() {
+        assert(args == 0);
+        ((arg(args++) = std::forward<Ts>(argv)), ...);
+        return thread_run(func);
+      };
+
+      if (allocation_group != nullptr)
+        return {{}, run()};
+
+      auto group = AllocationGroup::create();
+      ScopeAllocationGroup scope(group.get());
+      auto value = run();
+      return {std::move(group), std::move(value)};
     }
 
     template<typename... Ts>
-    Register thread_run_cleanup(Function* func, Ts&&... argv)
+    OwnedRegister thread_run_cleanup(Function* func, Ts&&... argv)
     {
       try
       {
@@ -151,10 +167,6 @@ namespace vbci
 
     void print_stack(logging::Log& log, bool top_frame_only = false);
     void print_error_stack(logging::Log& log, const Value& error_value);
-#ifndef NDEBUG
-    void check_stack_rc_invariant(std::source_location);
-#endif
-    void invariant(std::source_location loc = std::source_location::current());
 
     template<typename... Args>
     SNMALLOC_FAST_PATH void trace_instruction(Args&&... args)

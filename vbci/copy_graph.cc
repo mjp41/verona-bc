@@ -110,13 +110,13 @@ namespace vbci
             auto loc = source->location();
             if (loc.is_immutable() || loc.is_immortal())
             {
-              source->field_inc();
+              source->inc();
               return false;
             }
 
             if (auto copy = copies.find(source); copy != copies.end())
             {
-              copy->second->reg_inc();
+              copy->second->inc();
               return false;
             }
 
@@ -146,20 +146,6 @@ namespace vbci
       return GraphCopy(region).run(root);
     }
 
-    Register copy_graph_heap(ValueBorrow root)
-    {
-      auto group = AllocationGroup::create();
-      return copy_graph(root, group.get());
-    }
-  }
-
-  Register copy_graph_and_consume(Register root)
-  {
-    Register copy = copy_graph_heap(root.borrow());
-
-    SuppressFinalizers suppress;
-    root.clear();
-    return copy;
   }
 
   Register copy_graph_and_consume(Register root, Region& destination)

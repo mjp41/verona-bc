@@ -711,7 +711,7 @@ namespace vbci
     Value::error(Error::BadOperand);
   }
 
-  void Value::reg_inc() const
+  void Value::inc() const
   {
     if (readonly)
     {
@@ -720,69 +720,16 @@ namespace vbci
       return;
     }
 
-    field_inc();
-
     switch (tag)
     {
       case ValueType::Object:
       case ValueType::FieldRef:
-      case ValueType::Array:
-      case ValueType::ArrayRef:
-      {
-        auto loc = location();
-        if (loc.is_region())
-          loc.to_region()->stack_inc();
-        break;
-      }
-
-      default:
-        break;
-    }
-  }
-
-  void Value::reg_dec() const
-  {
-    if (readonly)
-    {
-      if (tag == ValueType::Cown)
-        cown->dec();
-      return;
-    }
-
-    switch (tag)
-    {
-      case ValueType::Object:
-      case ValueType::FieldRef:
-      case ValueType::Array:
-      case ValueType::ArrayRef:
-      {
-        auto loc = location();
-        if (loc.is_region() && !loc.to_region()->stack_dec())
-          return;
-        break;
-      }
-
-      default:
-        break;
-    }
-
-    field_dec();
-  }
-
-  void Value::field_inc() const
-  {
-    assert(!readonly);
-
-    switch (tag)
-    {
-      case ValueType::Object:
-      case ValueType::FieldRef:
-        obj->field_inc();
+        obj->inc();
         break;
 
       case ValueType::Array:
       case ValueType::ArrayRef:
-        arr->field_inc();
+        arr->inc();
         break;
 
       case ValueType::Cown:
@@ -795,20 +742,25 @@ namespace vbci
     }
   }
 
-  void Value::field_dec() const
+  void Value::dec() const
   {
-    assert(!readonly);
+    if (readonly)
+    {
+      if (tag == ValueType::Cown)
+        cown->dec();
+      return;
+    }
 
     switch (tag)
     {
       case ValueType::Object:
       case ValueType::FieldRef:
-        obj->field_dec();
+        obj->dec();
         break;
 
       case ValueType::Array:
       case ValueType::ArrayRef:
-        arr->field_dec();
+        arr->dec();
         break;
 
       case ValueType::Cown:
@@ -818,47 +770,6 @@ namespace vbci
 
       default:
         break;
-    }
-  }
-
-  void Value::pin() const
-  {
-    switch (tag)
-    {
-      case ValueType::Object:
-      case ValueType::Array:
-      {
-        if (readonly)
-          Value::error(Error::BadOperand);
-
-        reg_inc();
-        return;
-      }
-
-      case ValueType::Cown:
-        reg_inc();
-        return;
-
-      default:
-        Value::error(Error::BadOperand);
-    }
-  }
-
-  void Value::unpin() const
-  {
-    switch (tag)
-    {
-      case ValueType::Object:
-      case ValueType::Array:
-        reg_dec();
-        return;
-
-      case ValueType::Cown:
-        reg_dec();
-        return;
-
-      default:
-        Value::error(Error::BadOperand);
     }
   }
 

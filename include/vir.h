@@ -65,8 +65,6 @@ namespace vir
   inline const auto Drop = TokenDef("drop");
   inline const auto AtTeardown = TokenDef("atteardown");
   inline const auto Freeze = TokenDef("freeze");
-  inline const auto Pin = TokenDef("pin");
-  inline const auto Unpin = TokenDef("unpin");
   inline const auto FFIStruct = TokenDef("ffistruct");
   inline const auto FFILoad = TokenDef("ffiload");
   inline const auto FFIStore = TokenDef("ffistore");
@@ -239,12 +237,11 @@ namespace vir
 
   inline const auto wfStatement = Source | Offset | Const | ConstStr | Convert |
     Singleton | New | NewArray | NewArrayConst | Copy | Move | Drop |
-    AtTeardown | Freeze | Pin | Unpin | FFIStruct | FFILoad | FFIStore |
-    RegisterRef | FieldRef | ArrayRef | ArrayRefConst | Load | Store | Lookup |
-    Arg | Call | CallDyn | TryCallDyn | FFI | When | WhenDyn | GetRaise |
-    SetRaise | wfBinop | wfUnop | wfNulop | Typetest | MakeCallback |
-    CodePtrCallback | FreeCallback | MemoSlot | ArrayCopy | ArrayFill |
-    ArrayCompare;
+    AtTeardown | Freeze | FFIStruct | FFILoad | FFIStore | RegisterRef |
+    FieldRef | ArrayRef | ArrayRefConst | Load | Store | Lookup | Arg | Call |
+    CallDyn | TryCallDyn | FFI | When | WhenDyn | GetRaise | SetRaise |
+    wfBinop | wfUnop | wfNulop | Typetest | MakeCallback | CodePtrCallback |
+    FreeCallback | MemoSlot | ArrayCopy | ArrayFill | ArrayCompare;
 
   inline const auto wfTerminator =
     Tailcall | TailcallDyn | Return | Raise | Cond | Jump;
@@ -306,8 +303,6 @@ namespace vir
     | (Drop <<= LocalId)
     | (AtTeardown <<= LocalId)
     | (Freeze <<= wfDst * wfSrc)
-    | (Pin <<= wfDst * wfSrc)
-    | (Unpin <<= wfDst * wfSrc)
     | (FFIStruct <<= wfDst * (Type >>= wfType))
     | (FFILoad <<= wfDst * wfLhs * wfRhs * wfKind * (Type >>= wfType))
     | (FFIStore <<=

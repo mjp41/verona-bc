@@ -67,8 +67,6 @@ namespace virc
         "drop\\b" >> [](auto& m) { m.add(Drop); },
         "atteardown\\b" >> [](auto& m) { m.add(AtTeardown); },
         "freeze\\b" >> [](auto& m) { m.add(Freeze); },
-        "pin\\b" >> [](auto& m) { m.add(Pin); },
-        "unpin\\b" >> [](auto& m) { m.add(Unpin); },
         "ffistruct\\b" >> [](auto& m) { m.add(FFIStruct); },
         "ffiload\\b" >> [](auto& m) { m.add(FFILoad); },
         "ffistore\\b" >> [](auto& m) { m.add(FFIStore); },

@@ -875,9 +875,7 @@ namespace vc
         In(Expr, Lhs) *
               T(MakeCallback,
                 CodePtrCallback,
-                FreeCallback,
-                Pin,
-                Unpin)[Lhs]
+                FreeCallback)[Lhs]
             << (T(Args) << (T(Arg) << (T(ArgCopy) * T(LocalId)[Rhs]))) >>
           [](Match& _) {
             auto id = _.fresh(l_local);

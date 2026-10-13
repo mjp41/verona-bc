@@ -13,12 +13,6 @@
 #include <cstdlib>
 #include <iostream>
 #include <sched/schedulerthread.h>
-#include <source_location>
-
-#ifndef NDEBUG
-#  include <algorithm>
-#  include <unordered_map>
-#endif
 
 #define INLINE SNMALLOC_FAST_PATH_LAMBDA
 
@@ -29,8 +23,8 @@ namespace vbci
     struct BehaviorBody
     {
       Value function;
-      Value closure;
       AllocationGroup closure_group;
+      Value closure;
     };
   }
 
@@ -429,11 +423,11 @@ namespace vbci
       result,
       verona::rt::AccessMode::Write,
       verona::rt::Ownership::Borrowed);
-    new (construction.body) BehaviorBody{Value(func), Value(), {}};
+    new (construction.body) BehaviorBody{Value(func), {}, Value()};
     BehaviourCore::schedule(BehaviourCore::finish_construction(construction));
 
-    // Safe to convert to use Register this only contains a cown pointer, so
-    // there is no requirement for a stack_rc.
+    // Safe to convert to Register: this only contains a refcounted cown
+    // pointer, not an allocation-group value.
     return ValueTransfer(result);
   }
 
@@ -560,8 +554,6 @@ namespace vbci
 
   Register Thread::thread_run(Function* func)
   {
-    EnsureAllocationGroup ensure_allocation_group;
-
     auto depth = frames.size();
     Register saved;
     bool preserve_parent_local0 = frame != nullptr;
@@ -572,8 +564,6 @@ namespace vbci
     try
     {
       pushframe(func, 0);
-
-      invariant();
 
       while (depth != frames.size())
         step();
@@ -695,99 +685,6 @@ namespace vbci
       log << std::endl << "    arg[" << i << "] = " << frame->arg(i);
   }
 
-#ifndef NDEBUG
-  void Thread::check_stack_rc_invariant(std::source_location loc)
-  {
-    std::unordered_map<Region*, size_t> calc_stack_rcs;
-
-    auto visit_region = [&](Region* region) {
-      calc_stack_rcs[region] += 1;
-    };
-
-    auto visit_value = [&](ValueBorrow val) {
-      // Readonly values do not contribute to stack rcs.
-      if (val.is_readonly())
-        return;
-
-      auto loc = val.location();
-
-      if (!loc.is_region())
-        return;
-
-      auto region = loc.to_region();
-
-      visit_region(region);
-    };
-
-    // For each register in the local frame, if it is a region reference, then
-    for (auto& reg : locals)
-    {
-      visit_value(reg);
-    }
-
-    auto visit_header = [&](Header* h, Region* store_region = nullptr) {
-      if (!h->location().is_region())
-        return;
-
-      auto r = h->location().to_region();
-
-      if (r != store_region)
-        visit_region(r);
-    };
-
-    if (allocation_group != nullptr)
-    {
-      allocation_group->trace_fn(
-        [&](Header* h) { visit_header(h, allocation_group); });
-    }
-
-    stack.visit_headers({}, stack.top, [&](Header* h) {
-      if (program->is_array(h->get_type_id()))
-      {
-        auto arr = static_cast<Array*>(h);
-        arr->trace_fn(visit_header);
-      }
-      else
-      {
-        auto obj = static_cast<Object*>(h);
-        obj->trace_fn(visit_header);
-      }
-    });
-
-    // Now compare calculated stack RCs with actual stack RCs.
-    for (const auto& [region, calc_stack_rc] : calc_stack_rcs)
-    {
-      auto actual_stack_rc = region->get_stack_rc();
-      // Due to multi-threading it is not possible to guarantee a strict
-      // equality between calculated and actual stack RCs. We would have to
-      // pause all other threads to do that, which is not feasible. Instead we
-      // check that the actual stack RC is at least the calculated stack RC.
-
-      if (calc_stack_rc > actual_stack_rc)
-      {
-        logging::Error log;
-        log << "Stack RC invariant violated at " << loc.file_name() << ":"
-            << loc.line() << ":" << loc.column() << " for Region " << region
-            << " calculated stack RC " << calc_stack_rc << " actual stack RC "
-            << actual_stack_rc << std::endl;
-
-        print_stack(log);
-      }
-
-      assert(calc_stack_rc <= actual_stack_rc && "Stack RC invariant violated");
-    }
-  }
-#endif
-
-  void Thread::invariant(std::source_location loc)
-  {
-#ifndef NDEBUG
-    check_stack_rc_invariant(loc);
-#else
-    (void)loc;
-#endif
-  }
-
 }
 
 namespace vbc
@@ -818,10 +715,6 @@ namespace vbc
         return os << "AtTeardown";
       case Op::Freeze:
         return os << "Freeze";
-      case Op::Pin:
-        return os << "Pin";
-      case Op::Unpin:
-        return os << "Unpin";
       case Op::FFIStruct:
         return os << "FFIStruct";
       case Op::FFILoad:
@@ -1021,13 +914,7 @@ namespace vbci
     assert(frame);
     current_pc = frame->pc;
     auto op = leb<Op>();
-    auto process =
-      [this](auto f, std::source_location loc = std::source_location::current())
-        INLINE {
-          Operands::process(*this, f);
-          // Check the invariant after running this instruction.
-          invariant(loc);
-        };
+    auto process = [this](auto f) INLINE { Operands::process(*this, f); };
 
     trace_instruction("OP:", op);
     switch (op)
@@ -1240,13 +1127,15 @@ namespace vbci
           auto group = AllocationGroup::create();
           callback = copy_graph_and_consume(
             std::move(callback), group.get());
+          OwnedRegister owned_callback{
+            std::move(group), std::move(callback)};
 
           auto* work = verona::rt::Closure::make(
-            [callback = std::move(callback),
-             group = std::move(group),
+            [owned_callback = std::move(owned_callback),
              apply](verona::rt::Work*) mutable {
-              Thread::ScopeAllocationGroup scope(group.get());
-              Thread::run_cleanup(apply, callback.borrow());
+              Thread::ScopeAllocationGroup scope(
+                owned_callback.allocation_group.get());
+              Thread::run_cleanup(apply, owned_callback.value.borrow());
               return true;
             });
           verona::rt::Scheduler::schedule_at_quiescence(work);
@@ -1262,8 +1151,9 @@ namespace vbci
 
           if (src->is_header())
           {
+            auto group = AllocationGroup::create();
             auto copy =
-              copy_graph_and_consume(std::move(src));
+              copy_graph_and_consume(std::move(src), group.get());
 
             if (!freeze(copy->get_header()))
               Value::error(Error::BadFreeze);
@@ -1817,24 +1707,6 @@ namespace vbci
         break;
       }
 
-      case Op::Pin:
-      {
-        process([](Register& dst, const Register& src) INLINE {
-          src->pin();
-          dst = ValueImmortal(Value::none());
-        });
-        break;
-      }
-
-      case Op::Unpin:
-      {
-        process([](Register& dst, const Register& src) INLINE {
-          src->unpin();
-          dst = ValueImmortal(Value::none());
-        });
-        break;
-      }
-
       case Op::FFIStruct:
       {
         process([](
@@ -2383,8 +2255,8 @@ namespace vbci
     size_t num_cowns = args;
     size_t first_cown = 0;
     Register closure_source;
-    Register closure_copy;
     AllocationGroup closure_group;
+    Register closure_copy;
     std::vector<Register> cown_args;
 
     if (args > 0)
@@ -2472,7 +2344,7 @@ namespace vbci
     }
 
     auto* body = new (construction.body)
-      BehaviorBody{Value(func), Value(), std::move(closure_group)};
+      BehaviorBody{Value(func), std::move(closure_group), Value()};
 
     if (is_closure)
     {
@@ -2521,6 +2393,8 @@ namespace vbci
   void
   Thread::thread_handle_callback(CallbackClosure* cc, void* ret, void** args_)
   {
+    EnsureAllocationGroup ensure_allocation_group;
+
     assert(args == 0);
     auto num_c_args = cc->arg_value_types.size();
     arg(args++) = ValueBorrow(cc->lambda);

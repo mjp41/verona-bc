@@ -15,8 +15,8 @@ when changing or removing it can change one of those observations.
 
 | Classification | Operations | Required action |
 |---|---|---|
-| Retained semantics | `copy`, `move`, `drop`, `freeze`, `read`, `when`, references, `load`, `store`, bulk array operations, callbacks, external scheduler resources, `pin`, `unpin`, generic object and array allocation | Preserve the operation's value-level effect. Remove region checks, dragging, and sendability checks from its implementation. |
-| Simplified storage | `new`, `new [T]`, stores, external pinning, values crossing frames or entering cowns | Use ordinary managed allocation and reference counting. Storage placement must not introduce region errors. |
+| Retained semantics | `copy`, `move`, `drop`, `freeze`, `read`, `when`, references, `load`, `store`, bulk array operations, callbacks, external scheduler resources, generic object and array allocation | Preserve the operation's value-level effect. Remove region checks, dragging, and sendability checks from its implementation. |
+| Simplified storage | `new`, `new [T]`, stores, values crossing frames or entering cowns | Use ordinary managed allocation and reference counting. Storage placement must not introduce region errors. |
 | Removed storage machinery | `stack`, `heap`, `region`, their array variants, `merge`, region kinds `rc` and `arena` | Canonicalize allocation to `new`, then remove these forms from VIR, VBC, and source builtins. |
 
 Arithmetic, control-flow, type, memo, and FFI operations that do not retain or
@@ -96,10 +96,13 @@ and attachment from this sequence without weakening its lifetime effects.
 
 ### External roots
 
-`pin` and `unpin` remain because foreign code needs to add and remove external
-roots for managed objects, arrays, and cowns. Pinning becomes a direct lifetime
-operation on the value. It must not drag an object into a fresh region or keep
-a region-owning cown alive indirectly.
+The generic `pin` and `unpin` operations have been removed. They kept an
+allocation group alive through `stack_rc`, which mixed foreign retention with
+register accounting and exposed arbitrary managed graphs to native code.
+Foreign-retained byte buffers, callbacks, and native resources will instead
+use explicit owner objects or tokens designed for those individual lifetimes.
+Until those APIs exist, retaining Verona-managed pointers after an FFI call is
+unsupported.
 
 `makecallback`, `codeptrcallback`, and `freecallback` also remain. A callback
 closure currently borrows its callable; the enclosing Verona callback object
@@ -124,11 +127,15 @@ object and array allocation operations. Their textual VIR forms remain
 may allocate every result as an independently reference-counted managed value.
 
 Values returned or raised across frames, registered for teardown, placed in
-cown-owned state, captured by callbacks, or exposed through `pin` must remain
-live through managed ownership. These paths currently reject stack values or
-relocate frame-local graphs. Under the simplified contract they must copy,
-transfer, or fall back to managed allocation so that storage placement does not
-cause failure.
+cown-owned state, or captured by callbacks must remain live through managed
+ownership. These paths must copy or transfer explicit allocation-group owners
+so that storage placement does not cause failure.
+
+Allocation groups no longer have `stack_rc`. Their lifetime is determined
+solely by move-only `AllocationGroup` owners. Standalone synchronous results
+carry their temporary group until the caller consumes or freezes the result,
+and queued values are stored with their owner so the value is destroyed before
+the group.
 
 VC emits `New`, `NewArray`, and `NewArrayConst` for ordinary allocations and
 compiler-generated blocks. Textual VIR no longer exposes `Stack`, `Heap`, or

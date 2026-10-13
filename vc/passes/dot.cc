@@ -85,8 +85,6 @@ namespace vc
     {"codeptr_callback", {0, 1, CodePtrCallback}},
     {"free_callback", {0, 1, FreeCallback}},
     {"freeze", {0, 1, Freeze}},
-    {"pin", {0, 1, Pin}},
-    {"unpin", {0, 1, Unpin}},
     {"ffistruct", {1, 0, FFIStruct}},
     {"ffiload", {1, 3, FFILoad}},
     {"ffistore", {1, 4, FFIStore}},

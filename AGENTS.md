@@ -96,13 +96,7 @@ irreversible-action guardrails (git commit/push/PR require explicit permission).
   - **RC-transfer in SCC union**: During SCC detection, `scc_union(child, rep)` transfers `child.rc - 1` to rep (the -1 subtracts the tree edge). Back edges decrement `rep.rc` before the union loop. At SCC completion, `set_arc(rep->get_rc())` gives the exact external ref count.
   - **Union-by-address**: Uses `uintptr_t` of the header address as rank (no ties, no storage needed). With path compression, gives O(α(n)) amortized.
   - **Pending loop correctness**: The back-edge union loop MUST use `pending.back() != rep` (pointer comparison), NOT `Header::find(pending.back()) != rep`. Union can change the representative mid-loop, invalidating find-based comparison.
-  - **frozen_set pattern**: A `std::unordered_set<Header*>` tracks objects frozen by THIS call (inserted at PENDING time). Used to distinguish newly-frozen cross edges from pre-existing immutables in the DFS, and to identify unfrozen→frozen refs during the post-DFS scan.
-  - **stack_rc adjustment**: `stack_adjustment = arc_sum - frozen_cross - unfrozen_to_frozen`. The unfrozen scan counts field refs from surviving region objects to newly-frozen objects.
-  - **Ownership clearing**: Only clear parent/cown ownership when `root == region->get_entry_point()`. Sub-regions discovered during DFS are guaranteed to be entered through their entry point (single-entry-point invariant).
-  - **Entry points**: `Region` tracks the entry point header. Set in `set_parent(Region*, Header*)` and `set_cown_owner(Header*)`. The entry point is available at all callsites: write barrier has `in->get_header()`, drag has `next_h`, cown has `content.get_header()`.
-  - **freeze_local**: Freezes frame-local objects in place, then delegates heap sub-regions to `freeze()` in phase 2. `freeze()` delegates frame-local roots to `freeze_local()`.
-  - **Use-after-move in write barrier**: When `apply_in` needs the header for `set_parent`, save it BEFORE the register is cleared (move semantics). Use `content.get_header()` not `next->get_header()` after extract.
-  - **clear_cown_owner auto-free**: `clear_cown_owner()` now auto-frees like `clear_parent()` (calls `free_region()` if `stack_rc == 0`). Callers that need to prevent premature free must `stack_inc()` first (cown destructor and exchange already do this).
+  - **Explicit group ownership**: Allocation groups have no `stack_rc`; move-only `AllocationGroup` owners determine their lifetime. Any queued or returned register that can outlive a call must be paired with its owner and destroyed before that owner.
 - **Type system**: `Dyn` is a top type (`anything <: Dyn`). The bottom type is an empty `Union` (no members). In IRSubtype, the axiom table is keyed by the right operand's type (`r->type()` lookup in `reduce()`).
 
 ## Skills

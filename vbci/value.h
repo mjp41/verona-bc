@@ -234,7 +234,11 @@ namespace vbci
 
     Value op_xor(const Value& v) const
     {
-      return binop<std::not_equal_to<>, std::bit_xor<>, std::bit_xor<>, nobinop>(v);
+      return binop<
+        std::not_equal_to<>,
+        std::bit_xor<>,
+        std::bit_xor<>,
+        nobinop>(v);
     }
 
     make_binop(bit_left_shift, lhs << rhs);
@@ -556,25 +560,8 @@ namespace vbci
       return Value(std::numeric_limits<double>::quiet_NaN());
     }
 
-    // Increment RC for a reference held in a register context.
-    // Adjusts both object RC and region stack_rc.
-    void reg_inc() const;
-
-    // Decrement RC for a reference held in a register context.
-    // Adjusts both object RC and region stack_rc. Collects if RC hits 0.
-    void reg_dec() const;
-
-    // Increment RC for a reference held in a field context.
-    // Adjusts object RC only — no stack_rc change.
-    void field_inc() const;
-
-    // Decrement RC for a reference held in a field context.
-    // Adjusts object RC only — no stack_rc change. Collects if RC hits 0.
-    void field_dec() const;
-
-    // Pin or unpin a refcounted value for external use.
-    void pin() const;
-    void unpin() const;
+    void inc() const;
+    void dec() const;
 
   public:
     struct nounop

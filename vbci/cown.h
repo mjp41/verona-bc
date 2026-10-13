@@ -81,7 +81,7 @@ namespace vbci
     {
       LOG(Trace) << "Destroying cown @" << this;
       assert(allocation_group);
-      content.reg_dec();
+      content.dec();
       content = Value();
       LOG(Trace) << "Destroyed cown @" << this;
     }
@@ -158,7 +158,7 @@ namespace vbci
         content = next.extract();
       else
       {
-        next->reg_inc();
+        next->inc();
         content = next.borrow();
       }
 

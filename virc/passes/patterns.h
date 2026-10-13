@@ -100,8 +100,6 @@ namespace virc
       MakeCallback,
       CodePtrCallback,
       FreeCallback,
-      Pin,
-      Unpin,
       FFIStruct,
       FFILoad,
       FFIStore,

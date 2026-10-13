@@ -6,7 +6,6 @@
 #include "program.h"
 #include "region_ext.h"
 
-#include <unordered_set>
 #include <vector>
 
 namespace vbci
@@ -47,14 +46,8 @@ namespace vbci
   }
 
   // Trace a header's fields, pushing children onto the DFS stack.
-  // Returns the number of frozen-to-frozen edges found.
-  static RC trace_fields(
-    Header* h,
-    std::vector<Header*>& dfs,
-    Region* region = nullptr,
-    std::unordered_set<Header*>* frozen_set = nullptr)
+  static void trace_fields(Header* h, std::vector<Header*>& dfs)
   {
-    RC frozen_edges = 0;
     auto& program = Program::get();
     auto fn = [&](Header* h) {
       auto loc = h->location();
@@ -62,34 +55,20 @@ namespace vbci
       if (loc.is_scc_ptr() || loc.is_pending())
       {
         dfs.push_back(h);
-        if (region)
-          frozen_edges++;
         return;
       }
 
       if (loc.is_immutable() || loc.is_immortal())
-      {
-        // Count edges to objects frozen by THIS call.
-        if (frozen_set && frozen_set->count(h))
-          frozen_edges++;
         return;
-      }
 
       if (loc.is_region())
-      {
         dfs.push_back(h);
-        if (region && loc.to_region() == region)
-          frozen_edges++;
-        return;
-      }
     };
 
     if (program.is_array(h->get_type_id()))
       static_cast<Array*>(h)->trace_fn(fn);
     else
       static_cast<Object*>(h)->trace_fn(fn);
-
-    return frozen_edges;
   }
 
   bool freeze(Header* root)
@@ -108,7 +87,6 @@ namespace vbci
     std::vector<Header*> worklist;
     std::vector<Header*> dfs;
     std::vector<Header*> pending;
-    std::unordered_set<Header*> frozen_set;
 
     worklist.push_back(root);
 
@@ -122,11 +100,6 @@ namespace vbci
         continue;
 
       region = root->region();
-      RC arc_sum = 0;
-      RC frozen_internal = 0;
-      // Frozen edges already removed from RCs by SCC collapse.
-      RC scc_internal = 0;
-      frozen_set.clear();
 
       dfs.push_back(root);
 
@@ -143,7 +116,6 @@ namespace vbci
           {
             pending.pop_back();
             auto rep = Header::find(h);
-            arc_sum += rep->get_rc();
             rep->set_location(Location::immutable());
             rep->set_arc(rep->get_rc());
           }
@@ -158,12 +130,10 @@ namespace vbci
         if (rep_loc.is_pending())
         {
           rep->set_rc(rep->get_rc() - 1);
-          scc_internal++;
 
           while (!pending.empty() && pending.back() != rep)
           {
             scc_union(pending.back(), rep);
-            scc_internal++;
             pending.pop_back();
           }
         }
@@ -177,43 +147,15 @@ namespace vbci
           {
             region->remove(h);
             h->set_location(Location::from_raw(Location::Pending));
-            frozen_set.insert(h);
 
             pending.push_back(h);
             dfs.push_back(post_order_mark(h));
-            frozen_internal += trace_fields(h, dfs, region, &frozen_set);
+            trace_fields(h, dfs);
           }
           else
             worklist.push_back(h);
         }
       }
-
-      // Count unfrozen-to-frozen field references.
-      RC unfrozen_to_frozen = 0;
-      auto& program = Program::get();
-
-      region->for_each_header([&](Header* h) {
-        auto count_fn = [&](Header* target) {
-          if (frozen_set.count(target))
-            unfrozen_to_frozen++;
-        };
-
-        if (program.is_array(h->get_type_id()))
-          static_cast<Array*>(h)->trace_fn(count_fn);
-        else
-          static_cast<Object*>(h)->trace_fn(count_fn);
-      });
-
-      assert(frozen_internal >= scc_internal);
-      RC frozen_cross = frozen_internal - scc_internal;
-      assert(arc_sum >= frozen_cross + unfrozen_to_frozen);
-      RC stack_adjustment =
-        arc_sum - frozen_cross - unfrozen_to_frozen;
-
-      // Adjust stack_rc. May free the region if stack_rc hits 0 with
-      // no owner.
-      if (stack_adjustment > 0)
-        region->stack_dec(stack_adjustment);
     }
 
     return true;

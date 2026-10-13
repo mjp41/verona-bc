@@ -1,216 +1,144 @@
----
-name: vbci-memory
-description: Verona interpreter (vbci) memory management model — regions, reference counting, write barriers, dragging, cowns, and finalization. Use when working on or debugging vbci runtime memory management code.
----
-
 # vbci Memory Management
 
 ## Overview
 
-The Verona interpreter uses a region-based memory model with reference counting. Objects live in regions, regions form strict trees (single parent, single entry point), and cowns provide a forest of independent region trees for concurrency.
+The interpreter uses explicit allocation-group ownership. Mutable objects and
+arrays are allocated in a `RegionRC`, and exactly one move-only
+`AllocationGroup` owns that region. The group is released as a unit when its
+owner is destroyed.
 
-## Object Locations
+There is no region topology, dragging, sendability check, write barrier for
+group ownership, or allocation-group reference count.
 
-Every object/array has a `Location` (encoded as a tagged `uintptr_t`):
+## Allocation-group ownership
 
-| Location | Meaning | RC type | Collected by |
-|----------|---------|---------|-------------|
-| **Stack** | Stack-allocated in a frame | No RC | Frame teardown (destruct) |
-| **Frame-local** | In a frame's embedded RegionRC | Object RC | RC=0 collection, or `free_contents` for cycles |
-| **Region** | In a heap RegionRC | Object RC | RC=0 collection, or `free_contents` for cycles |
-| **Immutable** | Frozen, shareable | ARC (atomic) | ARC=0 collection |
-| **Immortal** | Primitive values, constants | No RC | Never collected |
+`AllocationGroup` is the only API that creates and owns a `Region`:
 
-## Two Independent RC Systems
+- `AllocationGroup::create()` creates a fresh group.
+- Moving an `AllocationGroup` transfers exclusive ownership.
+- `absorb()` consumes another owner and moves all of its objects into the
+  destination group.
+- Destroying the owner finalizes and releases all objects still in the group.
 
-### Object RC (`Header::rc`)
+`Thread::allocation_group` is a non-owning pointer selecting the group used by
+new allocations. `ScopeAllocationGroup` temporarily replaces that context.
 
-Counts **all** incoming references to an object, regardless of source (registers, fields, anywhere). When RC hits 0, the object is collected individually via `collect()`. The region's stack_rc is irrelevant to individual object collection.
+Values do not keep allocation groups alive. Any value that can outlive the
+current owner must be stored together with an explicit owner:
 
-- `inc<needs_stack_rc>()`: increments object RC; if `needs_stack_rc`, also increments the region's stack_rc
-- `dec<needs_stack_rc>()`: decrements object RC; if RC hits 0, queues for collection via `collect()`
+- cowns own their dormant state group;
+- queued behavior bodies own their copied closure group;
+- executing behaviors own one combined execution group;
+- queued teardown callbacks own their copied callback group;
+- standalone synchronous results use `Thread::OwnedRegister`.
 
-The `needs_stack_rc` template parameter indicates whether the reference is from a register/stack/frame-local context (true) or from a field within a region (false).
+The owner must be declared before the managed value so C++ destroys the value
+before releasing its group.
 
-### Region Stack RC (`Region::stack_rc`)
+## Object reference counting
 
-Counts references into the region from **outside** the region's own object graph — specifically from:
-- Frame registers
-- Fields of stack-allocated or frame-local objects/arrays
+`Header::rc` counts mutable references to an individual object or array.
+Register and field references use the same `inc()` / `dec()` operations.
+Reaching zero collects the individual object unless its group is already
+finalizing. The write barrier separately rejects storing readonly borrowed
+values.
 
-This keeps entire regions alive. A region can be collected (freed as a whole) when:
-- It has **no parent** (not parented to another region, not cown-owned)
-- Its **stack_rc is 0** (no external references)
+Object RC can collect acyclic garbage early. Allocation-group destruction also
+collects remaining cyclic or otherwise live objects as a group.
 
-Stack_rc is NOT per-object — it's per-region.
+Readonly behavior arguments do not adjust object RC because their cown-owned
+allocation group remains alive for the behavior. Cown handles themselves
+remain independently reference counted.
 
-## Regions
+## Stores
 
-Regions are containers of objects that form **strict trees**:
-- Each region has at most one parent region
-- There is exactly one entry point from a parent to a child region
-- Cowns can own regions, creating a **forest** of region trees
+`writebarrier.h` now implements ordinary managed exchange semantics:
 
-### Region Types
-- **RegionRC**: Reference-counted region with a `headers` set tracking all contained objects
-- Regions track: `stack_rc`, `parent` (with tag bits for parent type), `finalizing` flag
+- reject writes to immutable storage;
+- reject references to invalid stack lifetimes;
+- retain or transfer the incoming value;
+- install it;
+- release the outgoing value.
 
-### Region Parenting
-The `parent` field encodes the owner:
-- `0`: no owner (root region, collectible if stack_rc == 0)
-- Pointer with no tag bits: parent is another Region
-- `parent_tag_cown`: owned by a cown
-- `parent_tag_frame_local`: frame-local region
+A mutable field may only refer to a value in the same allocation group. This
+is a debug invariant rather than a runtime ownership-repair mechanism.
 
-## Frame Teardown
+## Copy-on-split boundaries
 
-Each frame has:
-- **Stack allocations**: objects allocated with `Op::Stack` on the frame's stack area
-- **Frame-local region**: an embedded `RegionRC` for objects created with `Op::New`
+Ownership boundaries deep-copy reachable mutable graphs:
 
-Teardown order:
-1. **`frame->drop()`**: Clears all registers. RC decrements may trigger individual object collection via `collect()`.
-2. **Phase 1**: Run finalizers on stack objects (via `run_sync` with readonly reference)
-3. **Phase 2**: Destruct stack objects (drop field references, no finalizer)
-4. **`free_contents()`**: Finalize and deallocate everything remaining in the frame-local region. This handles **cyclic garbage** — objects whose RC never hit 0 because they only have internal references within the region.
+- `freeze` copies into a fresh group, freezes the copy, and consumes the
+  source reference;
+- scheduling copies a closure into a queued owner;
+- behavior completion copies each writable cown, including the result cown,
+  into a fresh owned group;
+- teardown registration copies its callback into queued owned work.
 
-## Dragging
+Post-copy hooks execute with the destination group as the active allocation
+context.
 
-When an object in a frame-local region needs to escape (return to parent frame, be stored in a region, be sent to a cown), it is **dragged** via `drag_allocation()`:
+## Freezing
 
-1. DFS traversal from the root object to find all reachable frame-local objects
-2. Track internal RC (edges within the dragged set) vs external RC
-3. Check that child regions can be parented (no existing owner, no cycles)
-4. Move all objects to the destination region, adjusting RCs and setting parents
+`freeze()` converts the reachable copied graph to immutable SCCs:
 
-The `ignore_parent` parameter allows drags during exchange: when the outgoing value's region will be unparented by `apply_out`, the drag can treat that region as unowned without actually unparenting it first.
+- Tarjan-style DFS discovers SCCs;
+- union-by-address and path compression identify representatives;
+- `scc_union(child, rep)` transfers `child.rc - 1` to the representative;
+- back edges decrement the representative before union;
+- SCC completion sets `arc` from the representative's resulting RC.
 
-## Write Barrier (`writebarrier.h`)
+The pending-stack loop must compare `pending.back() != rep` directly. Calling
+`Header::find(pending.back())` there is incorrect because union can change the
+representative during the loop.
 
-The write barrier handles stores (field writes, array element writes) with a prepare/apply pattern:
-
-```
-write_ops<is_move>()
-    .prepare_store(store_loc)     // where the store target lives
-    .prepare_out(prev_loc)        // where the outgoing (old) value lives
-    .prepare_in(next_loc)         // where the incoming (new) value lives
-```
-
-Then:
-- `apply_in()`: executes drag, writes value, adjusts incoming RC/stack_rc/parent
-- `apply_out()`: adjusts outgoing RC/stack_rc, unparents outgoing region
-
-Key operations planned during prepare:
-- **Incoming**: drag (frame-local → region), RC inc/clear, stack_rc adjust, region parent
-- **Outgoing**: RC dec, stack_rc adjust, region unparent
-- `drop()`: simplified version for field drops during finalization (no incoming value)
-
-### Ordering constraint
-`apply_out` runs AFTER `apply_in`. When the incoming drag needs the outgoing region to be unparented first, `ignore_parent` on `drag_allocation` resolves this without reordering.
-
-## Collection (`collect.cc`)
-
-The `collect()` function handles deferred deallocation to avoid re-entrancy issues:
-
-- First call: sets `in_collection = true`, processes worklist
-- Nested calls (from `deallocate()` → `finalize()` → field drops → more RC=0): add to worklist, return immediately
-- Worklist processes until empty, then `in_collection = false`
-
-Each worklist item calls `deallocate()` which calls `finalize()` then frees the memory.
-
-## Cowns
-
-Cowns (`verona::rt::VCown`) own a value and optionally a region:
-- `add_reference()`: stores a value in the cown, potentially dragging frame-local to a fresh region and setting cown ownership
-- `exchange()`: swaps the cown's content, handling region re-parenting with rollback on failure
-- Cown-owned regions have `parent = parent_tag_cown`
-
-## Readonly Values
-
-Readonly values always come from a readonly cown (via `Read` op or behavior cown args with read-only slots). Key properties:
-- **Cannot be mutated**: stores through readonly refs raise `BadStoreTarget`
-- **Cannot have new field references**: no object/array can create a new field pointing to a readonly value
-- **No object/array RC**: `reg_inc`/`reg_dec` skip object RC and stack_rc for readonly objects/arrays
-- **Cowns still need RC**: readonly cown values (`ValueType::Cown`) still need `cown->inc()`/`cown->dec()` — the cown itself is ref-counted independently of its content's readonly status
-- **CownRef needs no RC**: `CownRef` values exist only as behavior arguments and are alive for the behavior's lifetime — no RC needed
+Frozen objects are removed from their mutable allocation group. When the
+temporary copy group is released after freezing, only non-frozen leftovers
+remain to be collected.
 
 ## Finalization
 
-Objects with a `final` method have their finalizer run during collection/teardown:
-- Called with a **read-only** reference to the object (prevents resurrection)
-- Finalizers must not mutate — stores through readonly refs raise `BadStoreTarget`
-- `Object::finalize()`: runs finalizer via `run_sync()`, then drops all field references via `writebarrier::drop()`
-- `Object::destruct()`: drops field references without running the finalizer (for stack objects after Phase 1)
+Group collection is two phase:
 
-### Finalization ordering
-The collector uses a two-phase approach: Phase 1 finalizes all objects (running finalizers, dropping field references), Phase 2 frees memory. This prevents use-after-free when finalizers reference sibling objects — all finalizers run before any memory is freed.
+1. run finalizers and drop managed fields;
+2. release object storage.
 
-## Sendability
+`SuppressFinalizers` is used when consuming a source graph whose semantic
+lifetime continues in a copy. Copy finalization must distinguish the live
+source image from abandoned garbage so finalizers run exactly once.
 
-An object is sendable if its region:
-- Has no owner (no parent region, no cown owner)  
-- Has stack_rc == 1 (only the current register references it)
+Finalizers execute with readonly access. Any allocations made by standalone
+cleanup execution use an explicitly owned temporary group.
 
-Frame-local objects are dragged to a fresh region first, then the region is checked for sendability. This ensures data-race freedom — only objects with exclusive ownership can be sent to behaviors.
+## Cowns
 
-## Freezing (`freeze.cc`)
+A dormant cown owns both its content and its `AllocationGroup`. Writable cown
+acquisition transfers that owner into the behavior execution group. Completion
+copies the resulting state into a fresh group and returns that owner to the
+cown.
 
-Freezing converts a reachable subgraph from mutable region objects to immutable objects with ARC tracking. The region survives with any unfrozen objects.
+Readonly acquisition leaves the cown's group in place and exposes only a
+readonly borrowed value for the behavior lifetime.
 
-### Two entry points
-- **`freeze(Header* root)`**: Freezes reachable subgraph in a heap region. Handles frame-local roots by delegating to `freeze_local`. Returns true on success.
-- **`freeze_local(Header* root)`**: Freezes frame-local objects in place, then delegates discovered heap sub-regions to `freeze()` in phase 2.
+## Foreign lifetimes
 
-### SCC detection with rc-transfer
-Uses Tarjan-style DFS with union-find. During SCC detection, `scc_union(child, rep)` transfers `child.rc - 1` to rep (subtracting the tree edge). Back edges decrement `rep.rc`. At SCC completion, `set_arc(rep->get_rc())` gives the exact external ref count without needing separate inc_arc calls.
+Generic `pin` and `unpin` operations have been removed. `ffi::external` only
+keeps the scheduler alive; it does not own managed values.
 
-Union-by-address (using `uintptr_t` of header as rank) with path compression gives O(α(n)) amortized.
+Future asynchronous FFI support must use explicit mechanisms for each foreign
+lifetime, such as an exported byte-buffer token or an identity-bearing callback
+component. It must not reintroduce an allocation-group reference count.
 
-### Stack_rc adjustment
-After freezing, the region's stack_rc must be adjusted to account for stack references that now point to immutable objects:
-
-```
-stack_adjustment = arc_sum - frozen_cross - unfrozen_to_frozen
-```
-
-- `arc_sum`: sum of all SCC arcs (total external refs to frozen objects)
-- `frozen_cross`: cross-edges between newly-frozen SCCs (tracked via `frozen_set`)
-- `unfrozen_to_frozen`: field refs from surviving region objects to newly-frozen objects
-
-### Sub-region handling
-When the freeze DFS discovers an entry point to a sub-region, it pushes it to a worklist. After freezing the parent region, sub-regions are processed. Ownership is cleared only when `root == region->get_entry_point()`.
-
-### Entry point tracking
-`Region` stores a `Header* entry_point` set during `set_parent()` and `set_cown_owner()`. This is needed to:
-- Assert the single-entry-point invariant during freeze
-- Guard ownership clearing (only clear when freezing the entry point)
-
-### Location states during freeze
-| State | Location | rc/arc field | Meaning |
-|-------|----------|-------------|---------|
-| UNMARKED | Region ptr | rc = field refs | Normal mutable, not yet visited |
-| PENDING | Pending tag | rc = accumulated external refs | On DFS path, SCC candidate |
-| SCC_PTR | SCC ptr to rep | unused | Union-find member, points toward root |
-| IMMUTABLE | Immutable tag | arc = external ref count | Frozen SCC root |
-
-### Immutable object lifecycle
-- `field_inc()` on immutable → `arc++`
-- `field_dec()` on immutable → `arc--`; if 0, `collect_scc()` walks all SCC members via SCC_PTR chains, finalizes, and frees
-- `reg_inc()`/`reg_dec()` on immutable → only `field_inc()`/`field_dec()` (no stack_rc)
-
-## Key Files
+## Key files
 
 | File | Purpose |
 |------|---------|
-| `header.h` | Base Header class: RC, location, region access, inc/dec |
-| `region.h` | Region struct: stack_rc, parent, ownership |
-| `region_rc.h/cc` | RegionRC: headers set, insert/remove/rfree/free_contents |
-| `location.h/cc` | Location encoding, `drag_allocation` |
-| `writebarrier.h` | Write barrier: prepare/apply pattern for stores |
-| `collect.h/cc` | Deferred collection worklist |
-| `object.h` | Object: init, finalize, destruct, deallocate |
-| `array.h` | Array: element access, finalize, deallocate |
-| `cown.h` | Cown: add_reference, exchange |
-| `value.h/cc` | Value union type: RC forwarding, location queries |
-| `register.h` | Register wrapper: ownership semantics |
-| `thread.h/cc` | Frame management, teardown, `run_sync` |
+| `region.h` | `Region` and move-only `AllocationGroup` |
+| `region_rc.h/cc` | Mutable allocation storage and group collection |
+| `header.h` | Object RC and immutable ARC operations |
+| `register.h` | Register ownership and transfer semantics |
+| `writebarrier.h` | Managed field/array exchange |
+| `copy_graph.cc` | Graph copying and destination hooks |
+| `freeze.cc` | SCC construction and immutable ARC conversion |
+| `cown.h` | Cown lifetime and allocation-group transfer |
+| `thread.cc` | Behavior, synchronous-call, teardown, and callback ownership |
+| `collect.cc` | Deferred object and group finalization |

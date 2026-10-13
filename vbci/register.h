@@ -55,7 +55,7 @@ namespace vbci
   private:
     // This sets the internal value without modifying reference counts.
     // Use with caution.
-    // The caller is expected to provide an RC and a stack RC for this value.
+    // The caller is expected to provide the required object RC.
     void set_raw_unsafe(const Value& v)
     {
       Value::operator=(v);
@@ -73,7 +73,7 @@ namespace vbci
     Register(ValueBorrow v)
     {
       set_raw_unsafe(v);
-      v.reg_inc();
+      v.inc();
     };
 
     Register(ValueImmortal v)
@@ -128,7 +128,7 @@ namespace vbci
       Value old = *this;
       Value new_value = fun();
       set_raw_unsafe(new_value);
-      old.reg_dec();
+      old.dec();
     }
 
     void operator=(ValueTransfer v)
@@ -139,7 +139,7 @@ namespace vbci
     void operator=(ValueBorrow v)
     {
       replace_unsafe([&]() {
-        v.reg_inc();
+        v.inc();
         return v;
       });
     }
@@ -180,7 +180,7 @@ namespace vbci
     void operator=(const Register& v)
     {
       replace_unsafe([&]() -> Value {
-        v.reg_inc();
+        v.inc();
         return v;
       });
     }
@@ -195,7 +195,7 @@ namespace vbci
     {
       replace_unsafe([&]() {
         ValueBorrow v = src.load_reference();
-        v.reg_inc();
+        v.inc();
         return v;
       });
     }
@@ -222,7 +222,7 @@ namespace vbci
             if constexpr (is_move)
               src.clear_unsafe();
             else
-              src.reg_inc();
+              src.inc();
 
             return Value(obj, f, readonly);
           });
@@ -238,7 +238,7 @@ namespace vbci
             if constexpr (is_move)
               src.clear_unsafe();
             else
-              src.field_inc();
+              src.inc();
 
             return Value(cown, readonly);
           });
@@ -266,7 +266,7 @@ namespace vbci
       if constexpr (is_move)
         src.clear_unsafe();
       else
-        src.reg_inc();
+        src.inc();
 
       replace_unsafe([&]() { return Value(arr, index, readonly); });
     }

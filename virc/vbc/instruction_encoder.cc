@@ -443,10 +443,6 @@ namespace virc::vbc_backend
           unary(statement, Op::CodePtrCallback);
         else if (statement == FreeCallback)
           unary(statement, Op::FreeCallback);
-        else if (statement == Pin)
-          unary(statement, Op::Pin);
-        else if (statement == Unpin)
-          unary(statement, Op::Unpin);
         else if (statement == AddExternal)
           output << uleb(+Op::AddExternal) << dst(statement);
         else if (statement == RemoveExternal)

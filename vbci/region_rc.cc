@@ -11,7 +11,6 @@ namespace vbci
     auto loc = Location(this);
     auto obj = Object::create(mem, cls, loc);
     headers.emplace(obj);
-    stack_inc();
     return obj;
   }
 
@@ -24,7 +23,6 @@ namespace vbci
     auto arr =
       Array::create(mem, loc, type_id, rep.first, size, rep.second->size);
     headers.emplace(arr);
-    stack_inc();
     return arr;
   }
 
@@ -89,9 +87,8 @@ namespace vbci
 
     for (auto* header : source->headers)
       header->set_location(Location(this));
-
     headers.merge(source->headers);
-    source->transfer_stack_rc_to(this);
+    headers.merge(source->headers);
     delete source;
   }
 }

@@ -133,14 +133,14 @@ namespace vbci
           case ValueType::Dyn:
           {
             auto prev = load(i);
-            writebarrier::drop(location(), prev);
+            writebarrier::drop(prev);
             break;
           }
 
           case ValueType::Cown:
           {
             auto prev = load(i);
-            prev.field_dec();
+            prev.dec();
             break;
           }
 

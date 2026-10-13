@@ -287,10 +287,6 @@ namespace vbc
     // done on cowns.
     Read,
 
-    // Pin or unpin a refcounted value for external use. Returns None.
-    Pin,
-    Unpin,
-
     // Compute FFI struct layout metadata for a leaf type or flat tuple type.
     // Arg0 = dst.
     // Arg1 = layout type ID.

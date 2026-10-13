@@ -268,7 +268,7 @@ namespace vbci
           {
             void* addr = reinterpret_cast<uint8_t*>(this + 1) + (stride * i);
             auto prev = Value::from_addr(value_type, addr);
-            writebarrier::drop(location(), prev);
+            writebarrier::drop(prev);
           }
           break;
         }

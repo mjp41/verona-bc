@@ -172,9 +172,10 @@ when writing `.v` files — library code, `_builtin` types, or user programs.
 
 - **Tie keepalive to the real external lifetime**: for libuv-backed wrappers,
   use timer-style `_activate(active)` plus handler-safe deferred release
-  (`_finish_handler`) so `ffi::pin` / `ffi::unpin` and
-  `ffi::external.add` / `ffi::external.remove` track active handles or pending
-  requests.
+  (`_finish_handler`) so `ffi::external.add` / `ffi::external.remove` track
+  active handles or pending requests. The current FFI has no managed-value
+  retention API; do not retain Verona pointers until an explicit buffer or
+  callback owner exists.
 - **Don't rely on incidental references**: a callback closure or unrelated
   signal watcher may accidentally keep a wrapper alive for a while, but that is
   not a sound lifetime strategy.

@@ -1,6 +1,5 @@
 #pragma once
 
-
 #include "ident.h"
 #include "location.h"
 #include "region.h"
@@ -105,47 +104,11 @@ namespace vbci
       to->insert(this);
     }
 
-    // Increment RC for a reference held outside the object's allocation group.
-    // Adjusts both object RC and the allocation group's stack_rc.
-    void reg_inc()
+    void inc()
     {
       if (loc.is_scc_ptr())
       {
-        find(this)->reg_inc();
-        return;
-      }
-
-      field_inc();
-
-      if (loc.is_region())
-        loc.to_region()->stack_inc();
-    }
-
-    // Decrement RC for a reference held outside the object's allocation group.
-    // Adjusts both object RC and the allocation group's stack_rc.
-    void reg_dec()
-    {
-      if (loc.is_scc_ptr())
-      {
-        find(this)->reg_dec();
-        return;
-      }
-
-      // If stack_dec returns false, the region has been freed, so we can
-      // return early without doing anything else.
-      if (loc.is_region() && !loc.to_region()->stack_dec())
-        return;
-
-      field_dec();
-    }
-
-    // Increment RC for a reference held in an object/array field.
-    // Adjusts object RC only — no stack_rc change.
-    void field_inc()
-    {
-      if (loc.is_scc_ptr())
-      {
-        find(this)->field_inc();
+        find(this)->inc();
         return;
       }
 
@@ -164,13 +127,11 @@ namespace vbci
         rc++;
     }
 
-    // Decrement RC for a reference held in an object/array field.
-    // Adjusts object RC only — no stack_rc change. Collects if RC hits 0.
-    void field_dec()
+    void dec()
     {
       if (loc.is_scc_ptr())
       {
-        find(this)->field_dec();
+        find(this)->dec();
         return;
       }
 

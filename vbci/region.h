@@ -21,35 +21,10 @@ namespace vbci
   private:
     friend class AllocationGroup;
 
-    RC stack_rc;
-    bool owned;
-
     static Region* create();
 
-    void acquire_owner()
-    {
-      assert(!owned);
-      owned = true;
-    }
-
-    void release_owner()
-    {
-      assert(owned);
-      owned = false;
-
-      if (stack_rc == 0)
-        free_region();
-    }
-
-    void free_region()
-    {
-      assert(!owned);
-      assert(stack_rc == 0);
-      collect(this);
-    }
-
   protected:
-    Region() : stack_rc(0), owned(false) {}
+    Region() = default;
 
   public:
     virtual ~Region() = default;
@@ -67,50 +42,6 @@ namespace vbci
     void for_each_header(auto&& fn) const;
 
     void trace_fn(auto&& fn) const;
-
-    void stack_inc(RC inc = 1)
-    {
-      LOG(Trace) << "Region @" << this << " stack_rc incremented from "
-                 << stack_rc << " to " << (stack_rc + inc);
-
-      stack_rc += inc;
-    }
-
-    bool stack_dec(RC dec = 1)
-    {
-      assert(stack_rc >= dec);
-      LOG(Trace) << "Region @" << this << " stack_rc decremented from "
-                 << stack_rc << " to " << (stack_rc - dec);
-
-      stack_rc -= dec;
-
-      if (stack_rc == 0)
-      {
-        if (!owned)
-        {
-          // Returns false if the region has been freed.
-          free_region();
-          return false;
-        }
-      }
-
-      return true;
-    }
-
-    RC get_stack_rc() const
-    {
-      return stack_rc;
-    }
-
-    void transfer_stack_rc_to(Region* target)
-    {
-      assert(target != this);
-
-      if (stack_rc > 0)
-        target->stack_inc(stack_rc);
-
-      stack_rc = 0;
-    }
   };
 
   class AllocationGroup
@@ -120,7 +51,6 @@ namespace vbci
     explicit AllocationGroup(Region* region) : region(region)
     {
       assert(region);
-      region->acquire_owner();
     }
 
     Region* release()
@@ -136,7 +66,7 @@ namespace vbci
     ~AllocationGroup()
     {
       if (region)
-        region->release_owner();
+        collect(region);
     }
 
     AllocationGroup(AllocationGroup&& other) noexcept
@@ -149,7 +79,7 @@ namespace vbci
         return *this;
 
       if (region)
-        region->release_owner();
+        collect(region);
 
       region = other.release();
       return *this;

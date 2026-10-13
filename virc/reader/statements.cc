@@ -392,12 +392,6 @@ namespace virc
         Dst * T(Freeze) * T(LocalId)[Rhs] >>
           [](Match& _) { return Freeze << _(LocalId) << _(Rhs); },
 
-        Dst * T(Pin) * T(LocalId)[Rhs] >>
-          [](Match& _) { return Pin << _(LocalId) << _(Rhs); },
-
-        Dst * T(Unpin) * T(LocalId)[Rhs] >>
-          [](Match& _) { return Unpin << _(LocalId) << _(Rhs); },
-
         Dst * T(FFIStruct) * TypePat[Type] >>
           [](Match& _) { return FFIStruct << _(LocalId) << _(Type); },
 

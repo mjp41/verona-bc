@@ -2624,8 +2624,6 @@ namespace vc
           }
           else if (n->in({
                      FreeCallback,
-                     Pin,
-                     Unpin,
                      AddExternal,
                      RemoveExternal,
                    }))

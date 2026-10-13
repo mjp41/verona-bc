@@ -99,7 +99,8 @@ namespace vbci
   {
     auto& slot = memo_slots.at(index);
     assert(slot->is_invalid());
-    slot = Thread::run_sync(&functions.at(memo_func_ids.at(index)));
+    auto result = Thread::run_sync(&functions.at(memo_func_ids.at(index)));
+    slot = std::move(result.value);
 
     if (slot->is_header())
       freeze(slot->get_header());
@@ -172,7 +173,7 @@ namespace vbci
     sched.run();
 
     auto ret_val = ret.get_cown()->load();
-    ret.field_dec();
+    ret.dec();
 
     if (ret_val.is_error())
     {

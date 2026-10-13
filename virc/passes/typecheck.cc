@@ -1280,11 +1280,6 @@ namespace virc
           // Freeze returns the frozen object (same type as src).
           set_type(env, node / LocalId, typed(node / Rhs));
         }
-        else if (node->type().in({Pin, Unpin}))
-        {
-          // Pin/unpin return None.
-          set_type(env, node / LocalId, None);
-        }
         else if (node == FFIStruct)
         {
           set_type(env, node / LocalId, ffi_struct_result_type());
@@ -1778,8 +1773,6 @@ namespace virc
                    AddExternal,
                    RemoveExternal,
                    FreeCallback,
-                   Pin,
-                   Unpin,
                    FFIStore,
                  }))
         {
