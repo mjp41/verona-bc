@@ -1,5 +1,6 @@
 #pragma once
 
+#include "frame_id.h"
 #include "ident.h"
 #include "logging.h"
 #include "platform.h"
@@ -91,7 +92,7 @@ namespace vbci
     explicit Value(Object* obj, bool ro);
     explicit Value(Array* arr);
     explicit Value(Cown* cown);
-    explicit Value(uint64_t idx, Location frame);
+    explicit Value(uint64_t idx, FrameId frame);
     explicit Value(Object* obj, size_t f, bool ro);
     explicit Value(Array* arr, size_t idx, bool ro);
     explicit Value(Cown* cown, bool ro);
@@ -153,6 +154,7 @@ namespace vbci
     PC error_pc() const;
     size_t get_size() const;
     Register& get_register() const;
+    FrameId frame_id() const;
 
     Location location() const;
     Region* region() const;

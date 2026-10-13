@@ -178,7 +178,7 @@ namespace vbci
 
     void immortalize()
     {
-      if (location() == Location::immortal())
+      if (location().is_immortal())
         return;
 
       mark_immortal();

@@ -106,7 +106,7 @@ namespace vbci
         return;
       }
 
-      if (loc.is_stack() || loc.is_immortal())
+      if (loc.is_immortal())
         return;
 
       if (loc.is_immutable())
@@ -129,7 +129,7 @@ namespace vbci
         return;
       }
 
-      if (loc.is_stack() || loc.is_immortal())
+      if (loc.is_immortal())
         return;
 
       if (loc.is_immutable())

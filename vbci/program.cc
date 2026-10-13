@@ -616,7 +616,7 @@ namespace vbci
       auto str_size = str.size() + 1;
       auto arr = Array::create(
         new uint8_t[Array::size_of(str_size, ffi_type_uint8.size)],
-        Location::stack(),
+        Location::immortal(),
         typeid_arg,
         ValueType::U8,
         str_size,
@@ -626,7 +626,6 @@ namespace vbci
       std::memcpy(p, str.c_str(), str_size);
       // Array size honestly includes the null terminator.
       // The string wrapper (in Verona) sets len = data.size - 1.
-      arr->immortalize();
       string_arrays[i] = arr;
     }
   }
@@ -659,7 +658,7 @@ namespace vbci
 
     argv = Array::create(
       new uint8_t[Array::size_of(args.size(), argv_rep.second->size)],
-      Location::stack(),
+      Location::immortal(),
       typeid_argv,
       argv_rep.first,
       args.size(),
@@ -671,7 +670,7 @@ namespace vbci
       auto str_size = str.size() + 1;
       auto arg = Array::create(
         new uint8_t[Array::size_of(str_size, arg_rep.second->size)],
-        Location::stack(),
+        Location::immortal(),
         typeid_arg,
         arg_rep.first,
         str_size,
@@ -681,13 +680,9 @@ namespace vbci
       std::memcpy(p, str.c_str(), str_size);
       arg->set_size(str_size - 1);
 
-      // TODO Register use here is pointless, and we should optimise.
-      // Create a exchange that doesn't use reference counting.
-      Register val = ValueTransfer(arg);
-      Register dst = argv->exchange<true>(i, std::move(val));
+      Register val = ValueImmortal(Value(arg));
+      argv->initialize(i, std::move(val));
     }
-
-    argv->immortalize();
   }
 
   bool Program::load()

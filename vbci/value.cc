@@ -61,7 +61,7 @@ namespace vbci
   Value::Value(Array* arr) : arr(arr), tag(ValueType::Array), readonly(0) {}
   Value::Value(Cown* cown) : cown(cown), tag(ValueType::Cown) {}
 
-  Value::Value(uint64_t val, Location frame)
+  Value::Value(uint64_t val, FrameId frame)
   : u64(val), idx(frame.raw()), tag(ValueType::RegisterRef), readonly(0)
   {}
 
@@ -534,6 +534,14 @@ namespace vbci
     return Thread::get_register(u64);
   }
 
+  FrameId Value::frame_id() const
+  {
+    if (tag != ValueType::RegisterRef)
+      Value::error(Error::BadConversion);
+
+    return FrameId::from_raw(idx);
+  }
+
   ValueType Value::get_value_type() const
   {
     return tag;
@@ -777,9 +785,6 @@ namespace vbci
   {
     switch (tag)
     {
-      case ValueType::RegisterRef:
-        return Location::from_raw(idx);
-
       case ValueType::Object:
       case ValueType::FieldRef:
         return obj->location();
@@ -902,11 +907,9 @@ namespace vbci
     {
       case ValueType::RegisterRef:
       {
-        auto vloc = v->location();
-
-        auto ref_loc = Location::from_raw(idx);
-
-        if (vloc.is_stack() && (vloc.stack_index() > ref_loc.stack_index()))
+        if (
+          v->get_value_type() == ValueType::RegisterRef &&
+          v->frame_id() > frame_id())
           Value::error(Error::BadStoreTarget);
 
         Register& reg = Thread::get_register(u64);

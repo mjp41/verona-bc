@@ -5,28 +5,35 @@
 
 namespace vbci::writebarrier
 {
-  inline void check_store(Location store_loc, Location value_loc)
+  inline void check_value(const Value& value)
+  {
+    if (
+      value.is_readonly() ||
+      value.get_value_type() == ValueType::RegisterRef)
+      Value::error(Error::BadStore);
+  }
+
+  inline void check_exchange(Location store_loc, const Value& value)
   {
     if (store_loc.is_immutable() || store_loc.is_immortal())
       Value::error(Error::BadStore);
 
-    if (!value_loc.is_stack())
-      return;
-
-    if (
-      !store_loc.is_stack() ||
-      store_loc.stack_index() < value_loc.stack_index())
-      Value::error(Error::BadStore);
+    check_value(value);
   }
 
   inline void
   init(Location store_loc, void* addr, ValueType type, Register next)
   {
-    if (next->is_readonly())
-      Value::error(Error::BadStore);
+    check_value(next.borrow());
 
-    auto next_loc = next->location();
-    check_store(store_loc, next_loc);
+    if (store_loc.is_immutable() || store_loc.is_immortal())
+    {
+      auto next_loc = next->location();
+
+      if (!next_loc.is_immutable() && !next_loc.is_immortal())
+        Value::error(Error::BadStore);
+    }
+
     next->to_addr(type, addr);
     next.clear_unsafe();
   }
@@ -36,12 +43,7 @@ namespace vbci::writebarrier
   exchange(Location store_loc, void* addr, ValueType type, Reg<is_move> next)
   {
     auto prev = Value::from_addr(type, addr);
-    auto next_loc = next->location();
-
-    if (next->is_readonly())
-      Value::error(Error::BadStore);
-
-    check_store(store_loc, next_loc);
+    check_exchange(store_loc, next.borrow());
 
     next->to_addr(type, addr);
 
@@ -61,8 +63,7 @@ namespace vbci::writebarrier
   {
     auto value_loc = value.location();
 
-    if (
-      value_loc.is_immortal() || value_loc.is_stack() || value_loc.is_pending())
+    if (value_loc.is_immortal() || value_loc.is_pending())
       return;
 
     value.dec();

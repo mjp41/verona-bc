@@ -9,15 +9,13 @@ namespace vbci
 
   struct Location
   {
-    static constexpr auto Stack = uintptr_t(0x1);
-    static constexpr auto Immutable = uintptr_t(0x2);
-    static constexpr auto Pending = uintptr_t(0x3);
-    static constexpr auto Immortal = uintptr_t(0x4);
-    static constexpr auto SccPtr = uintptr_t(0x5);
-    static constexpr auto Mask = uintptr_t(0x7);
-    static constexpr auto FrameInc = uintptr_t(0x8);
-
   private:
+    static constexpr auto Immutable = uintptr_t(0x1);
+    static constexpr auto Pending = uintptr_t(0x2);
+    static constexpr auto Immortal = uintptr_t(0x3);
+    static constexpr auto SccPtr = uintptr_t(0x4);
+    static constexpr auto Mask = uintptr_t(0x7);
+
     uintptr_t value;
 
     // Location objects are intentionally only constructible via the public
@@ -28,16 +26,6 @@ namespace vbci
     constexpr Location(uintptr_t v) : value(v) {}
 
   public:
-    static constexpr Location from_raw(uintptr_t raw)
-    {
-      return Location(raw);
-    }
-
-    static constexpr Location stack()
-    {
-      return Location(Stack);
-    };
-
     static constexpr Location immutable()
     {
       return Location(Immutable);
@@ -48,51 +36,16 @@ namespace vbci
       return Location(Immortal);
     };
 
+    static constexpr Location pending()
+    {
+      return Location(Pending);
+    };
+
     explicit Location(Region* r) : value(reinterpret_cast<uintptr_t>(r)) {}
-
-    constexpr uintptr_t raw() const
-    {
-      return value;
-    }
-
-    bool operator==(const Location& other) const
-    {
-      return value == other.value;
-    }
-
-    bool operator!=(const Location& other) const
-    {
-      return value != other.value;
-    }
-
-    bool operator<(const Location& other) const
-    {
-      return value < other.value;
-    }
-
-    bool operator<=(const Location& other) const
-    {
-      return value <= other.value;
-    }
-
-    bool operator>(const Location& other) const
-    {
-      return value > other.value;
-    }
-
-    bool operator>=(const Location& other) const
-    {
-      return value >= other.value;
-    }
 
     bool is_region() const
     {
       return (value & Mask) == 0;
-    }
-
-    bool is_stack() const
-    {
-      return (value & Mask) == Stack;
     }
 
     bool is_immortal() const
@@ -120,30 +73,6 @@ namespace vbci
     {
       assert(is_region());
       return reinterpret_cast<Region*>(value);
-    }
-
-    Location pending() const
-    {
-      assert(is_region());
-      return Location(value | Pending);
-    }
-
-    Location unpending() const
-    {
-      assert(is_pending());
-      return Location(value & ~Pending);
-    }
-
-    Location next_stack_level() const
-    {
-      assert(is_stack());
-      return Location(value + FrameInc);
-    }
-
-    size_t stack_index() const
-    {
-      assert(is_stack());
-      return (value - Stack) / FrameInc;
     }
 
     static Location scc_ptr(Header* h)

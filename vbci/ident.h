@@ -35,6 +35,7 @@ namespace vbci
   };
 
   using PC = size_t;
+  struct FrameId;
   struct Location;
   using RC = uint32_t;
   using ARC = std::atomic<RC>;

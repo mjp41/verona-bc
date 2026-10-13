@@ -8,7 +8,7 @@ namespace vbci
 {
   Frame::Frame(
     Function* func,
-    Location frame_id,
+    FrameId frame_id,
     std::vector<Register>& locals,
     size_t base,
     std::vector<Object*>& finalize,

@@ -151,7 +151,7 @@ namespace vbci
     void pushframe(Function* func, size_t dst);
     void try_pushframe(Function* func, size_t dst);
     void popframe(Register result);
-    void raise(Register result, Location target);
+    void raise(Register result, FrameId target);
     void tailcall(Function* func);
     void teardown(bool tailcall = false);
     void teardown_all();

@@ -8,7 +8,6 @@ namespace vbci
   // union-find for ARC tracking, and make reachable objects immutable.
   // The allocation group survives with any unfrozen objects.
   // Objects reached across allocation groups are frozen in the same way.
-  // No-op (returns true) if root is already immutable or immortal.
-  // Returns false if root is on the stack.
-  bool freeze(Header* root);
+  // No-op if root is already immutable or immortal.
+  void freeze(Header* root);
 }

@@ -202,7 +202,7 @@ namespace vbci
     // Walk the SCC members by tracing fields and following SCC_PTR.
     std::vector<Header*> work;
     work.push_back(root);
-    root->set_location(Location::from_raw(Location::Pending));
+    root->set_location(Location::pending());
 
     auto& program = Program::get();
 
@@ -215,7 +215,7 @@ namespace vbci
 
         if ((rep == root) || rep->location().is_pending())
         {
-          h->set_location(Location::from_raw(Location::Pending));
+          h->set_location(Location::pending());
           work.push_back(h);
         }
       }

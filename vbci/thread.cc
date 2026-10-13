@@ -1150,8 +1150,7 @@ namespace vbci
             auto copy =
               copy_graph_and_consume(std::move(src), group.get());
 
-            if (!freeze(copy->get_header()))
-              Value::error(Error::BadFreeze);
+            freeze(copy->get_header());
 
             dst = std::move(copy);
             return;
@@ -1641,7 +1640,7 @@ namespace vbci
         process([](Register& dst, const Register& src, Frame& frame) INLINE {
           dst = ValueImmortal(
             Value(static_cast<uint64_t>(frame.raise_target.raw())));
-          frame.raise_target = Location::from_raw(src->get_u64());
+          frame.raise_target = FrameId::from_raw(src->get_u64());
         });
         break;
       }
@@ -1760,8 +1759,7 @@ namespace vbci
           tuple_arr->exchange<false>(1, offsets_reg);
           tuple_arr->exchange<false>(2, kinds_reg);
 
-          if (!freeze(tuple_arr))
-            Value::error(Error::BadType);
+          freeze(tuple_arr);
 
           dst = ValueTransfer(tuple_arr);
         });
@@ -1928,13 +1926,13 @@ namespace vbci
 
     check_args(func->param_types);
 
-    Location frame_id = Location::stack();
+    FrameId frame_id = FrameId::first();
     size_t base = 0;
     size_t finalize_base = 0;
 
     if (frame)
     {
-      frame_id = frame->frame_id.next_stack_level();
+      frame_id = frame->frame_id.next();
       base = frame->base + frame->func->registers;
       finalize_base = frame->finalize_top;
     }
@@ -1976,13 +1974,13 @@ namespace vbci
 
     LOG(Trace) << "TryCall " << program->di_function(func);
 
-    Location frame_id = Location::stack();
+    FrameId frame_id = FrameId::first();
     size_t base = 0;
     size_t finalize_base = 0;
 
     if (frame)
     {
-      frame_id = frame->frame_id.next_stack_level();
+      frame_id = frame->frame_id.next();
       base = frame->base + frame->func->registers;
       finalize_base = frame->finalize_top;
     }
@@ -2018,9 +2016,9 @@ namespace vbci
     frame->drop_args(args);
 
     // Check for stack escapes.
-    auto retloc = ret->location();
-
-    if (retloc == frame->frame_id)
+    if (
+      ret->get_value_type() == ValueType::RegisterRef &&
+      ret->frame_id() == frame->frame_id)
     {
       // The return value can't be stack allocated in this frame.
       Value::error(Error::BadStackEscape);
@@ -2048,20 +2046,20 @@ namespace vbci
     frame->local(dst) = std::move(ret);
   }
 
-  void Thread::raise(Register ret_, Location target)
+  void Thread::raise(Register ret_, FrameId target)
   {
     Register ret{std::move(ret_)};
 
     // Validate the target: must be a stack frame with a lower ID than the
     // current frame (tailcalls retain frame IDs, so no gaps exist).
-    if (!target.is_stack() || target >= frame->frame_id)
+    if (target >= frame->frame_id)
       Value::error(Error::BadRaiseTarget);
 
     // Check if the raised value needs relocation before we tear down
     // intermediate frames.
-    auto retloc = ret->location();
-
-    if (retloc.is_stack() && retloc > target)
+    if (
+      ret->get_value_type() == ValueType::RegisterRef &&
+      ret->frame_id() > target)
     {
       // Stack-allocated in a frame younger than the target. It will be
       // destroyed when we tear down intermediate frames.
@@ -2097,7 +2095,9 @@ namespace vbci
     {
       auto& arg = frame->arg(i);
 
-      if (arg->location() == frame->frame_id)
+      if (
+        arg->get_value_type() == ValueType::RegisterRef &&
+        arg->frame_id() == frame->frame_id)
         stack_escape = true;
 
       frame->local(i) = std::move(arg);

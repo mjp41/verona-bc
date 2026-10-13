@@ -71,16 +71,13 @@ namespace vbci
       static_cast<Object*>(h)->trace_fn(fn);
   }
 
-  bool freeze(Header* root)
+  void freeze(Header* root)
   {
     assert(root);
     auto loc = root->location();
 
     if (loc.is_immutable() || loc.is_immortal())
-      return true;
-
-    if (loc.is_stack())
-      return false;
+      return;
 
     auto region = loc.to_region();
 
@@ -146,7 +143,7 @@ namespace vbci
           if (rep_loc.to_region() == region)
           {
             region->remove(h);
-            h->set_location(Location::from_raw(Location::Pending));
+            h->set_location(Location::pending());
 
             pending.push_back(h);
             dfs.push_back(post_order_mark(h));
@@ -158,6 +155,5 @@ namespace vbci
       }
     }
 
-    return true;
   }
 }

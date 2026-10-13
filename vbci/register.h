@@ -36,7 +36,7 @@ namespace vbci
 
     ValueImmortal(const Value& v) : Value(v)
     {
-      assert(v.location() == Location::immortal());
+      assert(v.location().is_immortal());
     }
   };
 
@@ -46,7 +46,7 @@ namespace vbci
 
     ValueStaticLifetime(const Value& v) : Value(v)
     {
-      assert(v.location().is_stack());
+      assert(v.get_value_type() == ValueType::RegisterRef);
     }
   };
 
@@ -78,13 +78,13 @@ namespace vbci
 
     Register(ValueImmortal v)
     {
-      assert(v.location() == Location::immortal());
+      assert(v.location().is_immortal());
       set_raw_unsafe(v);
     };
 
     Register(ValueStaticLifetime v)
     {
-      assert(v.location().is_stack());
+      assert(v.get_value_type() == ValueType::RegisterRef);
       set_raw_unsafe(v);
     };
 

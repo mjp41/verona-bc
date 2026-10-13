@@ -1,5 +1,6 @@
 #pragma once
 
+#include "frame_id.h"
 #include "register.h"
 #include "value.h"
 
@@ -11,7 +12,7 @@ namespace vbci
   struct Frame
   {
     Function* func;
-    Location frame_id;
+    FrameId frame_id;
     std::vector<Register>& locals;
     size_t base;
     std::vector<Object*>& finalize;
@@ -19,11 +20,11 @@ namespace vbci
     size_t finalize_top;
     PC pc;
     size_t dst;
-    Location raise_target;
+    FrameId raise_target;
 
     Frame(
       Function* func,
-      Location frame_id,
+      FrameId frame_id,
       std::vector<Register>& locals,
       size_t base,
       std::vector<Object*>& finalize,

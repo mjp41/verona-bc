@@ -55,13 +55,14 @@ remain independently reference counted.
 `writebarrier.h` now implements ordinary managed exchange semantics:
 
 - reject writes to immutable storage;
-- reject references to invalid stack lifetimes;
+- reject readonly values and register references;
 - retain or transfer the incoming value;
 - install it;
 - release the outgoing value.
 
-A mutable field may only refer to a value in the same allocation group. This
-is a debug invariant rather than a runtime ownership-repair mechanism.
+Initialization may write immutable storage only with immutable or immortal
+values. Mutable cross-group references are prevented by copying at ownership
+boundaries rather than repaired by stores.
 
 ## Copy-on-split boundaries
 
@@ -132,6 +133,8 @@ component. It must not reintroduce an allocation-group reference count.
 
 | File | Purpose |
 |------|---------|
+| `frame_id.h` | Frame ordering for register-reference lifetime checks |
+| `location.h` | Header allocation and frozen-SCC state |
 | `region.h` | `Region` and move-only `AllocationGroup` |
 | `region_rc.h/cc` | Mutable allocation storage and group collection |
 | `header.h` | Object RC and immutable ARC operations |

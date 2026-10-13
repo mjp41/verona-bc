@@ -151,7 +151,7 @@ namespace vbci
     bool add_reference(Reg<is_move>& next)
     {
       // Can't store a stack value in a cown.
-      if (next->location().is_stack())
+      if (next->get_value_type() == ValueType::RegisterRef)
         return false;
 
       if constexpr (is_move)
