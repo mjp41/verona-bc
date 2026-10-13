@@ -378,11 +378,6 @@ namespace vbci
           process<F, Args..., Program&>(
             self, fun, std::forward<Args>(args)..., *self.program);
         }
-        else if constexpr (std::is_same_v<T, Stack&>)
-        {
-          process<F, Args..., Stack&>(
-            self, fun, std::forward<Args>(args)..., self.stack);
-        }
         else if constexpr (std::is_same_v<T, ArgReg>)
         {
           self.trace_instruction(" ArgReg=", self.args);
@@ -1953,7 +1948,6 @@ namespace vbci
     frames.emplace_back(
       func,
       frame_id,
-      stack.save(),
       locals,
       base,
       finalize,
@@ -2002,7 +1996,6 @@ namespace vbci
     frames.emplace_back(
       func,
       frame_id,
-      stack.save(),
       locals,
       base,
       finalize,
@@ -2125,17 +2118,6 @@ namespace vbci
     LOG(Trace) << "Tearing down frame " << program->di_function(frame->func);
     // Drop all frame registers.
     frame->drop();
-
-    // Finalize all stack objects (run finalizers and drop field references).
-    stack.visit_headers(frame->save, stack.top, [&](Header* h) {
-      if (Program::get().is_array(h->get_type_id()))
-        static_cast<Array*>(h)->finalize();
-      else
-        static_cast<Object*>(h)->finalize();
-    });
-
-    // Pop the stack.
-    stack.restore(frame->save);
   }
 
   void Thread::teardown_all()

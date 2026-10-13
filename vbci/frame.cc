@@ -9,7 +9,6 @@ namespace vbci
   Frame::Frame(
     Function* func,
     Location frame_id,
-    Stack::Idx save,
     std::vector<Register>& locals,
     size_t base,
     std::vector<Object*>& finalize,
@@ -18,7 +17,6 @@ namespace vbci
     size_t dst)
   : func(func),
     frame_id(frame_id),
-    save(save),
     locals(locals),
     base(base),
     finalize(finalize),

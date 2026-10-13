@@ -7,7 +7,6 @@
 #include "program.h"
 #include "region.h"
 #include "register.h"
-#include "stack.h"
 
 #include <bit>
 #include <functional>
@@ -24,7 +23,6 @@ namespace vbci
     friend struct Operands;
 
   private:
-    Stack stack;
     std::vector<Frame> frames;
     std::vector<Register> locals;
     std::vector<Object*> finalize;

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "register.h"
-#include "stack.h"
 #include "value.h"
 
 #include <span>
@@ -13,7 +12,6 @@ namespace vbci
   {
     Function* func;
     Location frame_id;
-    Stack::Idx save;
     std::vector<Register>& locals;
     size_t base;
     std::vector<Object*>& finalize;
@@ -26,7 +24,6 @@ namespace vbci
     Frame(
       Function* func,
       Location frame_id,
-      Stack::Idx save,
       std::vector<Register>& locals,
       size_t base,
       std::vector<Object*>& finalize,
