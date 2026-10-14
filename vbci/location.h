@@ -15,6 +15,7 @@ namespace vbci
     static constexpr auto Immortal = uintptr_t(0x4);
     static constexpr auto SccPtr = uintptr_t(0x5);
     static constexpr auto Cown = uintptr_t(0x6);
+    static constexpr auto Finalizing = uintptr_t(0x7);
     static constexpr auto Mask = uintptr_t(0x7);
 
     uintptr_t value;
@@ -52,6 +53,11 @@ namespace vbci
       return Location(Cown);
     };
 
+    static constexpr Location finalizing()
+    {
+      return Location(Finalizing);
+    };
+
     bool is_mutable() const
     {
       return value == Mutable;
@@ -81,6 +87,11 @@ namespace vbci
     bool is_cown() const
     {
       return (value & Mask) == Cown;
+    }
+
+    bool is_finalizing() const
+    {
+      return (value & Mask) == Finalizing;
     }
 
     static Location scc_ptr(Header* h)

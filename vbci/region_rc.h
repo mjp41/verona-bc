@@ -26,13 +26,11 @@ namespace vbci
     Object* object(Class& cls) override;
     Array* array(uint32_t type_id, size_t size) override;
 
-    void rfree(Header* h) override;
     void insert(Header* h) override;
     bool remove(Header* h) override;
-    bool is_finalizing() override;
     bool begin_finalizing() override;
-    void finalize_contents() override;
-    void release_dead_objects() override;
+    Header* take_header() override;
+    void destroy() override;
     void absorb(Region* source) override;
 
     ~RegionRC()

@@ -40,11 +40,13 @@ releasing the group. `Thread::OwnedRegister` implements this protocol.
 
 `Header::rc` counts mutable references to an individual object or array.
 Register and field references use the same `inc()` / `dec()` operations.
-Reaching zero collects the individual object unless its group is already
-finalizing. The write barrier separately rejects storing readonly borrowed
-values. Mutable headers carry no group pointer. Incrementing RC is
-group-independent; decrementing requires the owning group as
-`current_region()` because reaching zero may collect the object.
+Reaching zero collects the individual object. Headers already claimed by the
+collector use the `Finalizing` location state, whose increments and decrements
+are no-ops. Newly allocated objects remain `Mutable` even when their region is
+being finalized, so their ordinary decrements still collect acyclic garbage.
+The write barrier separately rejects storing readonly borrowed values. Mutable
+headers carry no group pointer; decrementing uses `current_region()` when zero
+removes the object from its group.
 
 Object RC can collect acyclic garbage early. Allocation-group destruction also
 collects remaining cyclic or otherwise live objects as a group.
@@ -132,8 +134,14 @@ Collection within the active mutable batch is two phase:
 lifetime continues in a copy. Copy finalization must distinguish the live
 source image from abandoned garbage so finalizers run exactly once.
 
-Finalizers execute with readonly access. Any allocations made by standalone
-cleanup execution use an explicitly owned temporary group.
+Finalizers execute with readonly access and allocate in the current group,
+including when that group is finalizing. The collector removes every current
+header from `RegionRC` into its intrinsic finalization queue before invoking
+user code, marks those headers `Finalizing`, and leaves the region set empty
+for finalizer allocations. Acyclic finalizer allocations can still reach zero
+normally; only remaining cycles are transferred in the next batch. Finalized
+headers move to the collector's deletion queue. The collector repeats until
+the region set remains empty, then deletes all headers and the region.
 
 ## Cowns
 

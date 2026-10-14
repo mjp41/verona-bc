@@ -235,6 +235,15 @@ location state shares the immutable representative's atomic count and selects
 cown teardown rather than SCC collection when that count reaches zero. The
 count storage then becomes the intrusive cown collector link.
 
+Whole-group finalization reuses the group for allocations made by finalizers.
+Before running a batch, the collector removes all live headers from `RegionRC`
+into its intrinsic finalization queue and marks them `Finalizing`; new
+allocations therefore populate a fresh region set as ordinary mutable objects.
+References to claimed headers no longer affect RC, while acyclic new objects
+can still reach zero and collect normally. Finalized headers accumulate in the
+collector's deletion queue, and region transfer repeats for remaining cycles.
+Only then are all finalized objects and the empty region released.
+
 Allocation groups preserve the finalization contract for acyclic graphs: an
 abandoned source image is reclaimed without its user finalizer, while each
 surviving destination image finalizes when its semantic lifetime ends. The

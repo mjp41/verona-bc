@@ -145,7 +145,7 @@ namespace vbci
       };
 
       auto* region = current_region();
-      if (region != nullptr && !region->is_finalizing())
+      if (region != nullptr)
         return {{}, run()};
 
       auto group = AllocationGroup::create();

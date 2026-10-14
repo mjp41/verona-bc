@@ -107,6 +107,8 @@ namespace vbci
 
     void enqueue(Header* header, Region* region)
     {
+      header->set_location(Location::finalizing());
+
       if (collecting_region == region)
         enqueue_header(header);
       else
@@ -144,44 +146,52 @@ namespace vbci
     {
       auto& program = Program::get();
 
-      while (!headers_to_finalize.empty())
+      while (true)
       {
-        auto* header = headers_to_finalize.pop();
-        LOG(Trace) << "Finalizing work item: " << static_cast<void*>(header);
+        while (!headers_to_finalize.empty())
+        {
+          auto* header = headers_to_finalize.pop();
+          LOG(Trace) << "Finalizing work item: " << static_cast<void*>(header);
 
-        if (program.is_array(header->get_type_id()))
-          static_cast<Array*>(header)->finalize();
-        else
-          static_cast<Object*>(header)->finalize();
-        headers_to_delete.push_front(header);
+          if (program.is_array(header->get_type_id()))
+            static_cast<Array*>(header)->finalize();
+          else
+            static_cast<Object*>(header)->finalize();
+          headers_to_delete.push_front(header);
+        }
+
+        if (!region_to_delete)
+          break;
+
+        auto* header = region_to_delete->take_header();
+        if (!header)
+          break;
+
+        do
+        {
+          header->set_location(Location::finalizing());
+          enqueue_header(header);
+          header = region_to_delete->take_header();
+        } while (header);
       }
 
-      if (region_to_delete)
-        region_to_delete->finalize_contents();
-
-      // Explicit header frees must happen before a region bulk free because
-      // the headers have already been detached from the region.
+      // Delete storage only after every generation has been finalized.
       while (!headers_to_delete.empty())
       {
         auto* header = headers_to_delete.pop();
         LOG(Trace) << "Deleting work item: " << static_cast<void*>(header);
 
-        if (header->location().is_pending())
-        {
-          delete[] reinterpret_cast<uint8_t*>(header);
-        }
-        else
-        {
-          assert(collecting_region);
-          collecting_region->rfree(header);
-        }
+        assert(
+          header->location().is_pending() ||
+          header->location().is_finalizing());
+        delete[] reinterpret_cast<uint8_t*>(header);
       }
 
       if (region_to_delete)
       {
         LOG(Trace) << "Deleting work item: "
                    << static_cast<void*>(region_to_delete);
-        region_to_delete->release_dead_objects();
+        region_to_delete->destroy();
         region_to_delete = nullptr;
       }
     }
@@ -330,9 +340,6 @@ namespace vbci
     assert(h->location().is_mutable());
     auto* region = current_region();
     assert(region);
-
-    if (region->is_finalizing())
-      return;
 
     // Detach explicit header work items from the region up front so a later
     // Region work item won't re-finalize them.

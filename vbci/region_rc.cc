@@ -26,12 +26,6 @@ namespace vbci
     return arr;
   }
 
-  void RegionRC::rfree(Header* h)
-  {
-    headers.erase(h);
-    delete[] reinterpret_cast<uint8_t*>(h);
-  }
-
   void RegionRC::insert(Header* h)
   {
     LOG(Trace) << "Inserting header @" << h << " into RegionRC @" << this;
@@ -43,11 +37,6 @@ namespace vbci
     return headers.erase(h) != 0;
   }
 
-  bool RegionRC::is_finalizing()
-  {
-    return finalizing;
-  }
-
   bool RegionRC::begin_finalizing()
   {
     if (finalizing)
@@ -57,25 +46,22 @@ namespace vbci
     return true;
   }
 
-  void RegionRC::finalize_contents()
+  Header* RegionRC::take_header()
   {
-    auto& program = Program::get();
     assert(finalizing);
 
-    for (auto h : headers)
-    {
-      if (program.is_array(h->get_type_id()))
-        static_cast<Array*>(h)->finalize();
-      else
-        static_cast<Object*>(h)->finalize();
-    }
+    if (headers.empty())
+      return nullptr;
+
+    auto it = headers.begin();
+    auto* header = *it;
+    headers.erase(it);
+    return header;
   }
 
-  void RegionRC::release_dead_objects()
+  void RegionRC::destroy()
   {
-    for (auto h : headers)
-      delete[] reinterpret_cast<uint8_t*>(h);
-
+    assert(headers.empty());
     delete this;
   }
 

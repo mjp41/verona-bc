@@ -132,6 +132,9 @@ namespace vbci
       if (loc.is_immortal())
         return;
 
+      if (loc.is_finalizing())
+        return;
+
       if (loc.is_shared())
       {
         atomic_inc();
@@ -153,6 +156,9 @@ namespace vbci
       if (loc.is_immortal())
         return;
 
+      if (loc.is_finalizing())
+        return;
+
       if (loc.is_shared())
       {
         if (atomic_dec())
@@ -165,7 +171,7 @@ namespace vbci
       auto* r = current_region();
       assert(r);
 
-      if (!r->is_finalizing() && (--rc == 0))
+      if (--rc == 0)
         collect(this);
     }
   };
