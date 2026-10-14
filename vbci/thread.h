@@ -21,6 +21,8 @@ namespace vbci
   struct Thread
   {
     friend struct Operands;
+    friend Region* current_region();
+    friend Region* exchange_current_region(Region* region);
 
   private:
     std::vector<Frame> frames;
@@ -41,28 +43,51 @@ namespace vbci
 #endif
 
   public:
+    using ScopeAllocationGroup = ScopeRegion;
+
     struct OwnedRegister
     {
       AllocationGroup allocation_group;
       Register value;
-    };
 
-    class ScopeAllocationGroup
-    {
-      Region* previous;
+      OwnedRegister() = default;
 
-    public:
-      explicit ScopeAllocationGroup(Region& group)
-      : previous(std::exchange(Thread::get().allocation_group, &group))
+      OwnedRegister(AllocationGroup allocation_group, Register value)
+      : allocation_group(std::move(allocation_group)),
+        value(std::move(value))
       {}
 
-      ~ScopeAllocationGroup()
+      ~OwnedRegister()
       {
-        Thread::get().allocation_group = previous;
+        clear();
       }
 
-      ScopeAllocationGroup(const ScopeAllocationGroup&) = delete;
-      ScopeAllocationGroup& operator=(const ScopeAllocationGroup&) = delete;
+      void clear()
+      {
+        if (allocation_group)
+        {
+          ScopeAllocationGroup scope(allocation_group.get());
+          value.clear();
+        }
+        else
+        {
+          value.clear();
+        }
+      }
+
+      OwnedRegister(OwnedRegister&&) = default;
+      OwnedRegister& operator=(OwnedRegister&& other)
+      {
+        if (this == &other)
+          return *this;
+
+        clear();
+        allocation_group = std::move(other.allocation_group);
+        value = std::move(other.value);
+        return *this;
+      }
+      OwnedRegister(const OwnedRegister&) = delete;
+      OwnedRegister& operator=(const OwnedRegister&) = delete;
     };
 
     static ValueTransfer run_async(uint32_t type_id, Function* func);
@@ -119,7 +144,8 @@ namespace vbci
         return thread_run(func);
       };
 
-      if (allocation_group != nullptr)
+      auto* region = current_region();
+      if (region != nullptr && !region->is_finalizing())
         return {{}, run()};
 
       auto group = AllocationGroup::create();

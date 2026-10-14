@@ -215,9 +215,20 @@ responsibility; it does not restrict references or operations.
 
 Allocation-group ownership is represented by a move-only `AllocationGroup`
 handle. Dormant cowns, queued behavior captures, and executing behaviors hold
-these handles explicitly and transfer them when groups are absorbed. The
-thread's current-allocation pointer is only a scoped allocation context; it
-does not itself confer ownership.
+these handles explicitly and transfer them when groups are absorbed. The runtime's
+thread-local current region is a scoped context for allocation and mutable
+reference counting; it does not itself confer ownership. Explicit owners
+activate their group while releasing contained values.
+
+An outer collection creates a stack-local collector, reached by reentrant
+collection through one thread-local pointer. It uses one reusable mutable batch
+for the active region, finalizing all queued headers before freeing those
+headers and, when requested, the whole region. Header or whole-region roots for
+another group are deferred until that group becomes active. Cowns are queued
+intrusively and activate their owned group while dropping their content;
+frozen SCC roots use the same tagged work queue but require no region. SCC
+members enter the common header-finalization batch, whose normal field drops
+decrement external immutable references and queue them only on ARC zero.
 
 Allocation groups preserve the finalization contract for acyclic graphs: an
 abandoned source image is reclaimed without its user finalizer, while each

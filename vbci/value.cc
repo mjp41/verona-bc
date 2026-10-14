@@ -802,35 +802,6 @@ namespace vbci
     }
   }
 
-  Region* Value::region() const
-  {
-    switch (tag)
-    {
-      case ValueType::Object:
-      case ValueType::FieldRef:
-      {
-        auto r = obj->region();
-        if (r)
-          return r;
-        break;
-      }
-
-      case ValueType::Array:
-      case ValueType::ArrayRef:
-      {
-        auto r = arr->region();
-        if (r)
-          return r;
-        break;
-      }
-
-      default:
-        break;
-    }
-
-    Value::error(Error::BadAllocTarget);
-  }
-
   void Value::immortalize()
   {
     LOG(Trace) << "Immortalizing value of type " << int(tag) << "@" << this;

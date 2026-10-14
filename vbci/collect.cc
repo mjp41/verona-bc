@@ -14,50 +14,245 @@
 #include "collect.h"
 
 #include "array.h"
+#include "cown.h"
 #include "header.h"
 #include "object.h"
 #include "region.h"
 
 #include <queue>
-#include <type_traits>
 #include <vector>
 
 namespace vbci
 {
-  enum class CollectorType
+  enum class WorkType
   {
+    Header,
     Region,
-    Header
+    Immutable
   };
 
   struct WorkItem
   {
-    CollectorType type;
-    void* header;
+    WorkType type;
+    Region* region;
+    Header* header;
 
-    WorkItem(CollectorType t, void* h) : type(t), header(h) {}
+    explicit WorkItem(Region* region)
+    : type(WorkType::Region), region(region), header(nullptr)
+    {}
+
+    explicit WorkItem(Header* header)
+    : type(WorkType::Immutable), region(nullptr), header(header)
+    {}
+
+    WorkItem(Region* region, Header* header)
+    : type(WorkType::Header), region(region), header(header)
+    {}
   };
 
-  template<typename T>
-  struct Tag;
-
-  template<>
-  struct Tag<Header>
+  struct Collector
   {
-    static constexpr CollectorType value = CollectorType::Header;
+    std::queue<WorkItem> work;
+    std::queue<Header*> headers_to_finalize;
+    std::vector<Header*> headers_to_delete;
+    Cown* cowns_to_finalize = nullptr;
+    Region* collecting_region = nullptr;
+    Region* region_to_delete = nullptr;
+
+    void enqueue(Header* header, Region* region)
+    {
+      if (collecting_region == region)
+        headers_to_finalize.push(header);
+      else
+        work.emplace(region, header);
+    }
+
+    void enqueue(Region* region)
+    {
+      if (collecting_region == region)
+      {
+        assert(region_to_delete == nullptr);
+        region_to_delete = region;
+      }
+      else
+      {
+        work.emplace(region);
+      }
+    }
+
+    void enqueue(Cown* cown)
+    {
+      cown->collector_next() = cowns_to_finalize;
+      cowns_to_finalize = cown;
+    }
+
+    void enqueue_immutable(Header* root)
+    {
+      work.emplace(root);
+    }
+
+    void drain_batch()
+    {
+      auto& program = Program::get();
+
+      while (!headers_to_finalize.empty())
+      {
+        auto* header = headers_to_finalize.front();
+        headers_to_finalize.pop();
+        LOG(Trace) << "Finalizing work item: " << static_cast<void*>(header);
+
+        if (program.is_array(header->get_type_id()))
+          static_cast<Array*>(header)->finalize();
+        else
+          static_cast<Object*>(header)->finalize();
+        headers_to_delete.push_back(header);
+      }
+
+      if (region_to_delete)
+        region_to_delete->finalize_contents();
+
+      // Explicit header frees must happen before a region bulk free because
+      // the headers have already been detached from the region.
+      for (auto* header : headers_to_delete)
+      {
+        LOG(Trace) << "Deleting work item: " << static_cast<void*>(header);
+
+        if (header->location().is_pending())
+        {
+          delete[] reinterpret_cast<uint8_t*>(header);
+        }
+        else
+        {
+          assert(collecting_region);
+          collecting_region->rfree(header);
+        }
+      }
+      headers_to_delete.clear();
+
+      if (region_to_delete)
+      {
+        LOG(Trace) << "Deleting work item: "
+                   << static_cast<void*>(region_to_delete);
+        region_to_delete->release_dead_objects();
+        region_to_delete = nullptr;
+      }
+    }
+
+    void enqueue_scc_members(Header* root)
+    {
+      assert(root->location().is_pending());
+      std::vector<Header*> work;
+      work.push_back(root);
+
+      auto& program = Program::get();
+      auto add_member = [&](Header* header) {
+        if (!header->location().is_scc_ptr())
+          return;
+
+        auto* representative = Header::find(header);
+        if (representative->location().is_pending())
+        {
+          header->set_location(Location::pending());
+          work.push_back(header);
+        }
+      };
+
+      while (!work.empty())
+      {
+        auto* header = work.back();
+        work.pop_back();
+        headers_to_finalize.push(header);
+
+        // Only discover members of this SCC. Normal finalization drops
+        // external immutable references and queues them if their ARC reaches
+        // zero.
+        if (program.is_array(header->get_type_id()))
+          static_cast<Array*>(header)->trace_fn(add_member);
+        else
+          static_cast<Object*>(header)->trace_fn(add_member);
+      }
+    }
+
+    void drain()
+    {
+      while (!work.empty() || cowns_to_finalize)
+      {
+        if (!work.empty())
+        {
+          auto item = work.front();
+          work.pop();
+
+          if (item.type == WorkType::Immutable)
+          {
+            enqueue_scc_members(item.header);
+            drain_batch();
+            continue;
+          }
+
+          collecting_region = item.region;
+
+          ScopeRegion region_scope(*collecting_region);
+          if (item.type == WorkType::Header)
+            headers_to_finalize.push(item.header);
+          else
+            region_to_delete = collecting_region;
+          drain_batch();
+
+          collecting_region = nullptr;
+          continue;
+        }
+
+        auto* cown = cowns_to_finalize;
+        cowns_to_finalize = cown->collector_next();
+        collecting_region = &cown->get_allocation_group();
+
+        ScopeRegion region_scope(*collecting_region);
+        LOG(Trace) << "Finalizing cown: " << static_cast<void*>(cown);
+        cown->finalize();
+        drain_batch();
+        LOG(Trace) << "Deleting work item: " << static_cast<void*>(cown);
+        cown->destroy();
+
+        collecting_region = nullptr;
+      }
+    }
   };
 
-  template<>
-  struct Tag<Region>
-  {
-    static constexpr CollectorType value = CollectorType::Region;
-  };
-
-  static thread_local std::queue<WorkItem> worklist;
-  static thread_local std::vector<Header*> headers_to_delete;
-  static thread_local std::vector<Region*> regions_to_delete;
-  static thread_local bool in_collection = false;
+  static thread_local Collector* current_collector = nullptr;
   static thread_local bool suppress_finalizers = false;
+
+  struct CurrentCollector
+  {
+    explicit CurrentCollector(Collector& collector)
+    {
+      assert(current_collector == nullptr);
+      current_collector = &collector;
+    }
+
+    ~CurrentCollector()
+    {
+      assert(current_collector != nullptr);
+      current_collector = nullptr;
+    }
+
+    CurrentCollector(const CurrentCollector&) = delete;
+    CurrentCollector& operator=(const CurrentCollector&) = delete;
+  };
+
+  template<typename Fn>
+  static void use_collector(Fn&& fn)
+  {
+    if (current_collector)
+    {
+      fn(*current_collector);
+      return;
+    }
+
+    Collector collector;
+    CurrentCollector current(collector);
+    fn(collector);
+    collector.drain();
+  }
 
   SuppressFinalizers::SuppressFinalizers()
   {
@@ -76,168 +271,42 @@ namespace vbci
     return suppress_finalizers;
   }
 
-  static void drain_work_list()
+  void collect(Header* h)
   {
-    auto& program = Program::get();
-    in_collection = true;
+    assert(h->location().is_mutable());
+    auto* region = current_region();
+    assert(region);
 
-    // Phase 1: Finalize all objects, collecting the transitive closure.
-    while (!worklist.empty())
-    {
-      auto n = worklist.front();
-      worklist.pop();
-      LOG(Trace) << "Finalizing work item: " << static_cast<void*>(n.header);
-
-      switch (n.type)
-      {
-        case CollectorType::Header:
-        {
-          auto h = static_cast<Header*>(n.header);
-
-          if (program.is_array(h->get_type_id()))
-            static_cast<Array*>(h)->finalize();
-          else
-            static_cast<Object*>(h)->finalize();
-          break;
-        }
-
-        case CollectorType::Region:
-        {
-          auto r = static_cast<Region*>(n.header);
-          r->finalize_contents();
-          break;
-        }
-      }
-
-      switch (n.type)
-      {
-        case CollectorType::Header:
-          headers_to_delete.push_back(static_cast<Header*>(n.header));
-          break;
-
-        case CollectorType::Region:
-          regions_to_delete.push_back(static_cast<Region*>(n.header));
-          break;
-      }
-    }
-
-    // Phase 2: Delete all finalized objects. Explicit header frees must happen
-    // before region bulk frees so a Region work item cannot free a later Header
-    // work item that still points into that region.
-    for (auto* h : headers_to_delete)
-    {
-      LOG(Trace) << "Deleting work item: " << static_cast<void*>(h);
-
-      if (h->location().is_immutable() || h->location().is_pending())
-      {
-        delete[] reinterpret_cast<uint8_t*>(h);
-      }
-      else
-      {
-        h->region()->rfree(h);
-      }
-    }
-
-    for (auto* r : regions_to_delete)
-    {
-      LOG(Trace) << "Deleting work item: " << static_cast<void*>(r);
-      r->release_dead_objects();
-    }
-
-    headers_to_delete.clear();
-    regions_to_delete.clear();
-
-    // Phase 2 may have enqueued new items while dropping references. Loop back
-    // to process them.
-    if (!worklist.empty())
-    {
-      drain_work_list();
+    if (region->is_finalizing())
       return;
-    }
 
-    in_collection = false;
+    // Detach explicit header work items from the region up front so a later
+    // Region work item won't re-finalize them.
+    if (!region->remove(h))
+      return;
+
+    use_collector(
+      [&](Collector& collector) { collector.enqueue(h, region); });
   }
 
-  template<typename T>
-  void collect(T* h)
+  void collect(Region* region)
   {
-    if constexpr (std::is_same_v<T, Header>)
-    {
-      if (h->location().is_region())
-      {
-        auto* region = h->region();
-
-        if (region->is_finalizing())
-          return;
-
-        // Detach explicit header work items from the region up front so a later
-        // Region work item won't re-finalize them.
-        if (!region->remove(h))
-          return;
-      }
-    }
-    else if (!h->begin_finalizing())
-    {
+    if (!region->begin_finalizing())
       return;
-    }
 
-    worklist.emplace(Tag<T>::value, h);
-
-    if (!in_collection)
-      drain_work_list();
+    use_collector([&](Collector& collector) { collector.enqueue(region); });
   }
 
-  template void collect<Header>(Header* h);
-  template void collect<Region>(Region* h);
+  void collect(Cown* cown)
+  {
+    use_collector([&](Collector& collector) { collector.enqueue(cown); });
+  }
 
-  // Collect a frozen SCC: walk all members via SCC_PTR chains,
-  // mark each as pending (processing sentinel), and push onto the
-  // collector worklist. The two-phase collector handles finalization
-  // (Phase 1) and deallocation (Phase 2), including cascading decrefs
-  // from field drops.
   void collect_scc(Header* root)
   {
     assert(root->location().is_immutable());
-
-    // Walk the SCC members by tracing fields and following SCC_PTR.
-    std::vector<Header*> work;
-    work.push_back(root);
     root->set_location(Location::pending());
-
-    auto& program = Program::get();
-
-    auto fn = [&](Header* h) {
-      // If this is an SCC_PTR member of this SCC and not yet marked for
-      // processing, add it.
-      if (h->location().is_scc_ptr())
-      {
-        auto rep = Header::find(h);
-
-        if ((rep == root) || rep->location().is_pending())
-        {
-          h->set_location(Location::pending());
-          work.push_back(h);
-        }
-      }
-    };
-
-    while (!work.empty())
-    {
-      auto x = work.back();
-      work.pop_back();
-
-      // Push this member into the collector worklist (don't drain yet).
-      worklist.emplace(Tag<Header>::value, x);
-
-      // Trace fields to find other SCC members.
-      if (program.is_array(x->get_type_id()))
-        static_cast<Array*>(x)->trace_fn(fn);
-      else
-        static_cast<Object*>(x)->trace_fn(fn);
-    }
-
-    // If we're not already inside a collection, drain now.
-    if (!in_collection)
-      drain_work_list();
+    use_collector(
+      [&](Collector& collector) { collector.enqueue_immutable(root); });
   }
 }

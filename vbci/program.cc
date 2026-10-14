@@ -103,7 +103,7 @@ namespace vbci
     slot = std::move(result.value);
 
     if (slot->is_header())
-      freeze(slot->get_header());
+      freeze(slot->get_header(), result.allocation_group.get());
 
     slot.borrow().immortalize();
   }

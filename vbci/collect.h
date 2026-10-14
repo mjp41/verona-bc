@@ -5,6 +5,8 @@
 namespace vbci
 {
   struct Header;
+  struct Region;
+  struct Cown;
 
   struct SuppressFinalizers
   {
@@ -17,8 +19,9 @@ namespace vbci
     static bool active();
   };
 
-  template<typename T>
-  void collect(T* h);
+  void collect(Header* h);
+  void collect(Region* region);
+  void collect(Cown* cown);
 
   // Collect a frozen SCC: find all members and push them onto the
   // collector worklist so finalizers run before memory is freed.

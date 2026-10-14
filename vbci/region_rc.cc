@@ -8,7 +8,7 @@ namespace vbci
   Object* RegionRC::object(Class& cls)
   {
     auto mem = new uint8_t[cls.size];
-    auto loc = Location(this);
+    auto loc = Location::mutable_();
     auto obj = Object::create(mem, cls, loc);
     headers.emplace(obj);
     return obj;
@@ -19,7 +19,7 @@ namespace vbci
     auto content_type_id = Program::get().unarray(type_id);
     auto rep = Program::get().layout_type_id(content_type_id);
     auto mem = new uint8_t[Array::size_of(size, rep.second->size)];
-    auto loc = Location(this);
+    auto loc = Location::mutable_();
     auto arr =
       Array::create(mem, loc, type_id, rep.first, size, rep.second->size);
     headers.emplace(arr);
@@ -85,9 +85,6 @@ namespace vbci
     auto* source = static_cast<RegionRC*>(source_region);
     assert(!source->finalizing);
 
-    for (auto* header : source->headers)
-      header->set_location(Location(this));
-    headers.merge(source->headers);
     headers.merge(source->headers);
     delete source;
   }

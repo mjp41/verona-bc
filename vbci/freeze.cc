@@ -61,7 +61,7 @@ namespace vbci
       if (loc.is_immutable() || loc.is_immortal())
         return;
 
-      if (loc.is_region())
+      if (loc.is_mutable())
         dfs.push_back(h);
     };
 
@@ -71,7 +71,7 @@ namespace vbci
       static_cast<Object*>(h)->trace_fn(fn);
   }
 
-  void freeze(Header* root)
+  void freeze(Header* root, Region& region)
   {
     assert(root);
     auto loc = root->location();
@@ -79,81 +79,60 @@ namespace vbci
     if (loc.is_immutable() || loc.is_immortal())
       return;
 
-    auto region = loc.to_region();
-
-    std::vector<Header*> worklist;
     std::vector<Header*> dfs;
     std::vector<Header*> pending;
 
-    worklist.push_back(root);
+    dfs.push_back(root);
 
-    while (!worklist.empty())
+    while (!dfs.empty())
     {
-      root = worklist.back();
-      worklist.pop_back();
+      Header* h_mark = dfs.back();
+      dfs.pop_back();
 
-      // Skip duplicate worklist entries and already-frozen objects.
-      if (root->location().is_immutable() || root->location().is_scc_ptr())
-        continue;
-
-      region = root->region();
-
-      dfs.push_back(root);
-
-      while (!dfs.empty())
+      if (is_post_order(h_mark))
       {
-        Header* h_mark = dfs.back();
-        dfs.pop_back();
+        Header* h = remove_post_order_mark(h_mark);
 
-        if (is_post_order(h_mark))
+        if (!pending.empty() && (pending.back() == h))
         {
-          Header* h = remove_post_order_mark(h_mark);
-
-          if (!pending.empty() && (pending.back() == h))
-          {
-            pending.pop_back();
-            auto rep = Header::find(h);
-            rep->set_location(Location::immutable());
-            rep->set_arc(rep->get_rc());
-          }
-
-          continue;
+          pending.pop_back();
+          auto rep = Header::find(h);
+          rep->set_location(Location::immutable());
+          rep->set_arc(rep->get_rc());
         }
 
-        Header* h = h_mark;
-        auto rep = Header::find(h);
-        auto rep_loc = rep->location();
+        continue;
+      }
 
-        if (rep_loc.is_pending())
-        {
-          rep->set_rc(rep->get_rc() - 1);
+      Header* h = h_mark;
+      auto rep = Header::find(h);
+      auto rep_loc = rep->location();
 
-          while (!pending.empty() && pending.back() != rep)
-          {
-            scc_union(pending.back(), rep);
-            pending.pop_back();
-          }
-        }
-        else if (rep_loc.is_immutable())
-        {
-          // Already frozen. No action needed.
-        }
-        else if (rep_loc.is_region())
-        {
-          if (rep_loc.to_region() == region)
-          {
-            region->remove(h);
-            h->set_location(Location::pending());
+      if (rep_loc.is_pending())
+      {
+        rep->set_rc(rep->get_rc() - 1);
 
-            pending.push_back(h);
-            dfs.push_back(post_order_mark(h));
-            trace_fields(h, dfs);
-          }
-          else
-            worklist.push_back(h);
+        while (!pending.empty() && pending.back() != rep)
+        {
+          scc_union(pending.back(), rep);
+          pending.pop_back();
         }
       }
-    }
+      else if (rep_loc.is_immutable())
+      {
+        // Already frozen. No action needed.
+      }
+      else if (rep_loc.is_mutable())
+      {
+        if (!region.remove(h))
+          Value::error(Error::BadFreeze);
 
+        h->set_location(Location::pending());
+
+        pending.push_back(h);
+        dfs.push_back(post_order_mark(h));
+        trace_fields(h, dfs);
+      }
+    }
   }
 }

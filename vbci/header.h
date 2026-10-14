@@ -83,21 +83,6 @@ namespace vbci
       return root;
     }
 
-    Region* region()
-    {
-      if (!loc.is_region())
-        return nullptr;
-
-      return loc.to_region();
-    }
-
-    void move_region(Region* to)
-    {
-      loc.to_region()->remove(this);
-      loc = Location(to);
-      to->insert(this);
-    }
-
     void inc()
     {
       if (loc.is_scc_ptr())
@@ -115,10 +100,8 @@ namespace vbci
         return;
       }
 
-      auto r = loc.to_region();
-
-      if (!r->is_finalizing())
-        rc++;
+      assert(loc.is_mutable());
+      rc++;
     }
 
     void dec()
@@ -140,7 +123,9 @@ namespace vbci
         return;
       }
 
-      auto r = loc.to_region();
+      assert(loc.is_mutable());
+      auto* r = current_region();
+      assert(r);
 
       if (!r->is_finalizing() && (--rc == 0))
         collect(this);

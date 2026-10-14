@@ -157,7 +157,6 @@ namespace vbci
     FrameId frame_id() const;
 
     Location location() const;
-    Region* region() const;
     void immortalize();
 
     template<bool is_move>

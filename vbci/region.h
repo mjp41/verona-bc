@@ -15,6 +15,28 @@ namespace vbci
 {
   struct Header;
   class AllocationGroup;
+  struct Region;
+
+  Region* current_region();
+  Region* exchange_current_region(Region* region);
+
+  class ScopeRegion
+  {
+    Region* previous;
+
+  public:
+    explicit ScopeRegion(Region& region)
+    : previous(exchange_current_region(&region))
+    {}
+
+    ~ScopeRegion()
+    {
+      exchange_current_region(previous);
+    }
+
+    ScopeRegion(const ScopeRegion&) = delete;
+    ScopeRegion& operator=(const ScopeRegion&) = delete;
+  };
 
   struct Region
   {
@@ -63,10 +85,18 @@ namespace vbci
 
     static AllocationGroup create();
 
+    void clear()
+    {
+      if (!region)
+        return;
+
+      auto* current = release();
+      collect(current);
+    }
+
     ~AllocationGroup()
     {
-      if (region)
-        collect(region);
+      clear();
     }
 
     AllocationGroup(AllocationGroup&& other) noexcept
@@ -78,8 +108,7 @@ namespace vbci
       if (this == &other)
         return *this;
 
-      if (region)
-        collect(region);
+      clear();
 
       region = other.release();
       return *this;

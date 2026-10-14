@@ -20,8 +20,9 @@ group ownership, or allocation-group reference count.
   destination group.
 - Destroying the owner finalizes and releases all objects still in the group.
 
-`Thread::allocation_group` is a non-owning pointer selecting the group used by
-new allocations. `ScopeAllocationGroup` temporarily replaces that context.
+`current_region()` is a thread-local, non-owning pointer selecting the group
+used by new allocations and mutable reference counting.
+`ScopeAllocationGroup` temporarily replaces that context.
 
 Values do not keep allocation groups alive. Any value that can outlive the
 current owner must be stored together with an explicit owner:
@@ -32,8 +33,8 @@ current owner must be stored together with an explicit owner:
 - queued teardown callbacks own their copied callback group;
 - standalone synchronous results use `Thread::OwnedRegister`.
 
-The owner must be declared before the managed value so C++ destroys the value
-before releasing its group.
+Owner/value pairs must clear the value with their owned group active before
+releasing the group. `Thread::OwnedRegister` implements this protocol.
 
 ## Object reference counting
 
@@ -41,7 +42,9 @@ before releasing its group.
 Register and field references use the same `inc()` / `dec()` operations.
 Reaching zero collects the individual object unless its group is already
 finalizing. The write barrier separately rejects storing readonly borrowed
-values.
+values. Mutable headers carry no group pointer. Incrementing RC is
+group-independent; decrementing requires the owning group as
+`current_region()` because reaching zero may collect the object.
 
 Object RC can collect acyclic garbage early. Allocation-group destruction also
 collects remaining cyclic or otherwise live objects as a group.
@@ -98,7 +101,25 @@ remain to be collected.
 
 ## Finalization
 
-Group collection is two phase:
+Each outer collection creates a stack-local collector. Reentrant collection
+reaches it through one thread-local pointer; the collector's queues and active
+mutable batch are ordinary fields, not independent thread-local state. The
+batch finalizes all queued headers, then frees those headers and optionally the
+whole group. Work for another group is deferred as a header/group root until
+that group becomes active. Mutable roots and frozen SCC roots share a tagged
+work queue; cowns remain intrusive.
+
+Frozen SCC discovery adds every member to the common header-finalization
+batch. Field dropping performs the normal ARC decrements for immutable
+references outside the SCC, so another SCC is queued only when its external
+count reaches zero.
+
+The SCC root is marked `Pending` before discovery. Membership must test whether
+`Header::find(member)` reaches a `Pending` header, not whether it still returns
+the original root pointer: marking an intermediate member `Pending` terminates
+the representative chain at that member.
+
+Collection within the active mutable batch is two phase:
 
 1. run finalizers and drop managed fields;
 2. release object storage.
@@ -120,6 +141,12 @@ cown.
 Readonly acquisition leaves the cown's group in place and exposes only a
 readonly borrowed value for the behavior lifetime.
 
+When a cown's reference count reaches zero, the collector queues it
+intrusively. Processing the cown activates its owned group, drops its content,
+drains the resulting mutable batch, and releases the native cown storage. The
+lifetime union reuses the reference count field as the collector link once the
+count reaches zero.
+
 ## Foreign lifetimes
 
 Generic `pin` and `unpin` operations have been removed. `ffi::external` only
@@ -134,7 +161,7 @@ component. It must not reintroduce an allocation-group reference count.
 | File | Purpose |
 |------|---------|
 | `frame_id.h` | Frame ordering for register-reference lifetime checks |
-| `location.h` | Header allocation and frozen-SCC state |
+| `location.h` | Mutable, frozen-SCC, immortal, and pending header state |
 | `region.h` | `Region` and move-only `AllocationGroup` |
 | `region_rc.h/cc` | Mutable allocation storage and group collection |
 | `header.h` | Object RC and immutable ARC operations |

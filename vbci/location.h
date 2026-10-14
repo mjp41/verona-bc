@@ -4,16 +4,16 @@
 
 namespace vbci
 {
-  struct Region;
   struct Header;
 
   struct Location
   {
   private:
-    static constexpr auto Immutable = uintptr_t(0x1);
-    static constexpr auto Pending = uintptr_t(0x2);
-    static constexpr auto Immortal = uintptr_t(0x3);
-    static constexpr auto SccPtr = uintptr_t(0x4);
+    static constexpr auto Mutable = uintptr_t(0x1);
+    static constexpr auto Immutable = uintptr_t(0x2);
+    static constexpr auto Pending = uintptr_t(0x3);
+    static constexpr auto Immortal = uintptr_t(0x4);
+    static constexpr auto SccPtr = uintptr_t(0x5);
     static constexpr auto Mask = uintptr_t(0x7);
 
     uintptr_t value;
@@ -26,6 +26,11 @@ namespace vbci
     constexpr Location(uintptr_t v) : value(v) {}
 
   public:
+    static constexpr Location mutable_()
+    {
+      return Location(Mutable);
+    };
+
     static constexpr Location immutable()
     {
       return Location(Immutable);
@@ -41,11 +46,9 @@ namespace vbci
       return Location(Pending);
     };
 
-    explicit Location(Region* r) : value(reinterpret_cast<uintptr_t>(r)) {}
-
-    bool is_region() const
+    bool is_mutable() const
     {
-      return (value & Mask) == 0;
+      return value == Mutable;
     }
 
     bool is_immortal() const
@@ -67,12 +70,6 @@ namespace vbci
     bool is_pending() const
     {
       return (value & Mask) == Pending;
-    }
-
-    Region* to_region() const
-    {
-      assert(is_region());
-      return reinterpret_cast<Region*>(value);
     }
 
     static Location scc_ptr(Header* h)

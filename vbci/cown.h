@@ -43,29 +43,12 @@ namespace vbci
       allocation_group(AllocationGroup::create())
     {}
 
-    static void destroy(Cown* cown) noexcept
+  public:
+    Cown*& collector_next()
     {
-      thread_local Cown* pending = nullptr;
-      thread_local bool draining = false;
-
-      cown->lifetime.next_to_delete = pending;
-      pending = cown;
-
-      if (draining)
-        return;
-
-      draining = true;
-      while (pending != nullptr)
-      {
-        auto* current = pending;
-        pending = current->lifetime.next_to_delete;
-        current->~Cown();
-        verona::rt::heap::dealloc<sizeof(Cown)>(current);
-      }
-      draining = false;
+      return lifetime.next_to_delete;
     }
 
-  public:
     static Cown* create(uint32_t type_id)
     {
       if (!Program::get().is_cown(type_id))
@@ -80,10 +63,23 @@ namespace vbci
     ~Cown()
     {
       LOG(Trace) << "Destroying cown @" << this;
+      assert(content.is_invalid());
+      assert(!allocation_group);
+      LOG(Trace) << "Destroyed cown @" << this;
+    }
+
+    void finalize()
+    {
       assert(allocation_group);
       content.dec();
       content = Value();
-      LOG(Trace) << "Destroyed cown @" << this;
+      allocation_group.clear();
+    }
+
+    void destroy()
+    {
+      this->~Cown();
+      verona::rt::heap::dealloc<sizeof(Cown)>(this);
     }
 
     uint32_t get_type_id()
@@ -109,14 +105,14 @@ namespace vbci
     void dec() noexcept
     {
       LOG(Trace) << "Decrementing cown @" << this;
-      auto references = lifetime.references.fetch_sub(
+      auto previous = lifetime.references.fetch_sub(
         reference_increment, std::memory_order_release);
-      assert((references & ~immortal_bit) > 0);
-      if (references != reference_increment)
+      assert((previous & ~immortal_bit) > 0);
+      if (previous != reference_increment)
         return;
 
       std::atomic_thread_fence(std::memory_order_acquire);
-      destroy(this);
+      collect(this);
     }
 
     void immortalize() noexcept

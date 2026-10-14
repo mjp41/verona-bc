@@ -35,12 +35,11 @@ namespace vbci
   public:
     EnsureAllocationGroup()
     {
-      auto& thread = Thread::get();
-      if (thread.allocation_group != nullptr)
+      if (current_region() != nullptr)
         return;
 
       owned_group = AllocationGroup::create();
-      thread.allocation_group = &owned_group.get();
+      exchange_current_region(&owned_group.get());
     }
 
     ~EnsureAllocationGroup()
@@ -48,9 +47,9 @@ namespace vbci
       if (!owned_group)
         return;
 
-      auto& thread = Thread::get();
-      assert(thread.allocation_group == &owned_group.get());
-      thread.allocation_group = nullptr;
+      assert(current_region() == &owned_group.get());
+      exchange_current_region(nullptr);
+      owned_group.clear();
     }
 
     EnsureAllocationGroup(const EnsureAllocationGroup&) = delete;
@@ -360,9 +359,10 @@ namespace vbci
         }
         else if constexpr (std::is_same_v<T, Region&>)
         {
-          assert(self.allocation_group != nullptr);
+          auto* region = current_region();
+          assert(region);
           process<F, Args..., Region&>(
-            self, fun, std::forward<Args>(args)..., *self.allocation_group);
+            self, fun, std::forward<Args>(args)..., *region);
         }
         else if constexpr (std::is_same_v<T, Class&>)
         {
@@ -452,6 +452,16 @@ namespace vbci
     return thread;
   }
 
+  Region* current_region()
+  {
+    return Thread::get().allocation_group;
+  }
+
+  Region* exchange_current_region(Region* region)
+  {
+    return std::exchange(Thread::get().allocation_group, region);
+  }
+
   void Thread::run_behavior(verona::rt::Work* work) noexcept
   {
     get().thread_run_behavior(work);
@@ -466,9 +476,9 @@ namespace vbci
   {
     assert(!frame);
     assert(!args);
-    assert(allocation_group == nullptr);
+    assert(current_region() == nullptr);
     auto execution_group = AllocationGroup::create();
-    allocation_group = &execution_group.get();
+    ScopeAllocationGroup allocation_scope(execution_group.get());
     auto b = BehaviourCore::from_work(work);
     auto* body = b->get_body<BehaviorBody>();
     behavior = body->function.function();
@@ -541,8 +551,6 @@ namespace vbci
       print_stack(log);
     }
 #endif
-
-    allocation_group = nullptr;
 
     BehaviourCore::finished(work);
   }
@@ -1150,7 +1158,7 @@ namespace vbci
             auto copy =
               copy_graph_and_consume(std::move(src), group.get());
 
-            freeze(copy->get_header());
+            freeze(copy->get_header(), group.get());
 
             dst = std::move(copy);
             return;
@@ -1759,7 +1767,7 @@ namespace vbci
           tuple_arr->exchange<false>(1, offsets_reg);
           tuple_arr->exchange<false>(2, kinds_reg);
 
-          freeze(tuple_arr);
+          freeze(tuple_arr, allocation_group);
 
           dst = ValueTransfer(tuple_arr);
         });
@@ -2237,8 +2245,7 @@ namespace vbci
     size_t num_cowns = args;
     size_t first_cown = 0;
     Register closure_source;
-    AllocationGroup closure_group;
-    Register closure_copy;
+    OwnedRegister closure_copy;
     std::vector<Register> cown_args;
 
     if (args > 0)
@@ -2280,9 +2287,11 @@ namespace vbci
 
     if (is_closure)
     {
-      closure_group = AllocationGroup::create();
-      closure_copy = copy_graph_and_consume(
+      auto closure_group = AllocationGroup::create();
+      auto copy = copy_graph_and_consume(
         std::move(closure_source), closure_group.get());
+      closure_copy = OwnedRegister{
+        std::move(closure_group), std::move(copy)};
     }
 
     if (!program->subtype(func->return_type, program->uncown(type_id)))
@@ -2325,13 +2334,12 @@ namespace vbci
         verona::rt::Ownership::Transferred);
     }
 
-    auto* body = new (construction.body)
-      BehaviorBody{Value(func), std::move(closure_group), Value()};
+    auto* body = new (construction.body) BehaviorBody{
+      Value(func), std::move(closure_copy.allocation_group), Value()};
 
     if (is_closure)
     {
-      auto& closure = closure_copy;
-      body->closure = closure.extract();
+      body->closure = closure_copy.value.extract();
     }
 
     BehaviourCore::schedule(BehaviourCore::finish_construction(construction));
