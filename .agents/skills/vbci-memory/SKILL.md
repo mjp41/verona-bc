@@ -107,9 +107,9 @@ Each outer collection creates a stack-local collector. Reentrant collection
 reaches it through one thread-local pointer; the collector's queues and active
 mutable batch are ordinary fields, not independent thread-local state. The
 batch finalizes all queued headers, then frees those headers and optionally the
-whole group. Work for another group is deferred as a header/group root until
-that group becomes active. Mutable roots and frozen SCC roots share a tagged
-work queue; cowns remain intrusive.
+whole group. Work for another group is deferred until that group becomes
+active. A mutable root starts or joins the active batch directly. Frozen SCC
+roots use a tagged work queue, while cowns remain intrusive.
 
 `Header` reuses its dead RC/ARC storage as an intrusive collector link.
 Finalization uses an intrinsic FIFO, then moves each header onto an intrinsic

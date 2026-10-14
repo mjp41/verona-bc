@@ -223,17 +223,18 @@ activate their group while releasing contained values.
 An outer collection creates a stack-local collector, reached by reentrant
 collection through one thread-local pointer. It uses one reusable mutable batch
 for the active region, finalizing all queued headers before freeing those
-headers and, when requested, the whole region. Header or whole-region roots for
-another group are deferred until that group becomes active. Cowns are queued
-intrusively and activate their owned group while dropping their content;
-frozen SCC roots use the same tagged work queue but require no region. SCC
-members enter the common header-finalization batch, whose normal field drops
-decrement external immutable references and queue them only on ARC zero.
-Mutable and immutable headers reuse their dead count storage as intrinsic
-finalization/deletion links. Cowns derive from the same `Header`; its `Cown`
-location state shares the immutable representative's atomic count and selects
-cown teardown rather than SCC collection when that count reaches zero. The
-count storage then becomes the intrusive cown collector link.
+headers and, when requested, the whole region. A mutable root starts or joins
+the active batch directly; whole-region roots for another group are deferred
+until that group becomes active. Cowns are queued intrusively and activate
+their owned group while dropping their content; frozen SCC roots use the
+tagged work queue but require no region. SCC members enter the common
+header-finalization batch, whose normal field drops decrement external
+immutable references and queue them only on ARC zero. Mutable and immutable
+headers reuse their dead count storage as intrinsic finalization/deletion
+links. Cowns derive from the same `Header`; its `Cown` location state shares
+the immutable representative's atomic count and selects cown teardown rather
+than SCC collection when that count reaches zero. The count storage then
+becomes the intrusive cown collector link.
 
 Whole-group finalization reuses the group for allocations made by finalizers.
 Before running a batch, the collector removes all live headers from `RegionRC`

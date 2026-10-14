@@ -26,7 +26,6 @@ namespace vbci
 {
   enum class WorkType
   {
-    Header,
     Region,
     Immutable
   };
@@ -34,19 +33,18 @@ namespace vbci
   struct WorkItem
   {
     WorkType type;
-    Region* region;
-    Header* header;
+    union
+    {
+      Region* region;
+      Header* header;
+    };
 
     explicit WorkItem(Region* region)
-    : type(WorkType::Region), region(region), header(nullptr)
+    : type(WorkType::Region), region(region)
     {}
 
     explicit WorkItem(Header* header)
-    : type(WorkType::Immutable), region(nullptr), header(header)
-    {}
-
-    WorkItem(Region* region, Header* header)
-    : type(WorkType::Header), region(region), header(header)
+    : type(WorkType::Immutable), header(header)
     {}
   };
 
@@ -109,10 +107,18 @@ namespace vbci
     {
       header->set_location(Location::finalizing());
 
-      if (collecting_region == region)
+      if (collecting_region)
+      {
+        assert(collecting_region == region);
         enqueue_header(header);
-      else
-        work.emplace(region, header);
+        return;
+      }
+
+      assert(current_region() == region);
+      collecting_region = region;
+      enqueue_header(header);
+      drain_batch();
+      collecting_region = nullptr;
     }
 
     void enqueue(Region* region)
@@ -243,18 +249,17 @@ namespace vbci
 
           if (item.type == WorkType::Immutable)
           {
+            collecting_region = current_region();
             enqueue_scc_members(item.header);
             drain_batch();
+            collecting_region = nullptr;
             continue;
           }
 
           collecting_region = item.region;
 
           ScopeRegion region_scope(*collecting_region);
-          if (item.type == WorkType::Header)
-            enqueue_header(item.header);
-          else
-            region_to_delete = collecting_region;
+          region_to_delete = collecting_region;
           drain_batch();
 
           collecting_region = nullptr;
