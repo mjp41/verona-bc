@@ -50,19 +50,65 @@ namespace vbci
     {}
   };
 
+  struct HeaderQueue
+  {
+    Header* first = nullptr;
+    Header* last = nullptr;
+
+    bool empty() const
+    {
+      return first == nullptr;
+    }
+
+    void push(Header* header)
+    {
+      header->collector_set_next(nullptr);
+
+      if (last)
+        last->collector_set_next(header);
+      else
+        first = header;
+
+      last = header;
+    }
+
+    void push_front(Header* header)
+    {
+      header->collector_set_next(first);
+      first = header;
+      if (!last)
+        last = header;
+    }
+
+    Header* pop()
+    {
+      assert(first);
+      auto* header = first;
+      first = header->collector_get_next();
+      if (!first)
+        last = nullptr;
+      return header;
+    }
+  };
+
   struct Collector
   {
     std::queue<WorkItem> work;
-    std::queue<Header*> headers_to_finalize;
-    std::vector<Header*> headers_to_delete;
-    Cown* cowns_to_finalize = nullptr;
+    HeaderQueue headers_to_finalize;
+    HeaderQueue headers_to_delete;
+    HeaderQueue cowns_to_finalize;
     Region* collecting_region = nullptr;
     Region* region_to_delete = nullptr;
+
+    void enqueue_header(Header* header)
+    {
+      headers_to_finalize.push(header);
+    }
 
     void enqueue(Header* header, Region* region)
     {
       if (collecting_region == region)
-        headers_to_finalize.push(header);
+        enqueue_header(header);
       else
         work.emplace(region, header);
     }
@@ -80,15 +126,18 @@ namespace vbci
       }
     }
 
-    void enqueue(Cown* cown)
+    void enqueue(Header* header)
     {
-      cown->collector_next() = cowns_to_finalize;
-      cowns_to_finalize = cown;
-    }
+      assert(header->location().is_shared());
 
-    void enqueue_immutable(Header* root)
-    {
-      work.emplace(root);
+      if (!header->location().is_cown())
+      {
+        work.emplace(header);
+        return;
+      }
+
+      auto* cown = static_cast<Cown*>(header);
+      cowns_to_finalize.push_front(cown);
     }
 
     void drain_batch()
@@ -97,15 +146,14 @@ namespace vbci
 
       while (!headers_to_finalize.empty())
       {
-        auto* header = headers_to_finalize.front();
-        headers_to_finalize.pop();
+        auto* header = headers_to_finalize.pop();
         LOG(Trace) << "Finalizing work item: " << static_cast<void*>(header);
 
         if (program.is_array(header->get_type_id()))
           static_cast<Array*>(header)->finalize();
         else
           static_cast<Object*>(header)->finalize();
-        headers_to_delete.push_back(header);
+        headers_to_delete.push_front(header);
       }
 
       if (region_to_delete)
@@ -113,8 +161,9 @@ namespace vbci
 
       // Explicit header frees must happen before a region bulk free because
       // the headers have already been detached from the region.
-      for (auto* header : headers_to_delete)
+      while (!headers_to_delete.empty())
       {
+        auto* header = headers_to_delete.pop();
         LOG(Trace) << "Deleting work item: " << static_cast<void*>(header);
 
         if (header->location().is_pending())
@@ -127,7 +176,6 @@ namespace vbci
           collecting_region->rfree(header);
         }
       }
-      headers_to_delete.clear();
 
       if (region_to_delete)
       {
@@ -140,7 +188,8 @@ namespace vbci
 
     void enqueue_scc_members(Header* root)
     {
-      assert(root->location().is_pending());
+      assert(root->location().is_shared() && !root->location().is_cown());
+      root->set_location(Location::pending());
       std::vector<Header*> work;
       work.push_back(root);
 
@@ -161,7 +210,7 @@ namespace vbci
       {
         auto* header = work.back();
         work.pop_back();
-        headers_to_finalize.push(header);
+        enqueue_header(header);
 
         // Only discover members of this SCC. Normal finalization drops
         // external immutable references and queues them if their ARC reaches
@@ -175,7 +224,7 @@ namespace vbci
 
     void drain()
     {
-      while (!work.empty() || cowns_to_finalize)
+      while (!work.empty() || !cowns_to_finalize.empty())
       {
         if (!work.empty())
         {
@@ -193,7 +242,7 @@ namespace vbci
 
           ScopeRegion region_scope(*collecting_region);
           if (item.type == WorkType::Header)
-            headers_to_finalize.push(item.header);
+            enqueue_header(item.header);
           else
             region_to_delete = collecting_region;
           drain_batch();
@@ -202,8 +251,7 @@ namespace vbci
           continue;
         }
 
-        auto* cown = cowns_to_finalize;
-        cowns_to_finalize = cown->collector_next();
+        auto* cown = static_cast<Cown*>(cowns_to_finalize.pop());
         collecting_region = &cown->get_allocation_group();
 
         ScopeRegion region_scope(*collecting_region);
@@ -273,6 +321,12 @@ namespace vbci
 
   void collect(Header* h)
   {
+    if (h->location().is_shared())
+    {
+      use_collector([&](Collector& collector) { collector.enqueue(h); });
+      return;
+    }
+
     assert(h->location().is_mutable());
     auto* region = current_region();
     assert(region);
@@ -297,16 +351,4 @@ namespace vbci
     use_collector([&](Collector& collector) { collector.enqueue(region); });
   }
 
-  void collect(Cown* cown)
-  {
-    use_collector([&](Collector& collector) { collector.enqueue(cown); });
-  }
-
-  void collect_scc(Header* root)
-  {
-    assert(root->location().is_immutable());
-    root->set_location(Location::pending());
-    use_collector(
-      [&](Collector& collector) { collector.enqueue_immutable(root); });
-  }
 }

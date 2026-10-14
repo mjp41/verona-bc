@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <string>
@@ -38,7 +37,6 @@ namespace vbci
   struct FrameId;
   struct Location;
   using RC = uint32_t;
-  using ARC = std::atomic<RC>;
 
   struct Region;
   struct Header;

@@ -15,7 +15,7 @@ namespace vbci::writebarrier
 
   inline void check_exchange(Location store_loc, const Value& value)
   {
-    if (store_loc.is_immutable() || store_loc.is_immortal())
+    if (store_loc.is_shared() || store_loc.is_immortal())
       Value::error(Error::BadStore);
 
     check_value(value);
@@ -26,11 +26,11 @@ namespace vbci::writebarrier
   {
     check_value(next.borrow());
 
-    if (store_loc.is_immutable() || store_loc.is_immortal())
+    if (store_loc.is_shared() || store_loc.is_immortal())
     {
       auto next_loc = next->location();
 
-      if (!next_loc.is_immutable() && !next_loc.is_immortal())
+      if (!next_loc.is_shared() && !next_loc.is_immortal())
         Value::error(Error::BadStore);
     }
 

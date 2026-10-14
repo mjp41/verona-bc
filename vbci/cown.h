@@ -5,7 +5,6 @@
 #include "region.h"
 #include "value.h"
 
-#include <atomic>
 #include <boc/behaviourcore.h>
 #include <ds/heap.h>
 #include <format>
@@ -15,40 +14,21 @@ namespace vbci
 {
   struct VbciObjectModel;
 
-  struct alignas(8) Cown
+  struct alignas(8) Cown : public Header
   {
   private:
     friend VbciObjectModel;
 
-    static constexpr size_t immortal_bit = 1;
-    static constexpr size_t reference_increment = 2;
-
-    union LifetimeState
-    {
-      std::atomic<size_t> references;
-      Cown* next_to_delete;
-
-      LifetimeState() : references(reference_increment) {}
-      ~LifetimeState() {}
-    };
-
     verona::rt::CownSchedulerState<VbciObjectModel> scheduler_state;
-    LifetimeState lifetime;
-    uint32_t type_id;
     Value content;
     AllocationGroup allocation_group;
 
     Cown(uint32_t type_id)
-    : type_id(type_id),
+    : Header(type_id),
       allocation_group(AllocationGroup::create())
     {}
 
   public:
-    Cown*& collector_next()
-    {
-      return lifetime.next_to_delete;
-    }
-
     static Cown* create(uint32_t type_id)
     {
       if (!Program::get().is_cown(type_id))
@@ -82,42 +62,14 @@ namespace vbci
       verona::rt::heap::dealloc<sizeof(Cown)>(this);
     }
 
-    uint32_t get_type_id()
-    {
-      return type_id;
-    }
-
     uint32_t content_type_id()
     {
-      return Program::get().uncown(type_id);
-    }
-
-    void inc() noexcept
-    {
-      LOG(Trace) << "Incrementing cown @" << this;
-      assert(
-        (lifetime.references.load(std::memory_order_relaxed) & ~immortal_bit) >
-        0);
-      lifetime.references.fetch_add(
-        reference_increment, std::memory_order_relaxed);
-    }
-
-    void dec() noexcept
-    {
-      LOG(Trace) << "Decrementing cown @" << this;
-      auto previous = lifetime.references.fetch_sub(
-        reference_increment, std::memory_order_release);
-      assert((previous & ~immortal_bit) > 0);
-      if (previous != reference_increment)
-        return;
-
-      std::atomic_thread_fence(std::memory_order_acquire);
-      collect(this);
+      return Program::get().uncown(get_type_id());
     }
 
     void immortalize() noexcept
     {
-      lifetime.references.fetch_or(immortal_bit, std::memory_order_relaxed);
+      mark_immortal();
     }
 
     ValueBorrow load()

@@ -14,6 +14,7 @@ namespace vbci
     static constexpr auto Pending = uintptr_t(0x3);
     static constexpr auto Immortal = uintptr_t(0x4);
     static constexpr auto SccPtr = uintptr_t(0x5);
+    static constexpr auto Cown = uintptr_t(0x6);
     static constexpr auto Mask = uintptr_t(0x7);
 
     uintptr_t value;
@@ -46,6 +47,11 @@ namespace vbci
       return Location(Pending);
     };
 
+    static constexpr Location cown()
+    {
+      return Location(Cown);
+    };
+
     bool is_mutable() const
     {
       return value == Mutable;
@@ -56,10 +62,10 @@ namespace vbci
       return (value & Mask) == Immortal;
     }
 
-    bool is_immutable() const
+    bool is_shared() const
     {
       auto tag = value & Mask;
-      return tag == Immutable || tag == SccPtr;
+      return tag == Immutable || tag == SccPtr || tag == Cown;
     }
 
     bool is_scc_ptr() const
@@ -70,6 +76,11 @@ namespace vbci
     bool is_pending() const
     {
       return (value & Mask) == Pending;
+    }
+
+    bool is_cown() const
+    {
+      return (value & Mask) == Cown;
     }
 
     static Location scc_ptr(Header* h)

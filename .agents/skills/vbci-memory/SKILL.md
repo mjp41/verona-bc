@@ -109,6 +109,10 @@ whole group. Work for another group is deferred as a header/group root until
 that group becomes active. Mutable roots and frozen SCC roots share a tagged
 work queue; cowns remain intrusive.
 
+`Header` reuses its dead RC/ARC storage as an intrusive collector link.
+Finalization uses an intrinsic FIFO, then moves each header onto an intrinsic
+deletion list.
+
 Frozen SCC discovery adds every member to the common header-finalization
 batch. Field dropping performs the normal ARC decrements for immutable
 references outside the SCC, so another SCC is queued only when its external
@@ -141,11 +145,11 @@ cown.
 Readonly acquisition leaves the cown's group in place and exposes only a
 readonly borrowed value for the behavior lifetime.
 
-When a cown's reference count reaches zero, the collector queues it
-intrusively. Processing the cown activates its owned group, drops its content,
-drains the resulting mutable batch, and releases the native cown storage. The
-lifetime union reuses the reference count field as the collector link once the
-count reaches zero.
+`Cown` derives from `Header` and uses the `Cown` location state. Cowns and
+immutable SCC representatives use the same atomic header count with relaxed
+increments and release/acquire zero decrements. The location state determines
+which collection path zero selects. The count/link union becomes the intrusive
+collector link after zero.
 
 ## Foreign lifetimes
 
@@ -164,7 +168,7 @@ component. It must not reintroduce an allocation-group reference count.
 | `location.h` | Mutable, frozen-SCC, immortal, and pending header state |
 | `region.h` | `Region` and move-only `AllocationGroup` |
 | `region_rc.h/cc` | Mutable allocation storage and group collection |
-| `header.h` | Object RC and immutable ARC operations |
+| `header.h` | Mutable RC, shared atomic RC, and collector links |
 | `register.h` | Register ownership and transfer semantics |
 | `writebarrier.h` | Managed field/array exchange |
 | `copy_graph.cc` | Graph copying and destination hooks |

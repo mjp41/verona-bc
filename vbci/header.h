@@ -6,6 +6,9 @@
 #include "register.h"
 #include "value.h"
 
+#include <atomic>
+#include <new>
+
 namespace vbci
 {
   struct Header
@@ -16,7 +19,8 @@ namespace vbci
     union
     {
       RC rc;
-      ARC arc;
+      std::atomic<size_t> atomic_rc;
+      Header* next_to_collect;
     };
 
     uint32_t type_id;
@@ -25,9 +29,38 @@ namespace vbci
     Header(Location loc, uint32_t type_id) : loc(loc), rc(1), type_id(type_id)
     {}
 
+    explicit Header(uint32_t type_id)
+    : loc(Location::cown()), atomic_rc(1), type_id(type_id)
+    {}
+
     void mark_immortal()
     {
       loc = Location::immortal();
+    }
+
+    void atomic_inc() noexcept
+    {
+      if (loc.is_immortal())
+        return;
+
+      assert(loc.is_shared());
+      auto previous = atomic_rc.fetch_add(1, std::memory_order_relaxed);
+      assert(previous > 0);
+    }
+
+    bool atomic_dec() noexcept
+    {
+      if (loc.is_immortal())
+        return false;
+
+      assert(loc.is_shared());
+      auto previous = atomic_rc.fetch_sub(1, std::memory_order_release);
+      assert(previous > 0);
+      if (previous != 1)
+        return false;
+
+      std::atomic_thread_fence(std::memory_order_acquire);
+      return true;
     }
 
   public:
@@ -48,12 +81,17 @@ namespace vbci
 
     void set_arc(RC v)
     {
-      arc.store(v);
+      new (&atomic_rc) std::atomic<size_t>(v);
     }
 
-    void inc_arc()
+    Header* collector_get_next() const
     {
-      arc++;
+      return next_to_collect;
+    }
+
+    void collector_set_next(Header* next)
+    {
+      next_to_collect = next;
     }
 
     Location location() const
@@ -94,9 +132,9 @@ namespace vbci
       if (loc.is_immortal())
         return;
 
-      if (loc.is_immutable())
+      if (loc.is_shared())
       {
-        arc++;
+        atomic_inc();
         return;
       }
 
@@ -115,10 +153,10 @@ namespace vbci
       if (loc.is_immortal())
         return;
 
-      if (loc.is_immutable())
+      if (loc.is_shared())
       {
-        if (--arc == 0)
-          collect_scc(this);
+        if (atomic_dec())
+          collect(this);
 
         return;
       }

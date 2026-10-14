@@ -229,6 +229,11 @@ intrusively and activate their owned group while dropping their content;
 frozen SCC roots use the same tagged work queue but require no region. SCC
 members enter the common header-finalization batch, whose normal field drops
 decrement external immutable references and queue them only on ARC zero.
+Mutable and immutable headers reuse their dead count storage as intrinsic
+finalization/deletion links. Cowns derive from the same `Header`; its `Cown`
+location state shares the immutable representative's atomic count and selects
+cown teardown rather than SCC collection when that count reaches zero. The
+count storage then becomes the intrusive cown collector link.
 
 Allocation groups preserve the finalization contract for acyclic graphs: an
 abandoned source image is reclaimed without its user finalizer, while each

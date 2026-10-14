@@ -58,7 +58,7 @@ namespace vbci
         return;
       }
 
-      if (loc.is_immutable() || loc.is_immortal())
+      if (loc.is_shared() || loc.is_immortal())
         return;
 
       if (loc.is_mutable())
@@ -76,7 +76,7 @@ namespace vbci
     assert(root);
     auto loc = root->location();
 
-    if (loc.is_immutable() || loc.is_immortal())
+    if (loc.is_shared() || loc.is_immortal())
       return;
 
     std::vector<Header*> dfs;
@@ -118,7 +118,7 @@ namespace vbci
           pending.pop_back();
         }
       }
-      else if (rep_loc.is_immutable())
+      else if (rep_loc.is_shared())
       {
         // Already frozen. No action needed.
       }

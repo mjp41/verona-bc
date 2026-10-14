@@ -6,7 +6,6 @@ namespace vbci
 {
   struct Header;
   struct Region;
-  struct Cown;
 
   struct SuppressFinalizers
   {
@@ -21,9 +20,4 @@ namespace vbci
 
   void collect(Header* h);
   void collect(Region* region);
-  void collect(Cown* cown);
-
-  // Collect a frozen SCC: find all members and push them onto the
-  // collector worklist so finalizers run before memory is freed.
-  void collect_scc(Header* root);
 } // namespace vbci
