@@ -268,6 +268,23 @@ native stack. An edge to a pending type unions the pending suffix into that
 representative, matching frozen-object SCC discovery without constructing a
 reverse graph.
 
+Mutable objects whose type has `can_cycle` move to
+`MutableCycleCandidate` after a decrement leaves a nonzero RC. The header uses
+the previously unused tag and moves its RC into a thread-local slot vector.
+The upper bits identify the slot directly. Each live slot stores only the
+header reverse pointer and RC; an RC of zero identifies a free slot and lets
+the pointer storage hold the free-list index. A later increment removes the
+record and restores the count to the header. Further decrements update the side
+record and still collect immediately at zero.
+
+Candidate records in a freshly copied destination region are restored to
+ordinary mutable state before `copy_graph()` returns because the side storage
+is thread-local. This region-wide restoration runs after all post-copy hooks
+and can forget unreachable cycles created by a hook. Other candidates remain
+buffered. This is an intermediate implementation stage: allocation groups
+remain responsible for those unreclaimed cycles until a boundary cycle pass
+replaces the restoration.
+
 Allocation groups preserve the finalization contract for acyclic graphs: an
 abandoned source image is reclaimed without its user finalizer, while each
 surviving destination image finalizes when its semantic lifetime ends. The

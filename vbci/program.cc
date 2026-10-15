@@ -347,7 +347,8 @@ namespace vbci
 
   bool Program::can_cycle(uint32_t type_id)
   {
-    return cls(type_id).can_cycle;
+    return
+      (type_id < can_cycle_by_type.size()) && can_cycle_by_type.at(type_id);
   }
 
   uint32_t Program::unarray(uint32_t type_id)
@@ -1012,7 +1013,7 @@ namespace vbci
         {
           LOG(Error) << file << ": "
                      << (method.first == FinalizerMethodId ? "finalizer" :
-                                                                 "post-copy hook")
+                                                             "post-copy hook")
                      << " must have one parameter" << std::endl;
           return false;
         }
@@ -1030,8 +1031,9 @@ namespace vbci
     }
     catch (const Value& err)
     {
-      LOG(Error) << file << ": couldn't calculate class size: "
-                 << err.to_string() << std::endl;
+      LOG(Error) << file
+                 << ": couldn't calculate class size: " << err.to_string()
+                 << std::endl;
       return false;
     }
 
@@ -1040,10 +1042,9 @@ namespace vbci
 
   void Program::calculate_cycle_capabilities()
   {
+    auto type_count = min_complex_type_id + complex_types.size();
     auto is_cycle_candidate = [&](uint32_t type_id) {
-      if (
-        (type_id < NumPrimitiveClasses) ||
-        (type_id >= classes.size()))
+      if ((type_id < NumPrimitiveClasses) || (type_id >= type_count))
         return false;
 
       if (type_id < min_complex_type_id)
@@ -1084,7 +1085,7 @@ namespace vbci
       bool cyclic = false;
     };
 
-    auto type_count = min_complex_type_id + complex_types.size();
+    can_cycle_by_type.assign(type_count, false);
     std::vector<SccState> states;
     states.reserve(type_count);
     for (uint32_t type_id = 0; type_id < type_count; type_id++)
@@ -1130,11 +1131,9 @@ namespace vbci
         case TypeTag::Ref:
         {
           auto referee = type.children.at(0);
-          for (uint32_t target = 0; target < classes.size(); target++)
+          for (uint32_t target = 0; target < type_count; target++)
           {
-            if (
-              is_cycle_candidate(target) &&
-              contains_referee(target, referee))
+            if (is_cycle_candidate(target) && contains_referee(target, referee))
               add_child(target);
           }
           return;
@@ -1187,7 +1186,7 @@ namespace vbci
       }
     };
 
-    for (uint32_t type_id = 0; type_id < classes.size(); type_id++)
+    for (uint32_t type_id = 0; type_id < type_count; type_id++)
     {
       if (!is_cycle_candidate(type_id))
         continue;
@@ -1196,10 +1195,10 @@ namespace vbci
     }
 
     assert(pending.empty());
-    for (uint32_t type_id = 0; type_id < classes.size(); type_id++)
+    for (uint32_t type_id = 0; type_id < type_count; type_id++)
     {
       if (is_cycle_candidate(type_id))
-        classes.at(type_id).can_cycle = states.at(find(type_id)).cyclic;
+        can_cycle_by_type.at(type_id) = states.at(find(type_id)).cyclic;
     }
   }
 

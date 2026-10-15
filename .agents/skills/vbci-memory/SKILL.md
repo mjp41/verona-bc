@@ -53,8 +53,8 @@ collects remaining cyclic or otherwise live objects as a group.
 Mutable counts are thread-confined and use relaxed atomic loads and stores;
 only shared immutable and cown counts use atomic read-modify-write operations.
 
-Each runtime `Class` has a `can_cycle` capability computed once after loading
-all type metadata. The runtime builds the possible managed-reference graph and
+Each runtime type has a `can_cycle` capability computed once after loading all
+type metadata. The runtime builds the possible managed-reference graph and
 marks only types in a cyclic SCC, defined as an SCC containing at least one
 internal edge. User objects, arrays, and tuples are cycle candidates. Union,
 `ref`, and `dyn` type IDs are auxiliary traversal vertices; cowns are ownership
@@ -66,6 +66,19 @@ Each trace step expands one type ID by one level using the shared iterative
 `traverse_graph` primitive. SCC discovery mirrors freezing: an edge to a
 pending type unions the pending suffix into that representative. No reverse
 graph is constructed.
+
+Mutable cycle candidates use the previously unused header tag. A candidate's
+header no longer stores its RC; a thread-local vector stores live
+`(Header*, RC)` records. The header state's upper bits identify the slot
+directly. Free records have RC zero and reuse the header field as a free-list
+index. A nonzero decrement of a cycle-capable mutable type creates a record.
+Candidate increments restore the header to `Mutable`, and candidate decrements
+update the record or collect at zero. Candidate records in a freshly copied
+destination region are restored before `copy_graph()` returns because their
+storage is thread-local. This region-wide restoration runs after all post-copy
+hooks and can forget unreachable cycles created by a hook. Other candidates
+remain buffered. Allocation groups remain the collection backstop until a
+boundary cycle pass replaces the restoration.
 
 Readonly behavior arguments do not adjust object RC because their cown-owned
 allocation group remains alive for the behavior. Cown handles themselves
@@ -197,6 +210,7 @@ component. It must not reintroduce an allocation-group reference count.
 |------|---------|
 | `frame_id.h` | Frame ordering for register-reference lifetime checks |
 | `header_state.h` | Tagged header state, counts, SCC links, and collector links |
+| `mutable_cycle_candidates.h/cc` | Thread-local mutable candidate RC records |
 | `region.h` | `Region` and move-only `AllocationGroup` |
 | `region_rc.h/cc` | Mutable allocation storage and group collection |
 | `header.h` | Mutable RC, shared atomic RC, and collector links |

@@ -28,7 +28,6 @@ namespace vbci
     size_t size;
     size_t debug_info;
     uint32_t type_id;
-    bool can_cycle = false;
 
     // Default constructor
     Class() = default;

@@ -3,6 +3,7 @@
 #include "array.h"
 #include "collect.h"
 #include "cown.h"
+#include "mutable_cycle_candidates.h"
 #include "object.h"
 #include "program.h"
 #include "region.h"
@@ -143,7 +144,13 @@ namespace vbci
       if (state.is_shared() || state.is_immortal())
         return root;
 
-      return GraphCopy(region).run(root);
+      auto copy = GraphCopy(region).run(root);
+      // Post-copy hooks can create candidates in the destination. Their
+      // thread-local records cannot cross this boundary, but restoring them
+      // can forget unreachable cycles. Allocation-group collection remains
+      // the backstop until a boundary cycle pass replaces this restoration.
+      restore_mutable_cycle_candidates(region);
+      return copy;
     }
 
   }

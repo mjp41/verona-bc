@@ -2,6 +2,7 @@
 
 #include "header_state.h"
 #include "ident.h"
+#include "mutable_cycle_candidates.h"
 #include "region.h"
 #include "register.h"
 #include "value.h"
@@ -10,6 +11,8 @@ namespace vbci
 {
   struct Header
   {
+    friend void restore_mutable_cycle_candidates();
+
   private:
     HeaderState header_state;
     uint32_t type_id;
@@ -36,6 +39,11 @@ namespace vbci
 
     RC get_rc()
     {
+      auto current = state();
+      if (current.is_mutable_cycle_candidate())
+        return mutable_cycle_candidate_count(
+          current.mutable_cycle_candidate_index());
+
       return static_cast<RC>(header_state.count());
     }
 
@@ -61,7 +69,23 @@ namespace vbci
 
     void set_state(HeaderState::Snapshot state)
     {
+      if (this->state().is_mutable_cycle_candidate())
+      {
+        auto current = this->state();
+        auto rc = remove_mutable_cycle_candidate(
+          current.mutable_cycle_candidate_index());
+        header_state.set(state, rc);
+        return;
+      }
+
       header_state.transition(state);
+    }
+
+    void restore_mutable_cycle_candidate(RC rc)
+    {
+      assert(state().is_mutable_cycle_candidate());
+      assert(rc > 0);
+      header_state.set(HeaderState::mutable_(), rc);
     }
 
     // Union-find representative lookup with path compression.
@@ -97,6 +121,14 @@ namespace vbci
       if (state.is_finalizing())
         return;
 
+      if (state.is_mutable_cycle_candidate())
+      {
+        auto count = remove_mutable_cycle_candidate(
+          state.mutable_cycle_candidate_index());
+        header_state.set(HeaderState::mutable_(), count + 1);
+        return;
+      }
+
       if (state.is_shared())
       {
         auto previous = header_state.increment_shared_count();
@@ -124,6 +156,18 @@ namespace vbci
       if (state.is_finalizing())
         return;
 
+      if (state.is_mutable_cycle_candidate())
+      {
+        auto previous = decrement_mutable_cycle_candidate(
+          state.mutable_cycle_candidate_index());
+        if (previous == 1)
+        {
+          header_state.set(HeaderState::mutable_(), 0);
+          collect(this);
+        }
+        return;
+      }
+
       if (state.is_shared())
       {
         if (header_state.decrement_shared_count())
@@ -139,7 +183,14 @@ namespace vbci
       auto previous = header_state.decrement_count();
       assert(previous > 0);
       if (previous == 1)
+      {
         collect(this);
+        return;
+      }
+
+      if (auto index = add_mutable_cycle_candidate(this, previous - 1))
+        header_state.transition(
+          HeaderState::mutable_cycle_candidate(*index));
     }
   };
 

@@ -9,6 +9,7 @@ add_executable(vbci
   frame.cc
   freeze.cc
   main.cc
+  mutable_cycle_candidates.cc
   program.cc
   region.cc
   region_rc.cc

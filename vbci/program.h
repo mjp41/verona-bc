@@ -39,6 +39,7 @@ namespace vbci
     std::vector<Function> functions;
     std::vector<Class> classes;
     std::vector<ComplexType> complex_types;
+    std::vector<bool> can_cycle_by_type;
     std::unordered_map<uint32_t, uint32_t> ref_map;
 
     std::vector<Dynlib> libs;

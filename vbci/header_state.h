@@ -12,6 +12,7 @@ namespace vbci
   class HeaderState
   {
   private:
+    static constexpr auto MutableCycleCandidate = uintptr_t(0x0);
     static constexpr auto Mutable = uintptr_t(0x1);
     static constexpr auto Immutable = uintptr_t(0x2);
     static constexpr auto Pending = uintptr_t(0x3);
@@ -38,7 +39,19 @@ namespace vbci
     public:
       bool is_mutable() const
       {
-        return (value & Mask) == Mutable;
+        auto tag = value & Mask;
+        return tag == Mutable || tag == MutableCycleCandidate;
+      }
+
+      bool is_mutable_cycle_candidate() const
+      {
+        return (value & Mask) == MutableCycleCandidate;
+      }
+
+      size_t mutable_cycle_candidate_index() const
+      {
+        assert(is_mutable_cycle_candidate());
+        return value >> Shift;
       }
 
       bool is_immortal() const
@@ -104,6 +117,11 @@ namespace vbci
       return Snapshot(Mutable);
     }
 
+    static constexpr Snapshot mutable_cycle_candidate(size_t index)
+    {
+      return Snapshot((uintptr_t(index) << Shift) | MutableCycleCandidate);
+    }
+
     static constexpr Snapshot immutable()
     {
       return Snapshot(Immutable);
@@ -152,6 +170,17 @@ namespace vbci
       value.store(count_value(current, count), std::memory_order_relaxed);
     }
 
+    void set(Snapshot state, size_t count = 0)
+    {
+      if (state.is_scc_ptr())
+      {
+        value.store(state.value, std::memory_order_relaxed);
+        return;
+      }
+
+      value.store(count_value(state, count), std::memory_order_relaxed);
+    }
+
     size_t increment_count()
     {
       auto previous = raw();
@@ -185,7 +214,7 @@ namespace vbci
 
     void transition(Snapshot next)
     {
-      if (next.is_scc_ptr())
+      if (next.is_scc_ptr() || next.is_mutable_cycle_candidate())
       {
         value.store(next.value, std::memory_order_relaxed);
         return;
