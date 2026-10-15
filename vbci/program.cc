@@ -4,7 +4,9 @@
 #include "cown.h"
 #include "freeze.h"
 #include "thread.h"
+#include "traverse.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <dlfcn.h>
 #include <format>
@@ -341,6 +343,11 @@ namespace vbci
   bool Program::is_union(uint32_t type_id)
   {
     return is_complex(type_id) && (complex_type(type_id).tag == TypeTag::Union);
+  }
+
+  bool Program::can_cycle(uint32_t type_id)
+  {
+    return cls(type_id).can_cycle;
   }
 
   uint32_t Program::unarray(uint32_t type_id)
@@ -894,6 +901,8 @@ namespace vbci
         return false;
     }
 
+    calculate_cycle_capabilities();
+
     // Function label locations are relative to the code section. Make them
     // absolute.
     auto memo_count = uleb(pc);
@@ -1027,6 +1036,171 @@ namespace vbci
     }
 
     return true;
+  }
+
+  void Program::calculate_cycle_capabilities()
+  {
+    auto is_cycle_candidate = [&](uint32_t type_id) {
+      if (
+        (type_id < NumPrimitiveClasses) ||
+        (type_id >= classes.size()))
+        return false;
+
+      if (type_id < min_complex_type_id)
+        return true;
+
+      auto tag = complex_type(type_id).tag;
+      return (tag == TypeTag::Array) || (tag == TypeTag::Tuple);
+    };
+
+    auto contains_referee = [&](uint32_t type_id, uint32_t referee) {
+      auto equivalent = [&](uint32_t candidate) {
+        return subtype(candidate, referee) && subtype(referee, candidate);
+      };
+
+      if (type_id < min_complex_type_id)
+      {
+        auto& fields = classes.at(type_id).fields;
+        return std::any_of(fields.begin(), fields.end(), [&](auto& field) {
+          return equivalent(field.type_id);
+        });
+      }
+
+      auto& children = complex_type(type_id).children;
+      return std::any_of(children.begin(), children.end(), equivalent);
+    };
+
+    enum class Visit
+    {
+      Unseen,
+      Pending,
+      Complete
+    };
+
+    struct SccState
+    {
+      uint32_t parent;
+      Visit visit = Visit::Unseen;
+      bool cyclic = false;
+    };
+
+    auto type_count = min_complex_type_id + complex_types.size();
+    std::vector<SccState> states;
+    states.reserve(type_count);
+    for (uint32_t type_id = 0; type_id < type_count; type_id++)
+      states.push_back({type_id});
+
+    auto find = [&](uint32_t type_id) {
+      auto root = type_id;
+      while (states.at(root).parent != root)
+        root = states.at(root).parent;
+
+      while (states.at(type_id).parent != type_id)
+      {
+        auto next = states.at(type_id).parent;
+        states.at(type_id).parent = root;
+        type_id = next;
+      }
+
+      return root;
+    };
+
+    auto trace_node = [&](uint32_t source, auto add_child) {
+      if (source == DynamicTypeId)
+      {
+        for (uint32_t target = 0; target < type_count; target++)
+          add_child(target);
+        return;
+      }
+
+      if (source < min_complex_type_id)
+      {
+        if (source >= NumPrimitiveClasses)
+        {
+          for (auto& field : classes.at(source).fields)
+            add_child(field.type_id);
+        }
+
+        return;
+      }
+
+      auto& type = complex_type(source);
+      switch (type.tag)
+      {
+        case TypeTag::Ref:
+        {
+          auto referee = type.children.at(0);
+          for (uint32_t target = 0; target < classes.size(); target++)
+          {
+            if (
+              is_cycle_candidate(target) &&
+              contains_referee(target, referee))
+              add_child(target);
+          }
+          return;
+        }
+
+        case TypeTag::Union:
+        case TypeTag::Array:
+        case TypeTag::Tuple:
+          for (auto child : type.children)
+            add_child(child);
+          return;
+
+        case TypeTag::Cown:
+          return;
+      }
+    };
+
+    std::vector<uint32_t> pending;
+    auto enter = [&](uint32_t type_id) {
+      if (type_id >= type_count)
+        return false;
+
+      auto rep = find(type_id);
+      auto& state = states.at(rep);
+      if (state.visit == Visit::Complete)
+        return false;
+
+      if (state.visit == Visit::Pending)
+      {
+        state.cyclic = true;
+        while (pending.back() != rep)
+        {
+          auto child = find(pending.back());
+          states.at(child).parent = rep;
+          pending.pop_back();
+        }
+        return false;
+      }
+
+      state.visit = Visit::Pending;
+      pending.push_back(rep);
+      return true;
+    };
+
+    auto leave = [&](uint32_t type_id) {
+      if (!pending.empty() && (pending.back() == type_id))
+      {
+        pending.pop_back();
+        states.at(find(type_id)).visit = Visit::Complete;
+      }
+    };
+
+    for (uint32_t type_id = 0; type_id < classes.size(); type_id++)
+    {
+      if (!is_cycle_candidate(type_id))
+        continue;
+
+      traverse_graph(type_id, trace_node, enter, leave);
+    }
+
+    assert(pending.empty());
+    for (uint32_t type_id = 0; type_id < classes.size(); type_id++)
+    {
+      if (is_cycle_candidate(type_id))
+        classes.at(type_id).can_cycle = states.at(find(type_id)).cyclic;
+    }
   }
 
   void Program::parse_complex_type(ComplexType& t, uint32_t type_id, PC& pc)

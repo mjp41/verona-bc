@@ -253,6 +253,21 @@ can still reach zero and collect normally. Finalized headers accumulate in the
 collector's deletion queue, and region transfer repeats for remaining cycles.
 Only then are all finalized objects and the empty region released.
 
+Runtime type metadata includes a `can_cycle` capability. After all types are
+loaded, the interpreter builds the possible managed-reference graph and marks
+types belonging to a cyclic SCC, defined as an SCC containing at least one
+internal edge. Object classes, arrays, and tuples are cycle candidates. Union,
+`ref`, and `dyn` type IDs are auxiliary traversal vertices; cowns remain
+ownership boundaries. Erased `dyn` values conservatively connect to every
+valid type ID. A `ref[T]` connects to cycle candidates with a direct field or
+element type equivalent to `T`, matching the possible base headers of interior
+references. Future cycle detection can skip headers whose type is not marked.
+Each trace step expands one type ID by one level using the shared iterative
+`traverse_graph` primitive, so deeply nested type graphs do not consume the
+native stack. An edge to a pending type unions the pending suffix into that
+representative, matching frozen-object SCC discovery without constructing a
+reverse graph.
+
 Allocation groups preserve the finalization contract for acyclic graphs: an
 abandoned source image is reclaimed without its user finalizer, while each
 surviving destination image finalizes when its semantic lifetime ends. The

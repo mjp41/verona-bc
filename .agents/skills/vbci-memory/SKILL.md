@@ -53,6 +53,20 @@ collects remaining cyclic or otherwise live objects as a group.
 Mutable counts are thread-confined and use relaxed atomic loads and stores;
 only shared immutable and cown counts use atomic read-modify-write operations.
 
+Each runtime `Class` has a `can_cycle` capability computed once after loading
+all type metadata. The runtime builds the possible managed-reference graph and
+marks only types in a cyclic SCC, defined as an SCC containing at least one
+internal edge. User objects, arrays, and tuples are cycle candidates. Union,
+`ref`, and `dyn` type IDs are auxiliary traversal vertices; cowns are ownership
+boundaries. Erased `dyn` values conservatively target every valid type ID. A
+`ref[T]` targets cycle candidates with a direct field or element type
+equivalent to `T`, matching the possible base headers of interior references.
+The cycle detector can skip headers whose type is not marked.
+Each trace step expands one type ID by one level using the shared iterative
+`traverse_graph` primitive. SCC discovery mirrors freezing: an edge to a
+pending type unions the pending suffix into that representative. No reverse
+graph is constructed.
+
 Readonly behavior arguments do not adjust object RC because their cown-owned
 allocation group remains alive for the behavior. Cown handles themselves
 remain independently reference counted.

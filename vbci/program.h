@@ -146,6 +146,7 @@ namespace vbci
     bool is_ref(uint32_t type_id);
     bool is_cown(uint32_t type_id);
     bool is_union(uint32_t type_id);
+    bool can_cycle(uint32_t type_id);
     uint32_t unarray(uint32_t type_id);
     uint32_t uncown(uint32_t type_id);
     uint32_t unref(uint32_t type_id);
@@ -167,6 +168,7 @@ namespace vbci
     bool parse_fields(Class& cls, PC& pc);
     bool parse_methods(Class& cls, PC& pc);
     bool fixup_methods(Class& cls);
+    void calculate_cycle_capabilities();
     void parse_complex_type(ComplexType& t, uint32_t type_id, PC& pc);
     void init_memo_slot(size_t index);
     std::string fallback_function(Function* func);
