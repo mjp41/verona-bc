@@ -1,6 +1,6 @@
 #pragma once
 
-#include "location.h"
+#include "header_state.h"
 #include "register.h"
 
 namespace vbci::writebarrier
@@ -13,24 +13,29 @@ namespace vbci::writebarrier
       Value::error(Error::BadStore);
   }
 
-  inline void check_exchange(Location store_loc, const Value& value)
+  inline void check_exchange(
+    HeaderState::Snapshot store_state, const Value& value)
   {
-    if (store_loc.is_shared() || store_loc.is_immortal())
+    if (store_state.is_shared() || store_state.is_immortal())
       Value::error(Error::BadStore);
 
     check_value(value);
   }
 
   inline void
-  init(Location store_loc, void* addr, ValueType type, Register next)
+  init(
+    HeaderState::Snapshot store_state,
+    void* addr,
+    ValueType type,
+    Register next)
   {
     check_value(next.borrow());
 
-    if (store_loc.is_shared() || store_loc.is_immortal())
+    if (store_state.is_shared() || store_state.is_immortal())
     {
-      auto next_loc = next->location();
+      auto next_state = next->state();
 
-      if (!next_loc.is_shared() && !next_loc.is_immortal())
+      if (!next_state.is_shared() && !next_state.is_immortal())
         Value::error(Error::BadStore);
     }
 
@@ -39,11 +44,14 @@ namespace vbci::writebarrier
   }
 
   template<bool is_move>
-  ValueTransfer
-  exchange(Location store_loc, void* addr, ValueType type, Reg<is_move> next)
+  ValueTransfer exchange(
+    HeaderState::Snapshot store_state,
+    void* addr,
+    ValueType type,
+    Reg<is_move> next)
   {
     auto prev = Value::from_addr(type, addr);
-    check_exchange(store_loc, next.borrow());
+    check_exchange(store_state, next.borrow());
 
     next->to_addr(type, addr);
 
@@ -61,9 +69,9 @@ namespace vbci::writebarrier
 
   inline void drop(Value& value)
   {
-    auto value_loc = value.location();
+    auto value_state = value.state();
 
-    if (value_loc.is_immortal() || value_loc.is_pending())
+    if (value_state.is_immortal() || value_state.is_pending())
       return;
 
     value.dec();

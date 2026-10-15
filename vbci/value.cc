@@ -781,24 +781,24 @@ namespace vbci
     }
   }
 
-  Location Value::location() const
+  HeaderState::Snapshot Value::state() const
   {
     switch (tag)
     {
       case ValueType::Object:
       case ValueType::FieldRef:
-        return obj->location();
+        return obj->state();
 
       case ValueType::Array:
       case ValueType::ArrayRef:
-        return arr->location();
+        return arr->state();
 
       case ValueType::Cown:
       case ValueType::CownRef:
-        return cown->location();
+        return cown->state();
 
       default:
-        return Location::immortal();
+        return HeaderState::immortal();
     }
   }
 
@@ -857,7 +857,7 @@ namespace vbci
 
     // Propagate readonly only to mutable (non-immortal, non-immutable) values.
     // Immortal and shared values don't need the readonly restriction.
-    if (readonly && !v.location().is_immortal() && !v.location().is_shared())
+    if (readonly && !v.state().is_immortal() && !v.state().is_shared())
       v.readonly = true;
     return v;
   }

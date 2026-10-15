@@ -60,10 +60,10 @@ namespace vbci
 
     void push(Header* header)
     {
-      header->collector_set_next(nullptr);
+      header->set_next(nullptr);
 
       if (last)
-        last->collector_set_next(header);
+        last->set_next(header);
       else
         first = header;
 
@@ -72,7 +72,7 @@ namespace vbci
 
     void push_front(Header* header)
     {
-      header->collector_set_next(first);
+      header->set_next(first);
       first = header;
       if (!last)
         last = header;
@@ -82,7 +82,7 @@ namespace vbci
     {
       assert(first);
       auto* header = first;
-      first = header->collector_get_next();
+      first = header->next();
       if (!first)
         last = nullptr;
       return header;
@@ -105,7 +105,7 @@ namespace vbci
 
     void enqueue(Header* header, Region* region)
     {
-      header->set_location(Location::finalizing());
+      header->set_state(HeaderState::finalizing());
 
       if (collecting_region)
       {
@@ -136,9 +136,9 @@ namespace vbci
 
     void enqueue(Header* header)
     {
-      assert(header->location().is_shared());
+      assert(header->state().is_shared());
 
-      if (!header->location().is_cown())
+      if (!header->state().is_cown())
       {
         work.emplace(header);
         return;
@@ -175,7 +175,7 @@ namespace vbci
 
         do
         {
-          header->set_location(Location::finalizing());
+          header->set_state(HeaderState::finalizing());
           enqueue_header(header);
           header = region_to_delete->take_header();
         } while (header);
@@ -188,8 +188,8 @@ namespace vbci
         LOG(Trace) << "Deleting work item: " << static_cast<void*>(header);
 
         assert(
-          header->location().is_pending() ||
-          header->location().is_finalizing());
+          header->state().is_pending() ||
+          header->state().is_finalizing());
         delete[] reinterpret_cast<uint8_t*>(header);
       }
 
@@ -204,20 +204,20 @@ namespace vbci
 
     void enqueue_scc_members(Header* root)
     {
-      assert(root->location().is_shared() && !root->location().is_cown());
-      root->set_location(Location::pending());
+      assert(root->state().is_shared() && !root->state().is_cown());
+      root->set_state(HeaderState::pending());
       std::vector<Header*> work;
       work.push_back(root);
 
       auto& program = Program::get();
       auto add_member = [&](Header* header) {
-        if (!header->location().is_scc_ptr())
+        if (!header->state().is_scc_ptr())
           return;
 
         auto* representative = Header::find(header);
-        if (representative->location().is_pending())
+        if (representative->state().is_pending())
         {
-          header->set_location(Location::pending());
+          header->set_state(HeaderState::pending());
           work.push_back(header);
         }
       };
@@ -336,13 +336,13 @@ namespace vbci
 
   void collect(Header* h)
   {
-    if (h->location().is_shared())
+    if (h->state().is_shared())
     {
       use_collector([&](Collector& collector) { collector.enqueue(h); });
       return;
     }
 
-    assert(h->location().is_mutable());
+    assert(h->state().is_mutable());
     auto* region = current_region();
     assert(region);
 

@@ -52,8 +52,8 @@ namespace vbci
         if (!source)
           return ValueBorrow(value);
 
-        auto loc = source->location();
-        if (loc.is_shared() || loc.is_immortal())
+        auto state = source->state();
+        if (state.is_shared() || state.is_immortal())
           return ValueTransfer(value);
 
         auto target = copies.at(source);
@@ -107,8 +107,8 @@ namespace vbci
         traverse(
           root_header,
           [&](Header* source) {
-            auto loc = source->location();
-            if (loc.is_shared() || loc.is_immortal())
+            auto state = source->state();
+            if (state.is_shared() || state.is_immortal())
             {
               source->inc();
               return false;
@@ -139,8 +139,8 @@ namespace vbci
       if (!root.is_header())
         return root;
 
-      auto loc = root.get_header()->location();
-      if (loc.is_shared() || loc.is_immortal())
+      auto state = root.get_header()->state();
+      if (state.is_shared() || state.is_immortal())
         return root;
 
       return GraphCopy(region).run(root);

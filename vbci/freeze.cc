@@ -42,7 +42,7 @@ namespace vbci
 
     // Transfer external refs, minus 1 for the intra-SCC tree edge.
     rep_r->set_rc(rep_r->get_rc() + r->get_rc() - 1);
-    r->set_location(Location::scc_ptr(rep_r));
+    r->set_state(HeaderState::scc_ptr(rep_r));
   }
 
   // Trace a header's fields, pushing children onto the DFS stack.
@@ -50,18 +50,18 @@ namespace vbci
   {
     auto& program = Program::get();
     auto fn = [&](Header* h) {
-      auto loc = h->location();
+      auto state = h->state();
 
-      if (loc.is_scc_ptr() || loc.is_pending())
+      if (state.is_scc_ptr() || state.is_pending())
       {
         dfs.push_back(h);
         return;
       }
 
-      if (loc.is_shared() || loc.is_immortal())
+      if (state.is_shared() || state.is_immortal())
         return;
 
-      if (loc.is_mutable())
+      if (state.is_mutable())
         dfs.push_back(h);
     };
 
@@ -74,9 +74,9 @@ namespace vbci
   void freeze(Header* root, Region& region)
   {
     assert(root);
-    auto loc = root->location();
+    auto state = root->state();
 
-    if (loc.is_shared() || loc.is_immortal())
+    if (state.is_shared() || state.is_immortal())
       return;
 
     std::vector<Header*> dfs;
@@ -97,8 +97,7 @@ namespace vbci
         {
           pending.pop_back();
           auto rep = Header::find(h);
-          rep->set_location(Location::immutable());
-          rep->set_arc(rep->get_rc());
+          rep->set_state(HeaderState::immutable());
         }
 
         continue;
@@ -106,9 +105,9 @@ namespace vbci
 
       Header* h = h_mark;
       auto rep = Header::find(h);
-      auto rep_loc = rep->location();
+      auto rep_state = rep->state();
 
-      if (rep_loc.is_pending())
+      if (rep_state.is_pending())
       {
         rep->set_rc(rep->get_rc() - 1);
 
@@ -118,16 +117,16 @@ namespace vbci
           pending.pop_back();
         }
       }
-      else if (rep_loc.is_shared())
+      else if (rep_state.is_shared())
       {
         // Already frozen. No action needed.
       }
-      else if (rep_loc.is_mutable())
+      else if (rep_state.is_mutable())
       {
         if (!region.remove(h))
           Value::error(Error::BadFreeze);
 
-        h->set_location(Location::pending());
+        h->set_state(HeaderState::pending());
 
         pending.push_back(h);
         dfs.push_back(post_order_mark(h));

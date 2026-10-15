@@ -17,12 +17,12 @@ namespace vbci
     ValueType value_type;
 
     Array(
-      Location loc,
+      HeaderState::Snapshot state,
       uint32_t type_id,
       ValueType value_type,
       size_t size,
       size_t stride)
-    : Header(loc, type_id), size(size), stride(stride), value_type(value_type)
+    : Header(state, type_id), size(size), stride(stride), value_type(value_type)
     {
       if (value_type == ValueType::Dyn)
       {
@@ -40,13 +40,13 @@ namespace vbci
   public:
     static Array* create(
       void* mem,
-      Location loc,
+      HeaderState::Snapshot state,
       uint32_t type_id,
       ValueType value_type,
       size_t size,
       size_t stride)
     {
-      return new (mem) Array(loc, type_id, value_type, size, stride);
+      return new (mem) Array(state, type_id, value_type, size, stride);
     }
 
     static size_t size_of(size_t size, size_t stride)
@@ -88,7 +88,7 @@ namespace vbci
         Value::error(Error::BadType);
 
       void* addr = reinterpret_cast<uint8_t*>(this + 1) + (stride * idx);
-      writebarrier::init(location(), addr, value_type, std::move(v));
+      writebarrier::init(state(), addr, value_type, std::move(v));
     }
 
     template<bool is_move>
@@ -99,7 +99,7 @@ namespace vbci
 
       void* addr = reinterpret_cast<uint8_t*>(this + 1) + (stride * idx);
       return writebarrier::exchange<is_move>(
-        location(), addr, value_type, std::forward<Reg<is_move>>(v));
+        state(), addr, value_type, std::forward<Reg<is_move>>(v));
     }
 
     bool is_primitive() const
@@ -235,7 +235,7 @@ namespace vbci
 
     void immortalize()
     {
-      if (location().is_immortal())
+      if (state().is_immortal())
         return;
 
       mark_immortal();

@@ -15,21 +15,23 @@ namespace vbci
   struct Object : public Header
   {
   private:
-    Object(Location loc, Class& cls) : Header(loc, cls.type_id)
+    Object(HeaderState::Snapshot state, Class& cls)
+    : Header(state, cls.type_id)
     {
       LOG(Trace) << "Creating object of class " << cls.type_id << "@" << this;
     }
 
   public:
-    static Object* create(void* mem, Class& cls, Location loc)
+    static Object* create(
+      void* mem, Class& cls, HeaderState::Snapshot state)
     {
-      return new (mem) Object(loc, cls);
+      return new (mem) Object(state, cls);
     }
 
     Object& init(Frame& frame, Class& cls)
     {
       uint8_t* base = reinterpret_cast<uint8_t*>(this + 1);
-      auto loc = location();
+      auto state = this->state();
 
       for (size_t i = 0; i < cls.fields.size(); i++)
       {
@@ -40,7 +42,7 @@ namespace vbci
           Value::error(Error::BadType);
 
         void* addr = base + f.offset;
-        writebarrier::init(loc, addr, f.value_type, std::move(v));
+        writebarrier::init(state, addr, f.value_type, std::move(v));
       }
 
       return *this;
@@ -91,7 +93,7 @@ namespace vbci
         Value::error(Error::BadType);
 
       void* addr = reinterpret_cast<uint8_t*>(this + 1) + f.offset;
-      writebarrier::init(location(), addr, f.value_type, std::move(v));
+      writebarrier::init(state(), addr, f.value_type, std::move(v));
     }
 
     template<bool is_move>
@@ -104,7 +106,7 @@ namespace vbci
 
       void* addr = reinterpret_cast<uint8_t*>(this + 1) + f.offset;
       return writebarrier::exchange<is_move>(
-        location(), addr, f.value_type, std::forward<Reg<is_move>>(v));
+        state(), addr, f.value_type, std::forward<Reg<is_move>>(v));
     }
 
     /**
@@ -178,7 +180,7 @@ namespace vbci
 
     void immortalize()
     {
-      if (location().is_immortal())
+      if (state().is_immortal())
         return;
 
       mark_immortal();

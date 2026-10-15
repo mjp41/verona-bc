@@ -230,11 +230,19 @@ their owned group while dropping their content; frozen SCC roots use the
 tagged work queue but require no region. SCC members enter the common
 header-finalization batch, whose normal field drops decrement external
 immutable references and queue them only on ARC zero. Mutable and immutable
-headers reuse their dead count storage as intrinsic finalization/deletion
-links. Cowns derive from the same `Header`; its `Cown` location state shares
-the immutable representative's atomic count and selects cown teardown rather
-than SCC collection when that count reaches zero. The count storage then
-becomes the intrusive cown collector link.
+headers use `HeaderState` to encapsulate their tag and count or pointer in one
+atomic word. The upper bits become intrinsic finalization/deletion links after
+collection. Mutable counts use relaxed loads and stores; only shared counts use
+atomic read-modify-write operations. Cowns derive from the same `Header`; its
+`Cown` tag selects cown teardown rather than SCC collection when the shared
+count reaches zero. The upper bits then become the intrusive cown collector
+link.
+
+`Immortal` and `Finalizing` remain separate tags for now, although neither
+performs reference-count operations. Finalizers receive readonly `self`, which
+cannot be stored outside the stack. Once all copy boundaries are confirmed
+unable to receive that readonly reference, these states can be collapsed to
+recover one tag value.
 
 Whole-group finalization reuses the group for allocations made by finalizers.
 Before running a batch, the collector removes all live headers from `RegionRC`

@@ -5,7 +5,6 @@
  *
  * This holds a value and manages the ownership semantics of that value.
  */
-#include "location.h"
 #include "value.h"
 
 namespace vbci
@@ -36,7 +35,7 @@ namespace vbci
 
     ValueImmortal(const Value& v) : Value(v)
     {
-      assert(v.location().is_immortal());
+      assert(v.state().is_immortal());
     }
   };
 
@@ -78,7 +77,7 @@ namespace vbci
 
     Register(ValueImmortal v)
     {
-      assert(v.location().is_immortal());
+      assert(v.state().is_immortal());
       set_raw_unsafe(v);
     };
 

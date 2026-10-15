@@ -1,6 +1,7 @@
 #pragma once
 
 #include "frame_id.h"
+#include "header_state.h"
 #include "ident.h"
 #include "logging.h"
 #include "platform.h"
@@ -156,7 +157,7 @@ namespace vbci
     Register& get_register() const;
     FrameId frame_id() const;
 
-    Location location() const;
+    HeaderState::Snapshot state() const;
     void immortalize();
 
     template<bool is_move>

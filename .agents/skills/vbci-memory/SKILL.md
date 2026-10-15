@@ -41,7 +41,7 @@ releasing the group. `Thread::OwnedRegister` implements this protocol.
 `Header::rc` counts mutable references to an individual object or array.
 Register and field references use the same `inc()` / `dec()` operations.
 Reaching zero collects the individual object. Headers already claimed by the
-collector use the `Finalizing` location state, whose increments and decrements
+collector use the `Finalizing` header state, whose increments and decrements
 are no-ops. Newly allocated objects remain `Mutable` even when their region is
 being finalized, so their ordinary decrements still collect acyclic garbage.
 The write barrier separately rejects storing readonly borrowed values. Mutable
@@ -50,6 +50,8 @@ removes the object from its group.
 
 Object RC can collect acyclic garbage early. Allocation-group destruction also
 collects remaining cyclic or otherwise live objects as a group.
+Mutable counts are thread-confined and use relaxed atomic loads and stores;
+only shared immutable and cown counts use atomic read-modify-write operations.
 
 Readonly behavior arguments do not adjust object RC because their cown-owned
 allocation group remains alive for the behavior. Cown handles themselves
@@ -111,9 +113,16 @@ whole group. Work for another group is deferred until that group becomes
 active. A mutable root starts or joins the active batch directly. Frozen SCC
 roots use a tagged work queue, while cowns remain intrusive.
 
-`Header` reuses its dead RC/ARC storage as an intrusive collector link.
-Finalization uses an intrinsic FIFO, then moves each header onto an intrinsic
-deletion list.
+`HeaderState` encapsulates one atomic tagged word. The bottom three bits
+identify the state; the upper bits hold mutable RC, shared ARC, an SCC
+representative, or an intrusive collector link. Finalization uses an intrinsic
+FIFO, then moves each header onto an intrinsic deletion list.
+
+`Immortal` and `Finalizing` currently have separate tags even though both
+ignore reference-count operations. The finalizer receives readonly `self`, so
+it cannot store that reference outside the stack. If every copy boundary is
+confirmed unable to receive such a readonly reference, the states may be
+collapsed to recover one tag value.
 
 Frozen SCC discovery adds every member to the common header-finalization
 batch. Field dropping performs the normal ARC decrements for immutable
@@ -153,11 +162,11 @@ cown.
 Readonly acquisition leaves the cown's group in place and exposes only a
 readonly borrowed value for the behavior lifetime.
 
-`Cown` derives from `Header` and uses the `Cown` location state. Cowns and
+`Cown` derives from `Header` and uses the `Cown` header state. Cowns and
 immutable SCC representatives use the same atomic header count with relaxed
-increments and release/acquire zero decrements. The location state determines
-which collection path zero selects. The count/link union becomes the intrusive
-collector link after zero.
+increments and release/acquire zero decrements. The header state determines
+which collection path zero selects. After zero, the upper bits of the tagged
+state become the intrusive collector link.
 
 ## Foreign lifetimes
 
@@ -173,7 +182,7 @@ component. It must not reintroduce an allocation-group reference count.
 | File | Purpose |
 |------|---------|
 | `frame_id.h` | Frame ordering for register-reference lifetime checks |
-| `location.h` | Mutable, frozen-SCC, immortal, and pending header state |
+| `header_state.h` | Tagged header state, counts, SCC links, and collector links |
 | `region.h` | `Region` and move-only `AllocationGroup` |
 | `region_rc.h/cc` | Mutable allocation storage and group collection |
 | `header.h` | Mutable RC, shared atomic RC, and collector links |

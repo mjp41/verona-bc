@@ -3,7 +3,6 @@
 #include "classes.h"
 #include "collect.h"
 #include "ident.h"
-#include "location.h"
 #include "logging.h"
 
 #include <cstdint>

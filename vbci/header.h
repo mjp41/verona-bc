@@ -1,66 +1,31 @@
 #pragma once
 
+#include "header_state.h"
 #include "ident.h"
-#include "location.h"
 #include "region.h"
 #include "register.h"
 #include "value.h"
-
-#include <atomic>
-#include <new>
 
 namespace vbci
 {
   struct Header
   {
   private:
-    Location loc;
-
-    union
-    {
-      RC rc;
-      std::atomic<size_t> atomic_rc;
-      Header* next_to_collect;
-    };
-
+    HeaderState header_state;
     uint32_t type_id;
 
   protected:
-    Header(Location loc, uint32_t type_id) : loc(loc), rc(1), type_id(type_id)
+    Header(HeaderState::Snapshot state, uint32_t type_id)
+    : header_state(state), type_id(type_id)
     {}
 
     explicit Header(uint32_t type_id)
-    : loc(Location::cown()), atomic_rc(1), type_id(type_id)
+    : header_state(HeaderState::cown()), type_id(type_id)
     {}
 
     void mark_immortal()
     {
-      loc = Location::immortal();
-    }
-
-    void atomic_inc() noexcept
-    {
-      if (loc.is_immortal())
-        return;
-
-      assert(loc.is_shared());
-      auto previous = atomic_rc.fetch_add(1, std::memory_order_relaxed);
-      assert(previous > 0);
-    }
-
-    bool atomic_dec() noexcept
-    {
-      if (loc.is_immortal())
-        return false;
-
-      assert(loc.is_shared());
-      auto previous = atomic_rc.fetch_sub(1, std::memory_order_release);
-      assert(previous > 0);
-      if (previous != 1)
-        return false;
-
-      std::atomic_thread_fence(std::memory_order_acquire);
-      return true;
+      set_state(HeaderState::immortal());
     }
 
   public:
@@ -71,108 +36,112 @@ namespace vbci
 
     RC get_rc()
     {
-      return rc;
+      return static_cast<RC>(header_state.count());
     }
 
     void set_rc(RC v)
     {
-      rc = v;
+      header_state.set_count(v);
     }
 
-    void set_arc(RC v)
+    Header* next() const
     {
-      new (&atomic_rc) std::atomic<size_t>(v);
+      return header_state.next();
     }
 
-    Header* collector_get_next() const
+    void set_next(Header* next)
     {
-      return next_to_collect;
+      header_state.set_next(next);
     }
 
-    void collector_set_next(Header* next)
+    HeaderState::Snapshot state() const
     {
-      next_to_collect = next;
+      return header_state.load();
     }
 
-    Location location() const
+    void set_state(HeaderState::Snapshot state)
     {
-      return loc;
-    }
-
-    void set_location(Location l)
-    {
-      loc = l;
+      header_state.transition(state);
     }
 
     // Union-find representative lookup with path compression.
     // Used by frozen SCC objects to find their SCC root.
     static Header* find(Header* h)
     {
-      if (!h->loc.is_scc_ptr())
+      auto state = h->state();
+      if (!state.is_scc_ptr())
         return h;
 
-      auto target = h->loc.scc_target();
+      auto target = state.scc_target();
       auto root = find(target);
 
       // Path compression: point directly to root.
       if (root != target)
-        h->loc = Location::scc_ptr(root);
+        h->set_state(HeaderState::scc_ptr(root));
 
       return root;
     }
 
     void inc()
     {
-      if (loc.is_scc_ptr())
+      auto state = this->state();
+      if (state.is_scc_ptr())
       {
         find(this)->inc();
         return;
       }
 
-      if (loc.is_immortal())
+      if (state.is_immortal())
         return;
 
-      if (loc.is_finalizing())
+      if (state.is_finalizing())
         return;
 
-      if (loc.is_shared())
+      if (state.is_shared())
       {
-        atomic_inc();
+        auto previous = header_state.increment_shared_count();
+        assert(previous > 0);
         return;
       }
 
-      assert(loc.is_mutable());
-      rc++;
+      assert(state.is_mutable());
+      auto previous = header_state.increment_count();
+      assert(previous > 0);
     }
 
     void dec()
     {
-      if (loc.is_scc_ptr())
+      auto state = this->state();
+      if (state.is_scc_ptr())
       {
         find(this)->dec();
         return;
       }
 
-      if (loc.is_immortal())
+      if (state.is_immortal())
         return;
 
-      if (loc.is_finalizing())
+      if (state.is_finalizing())
         return;
 
-      if (loc.is_shared())
+      if (state.is_shared())
       {
-        if (atomic_dec())
+        if (header_state.decrement_shared_count())
           collect(this);
 
         return;
       }
 
-      assert(loc.is_mutable());
+      assert(state.is_mutable());
       auto* r = current_region();
       assert(r);
 
-      if (--rc == 0)
+      auto previous = header_state.decrement_count();
+      assert(previous > 0);
+      if (previous == 1)
         collect(this);
     }
   };
+
+  static_assert(alignof(Header) >= 8);
 }
