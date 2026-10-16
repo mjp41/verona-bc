@@ -16,6 +16,7 @@
 #include "array.h"
 #include "cown.h"
 #include "header.h"
+#include "header_queue.h"
 #include "object.h"
 #include "region.h"
 
@@ -48,47 +49,6 @@ namespace vbci
     {}
   };
 
-  struct HeaderQueue
-  {
-    Header* first = nullptr;
-    Header* last = nullptr;
-
-    bool empty() const
-    {
-      return first == nullptr;
-    }
-
-    void push(Header* header)
-    {
-      header->set_next(nullptr);
-
-      if (last)
-        last->set_next(header);
-      else
-        first = header;
-
-      last = header;
-    }
-
-    void push_front(Header* header)
-    {
-      header->set_next(first);
-      first = header;
-      if (!last)
-        last = header;
-    }
-
-    Header* pop()
-    {
-      assert(first);
-      auto* header = first;
-      first = header->next();
-      if (!first)
-        last = nullptr;
-      return header;
-    }
-  };
-
   struct Collector
   {
     std::queue<WorkItem> work;
@@ -119,6 +79,42 @@ namespace vbci
       enqueue_header(header);
       drain_batch();
       collecting_region = nullptr;
+    }
+
+    void enqueue(Header* headers, Region& region)
+    {
+      if (!headers)
+        return;
+
+      auto starts_batch = collecting_region == nullptr;
+      if (starts_batch)
+      {
+        assert(current_region() == &region);
+        collecting_region = &region;
+      }
+      else
+      {
+        assert(collecting_region == &region);
+      }
+
+      // Classification has already claimed the complete garbage set and
+      // linked it through the Finalizing headers.
+      while (headers)
+      {
+        auto* header = headers;
+        headers = header->next();
+
+        assert(header->state().is_finalizing());
+        auto removed = region.remove(header);
+        assert(removed);
+        enqueue_header(header);
+      }
+
+      if (starts_batch)
+      {
+        drain_batch();
+        collecting_region = nullptr;
+      }
     }
 
     void enqueue(Region* region)
@@ -286,16 +282,19 @@ namespace vbci
 
   struct CurrentCollector
   {
+    Collector* active;
+    Collector* previous;
+
     explicit CurrentCollector(Collector& collector)
+    : active(&collector), previous(current_collector)
     {
-      assert(current_collector == nullptr);
-      current_collector = &collector;
+      current_collector = active;
     }
 
     ~CurrentCollector()
     {
-      assert(current_collector != nullptr);
-      current_collector = nullptr;
+      assert(current_collector == active);
+      current_collector = previous;
     }
 
     CurrentCollector(const CurrentCollector&) = delete;
@@ -353,6 +352,26 @@ namespace vbci
 
     use_collector(
       [&](Collector& collector) { collector.enqueue(h, region); });
+  }
+
+  void collect(Header* headers, Region& region)
+  {
+    if (!headers)
+      return;
+
+    if (
+      current_collector &&
+      current_collector->collecting_region != &region)
+    {
+      Collector collector;
+      CurrentCollector current(collector);
+      collector.enqueue(headers, region);
+      collector.drain();
+      return;
+    }
+
+    use_collector(
+      [&](Collector& collector) { collector.enqueue(headers, region); });
   }
 
   void collect(Region* region)

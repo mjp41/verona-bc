@@ -2,12 +2,9 @@
 // The finalizer schedules an increment on a shared counter and sets the exit
 // code to its new value.
 //
-// The runtime currently exits 2 because the unreachable garbage cycle is not
-// collected before the copy, so it continues to retain the source object.
-// Later ordinary cycle collection releases and finalizes that source, in
-// addition to the independently finalized destination copy. Backup cycle
-// detection before the ownership split would collect the garbage cycle and
-// change this result to 1. Until that is implemented, expected exit: 2.
+// Trial deletion before the copy collects the unreachable garbage cycle, so
+// it no longer retains and later finalizes the source object. Only the
+// independently finalized destination copy reports. Expected exit: 1.
 
 lib
   @set_exit_code = "set_exit_code"(i32): none

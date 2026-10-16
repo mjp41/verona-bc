@@ -1,0 +1,117 @@
+// A post-copy hook creates a reachable candidate and two unreachable SCCs.
+// The first garbage SCC is the only reference into the second, so deleting it
+// must reduce the second SCC's trial RC to zero. Both must be finalized before
+// the copied graph escapes. Expected exit code: 0.
+
+lib
+  @set_exit_code = "set_exit_code"(i32): none
+
+type @Next = @Node | none
+
+class @Capture
+  @final @capture_final
+
+class @Node
+  @next: @Next
+  @other: @Next
+  @capture: @Capture | none
+
+class @Wrapper
+  @live: @Node
+  @post_copy @wrapper_post_copy
+
+func @capture_final($self: @Capture): none
+  $one = const i32 1
+  $_set = ffi @set_exit_code($one)
+  $_none = const none
+  ret $_none
+
+func @wrapper_post_copy($self: @Wrapper): none
+  $live_ref = ref $self @live
+  $live = load $live_ref
+  $next_ref = ref $live @next
+  $next = load $next_ref
+  $is_node = typetest $next @Node
+  cond $is_node ^break_live_cycle ^make_garbage
+
+^break_live_cycle
+  $back_ref = ref $next @next
+  $none = const none
+  $_old_back = store $back_ref $none
+  jump ^make_garbage
+
+^make_garbage
+  $none_garbage = const none
+  $capture = new @Capture()
+  $downstream_first = new @Node($none_garbage, $none_garbage, $capture)
+  $downstream_second =
+    new @Node($downstream_first, $none_garbage, $capture)
+  $downstream_third =
+    new @Node($downstream_first, $none_garbage, $capture)
+  $downstream_next_ref = ref $downstream_first @next
+  $downstream_second_for_store = copy $downstream_second
+  $_old_downstream =
+    store $downstream_next_ref $downstream_second_for_store
+  $downstream_other_ref = ref $downstream_first @other
+  $downstream_third_for_store = copy $downstream_third
+  $_old_downstream_other =
+    store $downstream_other_ref $downstream_third_for_store
+
+  $upstream_first =
+    new @Node($none_garbage, $downstream_first, $none_garbage)
+  $upstream_second =
+    new @Node($upstream_first, $none_garbage, $none_garbage)
+  $upstream_next_ref = ref $upstream_first @next
+  $upstream_second_for_store = copy $upstream_second
+  $_old_upstream = store $upstream_next_ref $upstream_second_for_store
+
+  drop $downstream_next_ref
+  drop $downstream_other_ref
+  drop $upstream_next_ref
+  drop $downstream_first
+  drop $downstream_second
+  drop $downstream_third
+  drop $upstream_first
+  drop $upstream_second
+  drop $capture
+  $_none = const none
+  ret $_none
+
+func @main(): none
+  $initial = const i32 99
+  $_initial = ffi @set_exit_code($initial)
+
+  $none = const none
+  $live_first = new @Node($none, $none, $none)
+  $live_second = new @Node($live_first, $none, $none)
+  $live_next_ref = ref $live_first @next
+  $live_second_for_store = copy $live_second
+  $_old_live = store $live_next_ref $live_second_for_store
+
+  $wrapper = new @Wrapper($live_first)
+  $frozen = freeze $wrapper
+
+  $frozen_live_ref = ref $frozen @live
+  $frozen_live = load $frozen_live_ref
+  $frozen_next_ref = ref $frozen_live @next
+  $frozen_next = load $frozen_next_ref
+  $has_next = typetest $frozen_next @Node
+  cond $has_next ^check_end ^failure
+
+^check_end
+  $frozen_back_ref = ref $frozen_next @next
+  $frozen_back = load $frozen_back_ref
+  $ends = typetest $frozen_back none
+  cond $ends ^success ^failure
+
+^success
+  $zero = const i32 0
+  $_success = ffi @set_exit_code($zero)
+  $_none_success = const none
+  ret $_none_success
+
+^failure
+  $two = const i32 2
+  $_failure = ffi @set_exit_code($two)
+  $_none_failure = const none
+  ret $_none_failure

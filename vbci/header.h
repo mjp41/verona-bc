@@ -11,8 +11,6 @@ namespace vbci
 {
   struct Header
   {
-    friend void restore_mutable_cycle_candidates();
-
   private:
     HeaderState header_state;
     uint32_t type_id;

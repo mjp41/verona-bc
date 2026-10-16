@@ -17,6 +17,12 @@ namespace vbci
 {
   namespace
   {
+    void collect_candidate_garbage(Region& region)
+    {
+      while (auto* garbage = classify_mutable_cycle_candidates())
+        collect(garbage, region);
+    }
+
     struct GraphCopy
     {
       Region& region;
@@ -131,6 +137,8 @@ namespace vbci
         for (auto [post_copy, copy] : post_copies)
           Thread::run_sync(post_copy, ValueBorrow(copy));
 
+        collect_candidate_garbage(region);
+
         return map_value(root);
       }
     };
@@ -144,12 +152,11 @@ namespace vbci
       if (state.is_shared() || state.is_immortal())
         return root;
 
+      auto* source_region = current_region();
+      assert(source_region);
+      collect_candidate_garbage(*source_region);
+
       auto copy = GraphCopy(region).run(root);
-      // Post-copy hooks can create candidates in the destination. Their
-      // thread-local records cannot cross this boundary, but restoring them
-      // can forget unreachable cycles. Allocation-group collection remains
-      // the backstop until a boundary cycle pass replaces this restoration.
-      restore_mutable_cycle_candidates(region);
       return copy;
     }
 

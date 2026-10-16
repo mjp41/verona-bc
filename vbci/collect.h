@@ -19,5 +19,6 @@ namespace vbci
   };
 
   void collect(Header* h);
+  void collect(Header* headers, Region& region);
   void collect(Region* region);
 } // namespace vbci

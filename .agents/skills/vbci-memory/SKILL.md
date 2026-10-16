@@ -67,18 +67,61 @@ Each trace step expands one type ID by one level using the shared iterative
 pending type unions the pending suffix into that representative. No reverse
 graph is constructed.
 
-Mutable cycle candidates use the previously unused header tag. A candidate's
-header no longer stores its RC; a thread-local vector stores live
-`(Header*, RC)` records. The header state's upper bits identify the slot
-directly. Free records have RC zero and reuse the header field as a free-list
-index. A nonzero decrement of a cycle-capable mutable type creates a record.
-Candidate increments restore the header to `Mutable`, and candidate decrements
-update the record or collect at zero. Candidate records in a freshly copied
-destination region are restored before `copy_graph()` returns because their
-storage is thread-local. This region-wide restoration runs after all post-copy
-hooks and can forget unreachable cycles created by a hook. Other candidates
-remain buffered. Allocation groups remain the collection backstop until a
-boundary cycle pass replaces the restoration.
+Mutable cycle candidates use the previously unused header tag. Its invariant
+is that the authoritative real RC is in the thread-local candidate table.
+Ordinary mutable objects temporarily use the same state while enrolled in
+cycle detection. Each persistent slot stores only the header reverse pointer
+and real RC. Classification allocates a parallel table containing one tagged
+trial word per candidate index. Zero means unvisited. The low bit distinguishes
+a direct SCC representative count from an indirect representative `Header*`; a
+second bit distinguishes pending and completed direct representatives or tags
+an intrusive representative-stack link. Direct counts are offset by one so an
+SCC RC of zero remains distinct from an unvisited trial entry. The header
+state's upper bits identify the candidate slot directly. Free candidate records
+have real RC zero and reuse the header field as a free-list index. A nonzero
+decrement of a cycle-capable mutable type creates a persistent candidate
+record. Candidate increments restore the header to `Mutable`, and candidate
+decrements update the record or collect at zero.
+
+`classify_mutable_cycle_candidates()` runs synchronous trial deletion over the
+complete thread-local candidate table and has no region dependency.
+Classification traces the cycle-capable mutable closure, temporarily assigning
+slots to ordinary mutable objects as they are discovered. Header slot indices
+provide traversal identity and deduplication; no separate header map is built.
+Classification uses the same path-based SCC construction as freezing. Each
+new representative starts with its member's real RC. Union transfers the
+child SCC's count minus the tree edge, and an edge to a pending representative
+subtracts the back edge before unioning the pending suffix. A completed
+representative therefore holds the RC of its SCC in the condensation DAG:
+external references and references from other SCCs remain counted, while
+intra-SCC references do not. The trial word supplies union-find forwarding and
+path compression; a temporary pending vector supplies DFS ordering.
+
+Zero-count SCC representatives are processed as garbage roots. Tracing their
+members decrements the direct counts of target SCC representatives, cascading
+through the acyclic condensation graph. Strong connectivity means traversal
+from the representative, restricted to children with the same representative,
+reconstructs the complete SCC without a member table. The tagged trial word
+links a representative into the intrusive zero-SCC work stack immediately
+when SCC completion or cascading deletion makes its direct count zero. That
+stack is drained immediately: representative-restricted traversal processes
+outgoing SCC edges, changes every discovered member to `Finalizing`, releases
+its candidate slot, and appends it directly to the intrusive `HeaderQueue`.
+Because union-find links never cross SCCs, reaching any `Finalizing`
+representative while following an indirect member proves that member belongs
+to the SCC currently being claimed; the traversal follows and claims it
+without needing the original root pointer. Representatives left with nonzero
+counts are live; their members return to ordinary `Mutable` state by slot
+iteration without retraversing the live graph. No separate SCC worklist,
+member table, garbage-slot list, or garbage pointer vector is allocated.
+
+While allocation groups remain, reclamation is a separate adapter: the caller
+removes the already-finalizing intrusive garbage list from its region and
+transfers the same links to the collector before dropping fields. Copying
+drains the candidate table before tracing the source, then drains it again
+after post-copy hooks. The first pass leaves no old candidates, so the second
+pass contains only hook-created candidates. Each pass repeats if finalization
+creates further candidates.
 
 Readonly behavior arguments do not adjust object RC because their cown-owned
 allocation group remains alive for the behavior. Cown handles themselves
@@ -137,8 +180,11 @@ reaches it through one thread-local pointer; the collector's queues and active
 mutable batch are ordinary fields, not independent thread-local state. The
 batch finalizes all queued headers, then frees those headers and optionally the
 whole group. Work for another group is deferred until that group becomes
-active. A mutable root starts or joins the active batch directly. Frozen SCC
-roots use a tagged work queue, while cowns remain intrusive.
+active. Cross-region trial deletion is the exception: it uses a nested
+collector so the candidate records are resolved before that region can cross
+an ownership boundary. A mutable root starts or joins the active batch
+directly. Frozen SCC roots use a tagged work queue, while cowns remain
+intrusive.
 
 `HeaderState` encapsulates one atomic tagged word. The bottom three bits
 identify the state; the upper bits hold mutable RC, shared ARC, an SCC

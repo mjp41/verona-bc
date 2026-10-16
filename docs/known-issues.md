@@ -5,25 +5,22 @@ conditions. These are not intended language or VIR semantics.
 
 ## Copying cyclic graphs can duplicate finalization
 
-**Current:** ownership-split operations copy their reachable object graph and
-consume the source root, but the runtime does not yet run backup cycle
-detection around the split.
+**Current:** ownership-split operations run trial deletion before copying and
+again after destination post-copy hooks, but they do not yet detect cycles
+after consuming the copied source root.
 
 A source cycle therefore survives consumption of its last external root. When
 ordinary cycle collection later reclaims it, the source finalizer runs even
-though the copied destination has continued the same semantic lifetime. An
-unreachable cycle can similarly retain an otherwise live source object through
-the copy and cause both source and destination images to be finalized.
+though the copied destination has continued the same semantic lifetime.
 
 The
 [`copy_freeze_cycle_finalizer`](../testsuite/vir/copy_freeze_cycle_finalizer/copy_freeze_cycle_finalizer.vir)
-and
+fixture records the current result of two finalizer invocations. The
 [`copy_freeze_garbage_cycle_finalizer`](../testsuite/vir/copy_freeze_garbage_cycle_finalizer/copy_freeze_garbage_cycle_finalizer.vir)
-fixtures record the current result of two finalizer invocations. Preventing
-this requires backup cycle detection before and after the copy, or another
-mechanism that distinguishes abandoned source images from independent
-semantic lifetimes. This work is deferred and does not block the remaining
-copy-based runtime changes.
+fixture verifies that pre-copy trial deletion now handles unrelated garbage
+that retains the source graph. Fixing the remaining case requires trial
+deletion after source consumption together with the correct finalizer
+suppression policy.
 
 ## VC loses generic narrowing before callback reification
 
