@@ -5,7 +5,6 @@
 #include "logging.h"
 #include "platform.h"
 #include "program.h"
-#include "region.h"
 #include "register.h"
 
 #include <bit>
@@ -21,16 +20,12 @@ namespace vbci
   struct Thread
   {
     friend struct Operands;
-    friend Region* current_region();
-    friend Region* exchange_current_region(Region* region);
 
   private:
     std::vector<Frame> frames;
     std::vector<Register> locals;
     std::vector<Object*> finalize;
-
     Program* program;
-    Region* allocation_group;
     Frame* frame;
     Function* behavior;
     PC current_pc;
@@ -43,67 +38,20 @@ namespace vbci
 #endif
 
   public:
-    using ScopeAllocationGroup = ScopeRegion;
-
-    struct OwnedRegister
-    {
-      AllocationGroup allocation_group;
-      Register value;
-
-      OwnedRegister() = default;
-
-      OwnedRegister(AllocationGroup allocation_group, Register value)
-      : allocation_group(std::move(allocation_group)),
-        value(std::move(value))
-      {}
-
-      ~OwnedRegister()
-      {
-        clear();
-      }
-
-      void clear()
-      {
-        if (allocation_group)
-        {
-          ScopeAllocationGroup scope(allocation_group.get());
-          value.clear();
-        }
-        else
-        {
-          value.clear();
-        }
-      }
-
-      OwnedRegister(OwnedRegister&&) = default;
-      OwnedRegister& operator=(OwnedRegister&& other)
-      {
-        if (this == &other)
-          return *this;
-
-        clear();
-        allocation_group = std::move(other.allocation_group);
-        value = std::move(other.value);
-        return *this;
-      }
-      OwnedRegister(const OwnedRegister&) = delete;
-      OwnedRegister& operator=(const OwnedRegister&) = delete;
-    };
-
     static ValueTransfer run_async(uint32_t type_id, Function* func);
     static Register& get_register(uint64_t id);
     static void check_var_type_for_register(uint64_t raw_idx, const Value& v);
 
     template<typename... Ts>
-    static OwnedRegister run_sync(Function* func, Ts&&... argv)
+    static Register run_sync(Function* func, Ts&&... argv)
     {
       return get().thread_run_sync(func, std::forward<Ts>(argv)...);
     }
 
     template<typename... Ts>
-    static OwnedRegister run_cleanup(Function* func, Ts&&... argv)
+    static void run_cleanup(Function* func, Ts&&... argv)
     {
-      return get().thread_run_cleanup(func, std::forward<Ts>(argv)...);
+      get().thread_run_cleanup(func, std::forward<Ts>(argv)...);
     }
 
     // Called only by the libffi callback trampoline. Marshals C arguments into
@@ -129,14 +77,12 @@ namespace vbci
     Thread& operator=(Thread&&) = delete;
 
   private:
-    class EnsureAllocationGroup;
-
     Thread();
     static Thread& get();
     static void run_behavior(verona::rt::Work* work) noexcept;
 
     template<typename... Ts>
-    OwnedRegister thread_run_sync(Function* func, Ts&&... argv)
+    Register thread_run_sync(Function* func, Ts&&... argv)
     {
       auto run = [&]() {
         assert(args == 0);
@@ -144,29 +90,24 @@ namespace vbci
         return thread_run(func);
       };
 
-      auto* region = current_region();
-      if (region != nullptr)
-        return {{}, run()};
-
-      auto group = AllocationGroup::create();
-      ScopeAllocationGroup scope(group.get());
-      auto value = run();
-      return {std::move(group), std::move(value)};
+      return run();
     }
 
     template<typename... Ts>
-    OwnedRegister thread_run_cleanup(Function* func, Ts&&... argv)
+    void thread_run_cleanup(Function* func, Ts&&... argv)
     {
       try
       {
-        return thread_run_sync(func, std::forward<Ts>(argv)...);
+        auto result = thread_run_sync(func, std::forward<Ts>(argv)...);
+        result.clear();
+        collect_mutable_cycles();
       }
       catch (Value& error_value)
       {
         logging::Error log;
         log << error_value.to_string() << std::endl;
         print_error_stack(log, error_value);
-        return {};
+        collect_mutable_cycles();
       }
     }
 

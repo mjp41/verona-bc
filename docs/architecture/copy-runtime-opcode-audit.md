@@ -75,11 +75,9 @@ is part of the same ownership-split contract as `freeze` and `when`.
 ### Teardown callbacks
 
 `atteardown` is another scheduling ownership split. Registration copies and
-consumes the callback graph into a fresh allocation group, and the queued work
-owns that group until it executes at scheduler quiescence. Cleanup runs with
-the callback group as its allocation context, so allocations and mutations
-performed by the callback remain within its graph. Reverse-registration
-execution order is unchanged.
+consumes the callback graph, and the queued work roots that copy until it
+executes at scheduler quiescence. Reverse-registration execution order is
+unchanged.
 
 ### Cown-owned state
 
@@ -128,14 +126,8 @@ may allocate every result as an independently reference-counted managed value.
 
 Values returned or raised across frames, registered for teardown, placed in
 cown-owned state, or captured by callbacks must remain live through managed
-ownership. These paths must copy or transfer explicit allocation-group owners
-so that storage placement does not cause failure.
-
-Allocation groups no longer have `stack_rc`. Their lifetime is determined
-solely by move-only `AllocationGroup` owners. Standalone synchronous results
-carry their temporary group until the caller consumes or freezes the result,
-and queued values are stored with their owner so the value is destroyed before
-the group.
+roots. Queued work stores its copied value directly, cowns root their content,
+and synchronous results remain rooted by their returned register.
 
 VC emits `New`, `NewArray`, and `NewArrayConst` for ordinary allocations and
 compiler-generated blocks. Textual VIR no longer exposes `Stack`, `Heap`, or
@@ -206,30 +198,16 @@ incoming value, install it, and release the outgoing value. Field stores,
 array stores, `arraycopy`, and `arrayfill` must share that rule after the
 region-specific write-barrier logic is removed.
 
-Reference counting and backup cycle detection remain memory-management
-mechanisms. The prototype retains a cut-down allocation group containing the
-set of allocated object headers. Each dormant cown has a group, and each
-executing behavior has a group that absorbs its writable cown state and
-captured closure. Group membership determines only bulk reclamation
-responsibility; it does not restrict references or operations.
-
-Allocation-group ownership is represented by a move-only `AllocationGroup`
-handle. Dormant cowns, queued behavior captures, and executing behaviors hold
-these handles explicitly and transfer them when groups are absorbed. The runtime's
-thread-local current region is a scoped context for allocation and mutable
-reference counting; it does not itself confer ownership. Explicit owners
-activate their group while releasing contained values.
+Per-object reference counting and thread-local mutable-cycle classification
+are the complete mutable memory-management mechanisms. Mutable objects and
+arrays allocate directly and carry no region or allocation-group identity.
+Values, fields, cown content, queued closures, and callback captures are the
+only roots.
 
 An outer collection creates a stack-local collector, reached by reentrant
-collection through one thread-local pointer. It uses one reusable mutable batch
-for the active region, finalizing all queued headers before freeing those
-headers and, when requested, the whole region. A mutable root starts or joins
-the active batch directly; whole-region roots for another group are deferred
-until that group becomes active. A trial-deletion batch for another region is
-the exception: it uses a nested collector so classification and reclamation
-finish before that region can cross an ownership boundary. Cowns are queued
-intrusively and activate their owned group while dropping their content;
-frozen SCC roots use the tagged work queue but require no region. SCC members
+collection through one thread-local pointer. Mutable roots and classified
+cycle lists enter one header-finalization batch directly. Cowns are queued
+intrusively, while frozen SCC roots use a separate work queue. SCC members
 enter the common header-finalization batch, whose normal field drops decrement
 external immutable references and queue them only on ARC zero. Mutable and
 immutable headers use `HeaderState` to encapsulate their tag and count or
@@ -246,14 +224,10 @@ cannot be stored outside the stack. Once all copy boundaries are confirmed
 unable to receive that readonly reference, these states can be collapsed to
 recover one tag value.
 
-Whole-group finalization reuses the group for allocations made by finalizers.
-Before running a batch, the collector removes all live headers from `RegionRC`
-into its intrinsic finalization queue and marks them `Finalizing`; new
-allocations therefore populate a fresh region set as ordinary mutable objects.
-References to claimed headers no longer affect RC, while acyclic new objects
-can still reach zero and collect normally. Finalized headers accumulate in the
-collector's deletion queue, and region transfer repeats for remaining cycles.
-Only then are all finalized objects and the empty region released.
+Finalizers allocate ordinary mutable objects. References to claimed
+`Finalizing` headers no longer affect RC, while acyclic finalizer allocations
+still collect normally. Finalized headers accumulate in the collector's
+deletion queue and are released after the finalization batch.
 
 Runtime type metadata includes a `can_cycle` capability. After all types are
 loaded, the interpreter builds the possible managed-reference graph and marks
@@ -321,35 +295,18 @@ This avoids allocating an SCC worklist, member table, garbage-slot list, or
 garbage pointer vector. Classification does not modify any object's real RC
 before claiming it as finalizing.
 
-Reclamation remains a separate transitional adapter while allocation groups
-exist. It removes every header in the already-finalizing intrusive list from
-the applicable region and transfers the same links to the collector before
-dropping any fields, so internal decrements cannot recursively collect only
-part of a cycle. If finalization creates further candidates, the caller
-classifies again until the table is empty.
+The already-finalizing intrusive list transfers directly to the collector
+before any fields are dropped, so internal decrements cannot recursively
+collect only part of a cycle. If finalization creates further candidates, the
+caller classifies again until the table is empty.
 
 Copying completely processes existing candidates before tracing the source.
 Live candidates therefore return to ordinary mutable state and existing
-garbage is reclaimed in the active source region. After post-copy hooks, the
-candidate table contains only candidates created by those hooks; copying
-processes it again in the destination region before `copy_graph()` returns.
-This prevents candidate indices from crossing the ownership boundary without
-making allocation groups part of the classification algorithm. Allocation
-groups remain the backstop for cycles that have not yet reached a
-cycle-collection trigger.
-
-Allocation groups preserve the finalization contract for acyclic graphs: an
-abandoned source image is reclaimed without its user finalizer, while each
-surviving destination image finalizes when its semantic lifetime ends. The
-`freeze`, scheduling, and behavior-completion split paths all require this
-rule. Pre-copy trial deletion now reclaims unrelated garbage cycles that would
-otherwise retain the source graph. Detection after source-root consumption is
-still deferred, so a cycle within the copied live source may survive and later
-finalize in addition to its destination image. The migration must preserve
-this remaining limitation explicitly, rather than accidentally changing
-finalizer ordering or suppressing unrelated finalizers. The reproduction is
-recorded in
-[Known Issues](../known-issues.md).
+garbage is reclaimed before tracing. Consuming the source root runs another
+classification while `SuppressFinalizers` is active, so abandoned source
+cycles are reclaimed without user finalizers. After post-copy hooks, copying
+processes candidates once more before returning. Each surviving destination
+image therefore finalizes exactly once when its semantic lifetime ends.
 
 ## Migration order
 
@@ -381,11 +338,12 @@ recorded in
    remaining storage-topology error paths.
 7. **Reduce regions to allocation groups.** Remove parent tracking, region
    kinds, frame-local placement, dragging, merging, and their topology tests.
-   Retain only header membership, external-root accounting, and two-phase bulk
-   reclamation. Lins' cyclic reference-counting algorithm can later replace
-   the allocation group's interim role in cyclic garbage collection.
+   This provided the interim header-membership and bulk-reclamation model.
+8. **Remove allocation groups and regions.** Completed: allocate mutable
+   objects directly, reclaim cycles through thread-local SCC classification,
+   remove region membership and current-allocation context, simplify copy and
+   freeze interfaces, and delete `Region`, `RegionRC`, and `AllocationGroup`.
 
-The first implementation work package is allocation canonicalization. The
-second removes `merge` across every producer and consumer. Keeping these as
-separate changes makes each exposed contract change reviewable before the
-reference-counting implementation is rewritten.
+The migration is now complete through region and allocation-group removal.
+Future work can optimize the resulting reference-counted baseline without
+changing its value-level semantics.

@@ -2,39 +2,14 @@
 
 ## Overview
 
-The interpreter uses explicit allocation-group ownership. Mutable objects and
-arrays are allocated in a `RegionRC`, and exactly one move-only
-`AllocationGroup` owns that region. The group is released as a unit when its
-owner is destroyed.
+The interpreter uses per-object reference counting, thread-local mutable-cycle
+classification, and atomic reference counting for immutable SCCs and cowns.
+Mutable objects and arrays are allocated directly; there are no regions,
+allocation groups, object-membership sets, or current-allocation context.
 
-There is no region topology, dragging, sendability check, write barrier for
-group ownership, or allocation-group reference count.
-
-## Allocation-group ownership
-
-`AllocationGroup` is the only API that creates and owns a `Region`:
-
-- `AllocationGroup::create()` creates a fresh group.
-- Moving an `AllocationGroup` transfers exclusive ownership.
-- `absorb()` consumes another owner and moves all of its objects into the
-  destination group.
-- Destroying the owner finalizes and releases all objects still in the group.
-
-`current_region()` is a thread-local, non-owning pointer selecting the group
-used by new allocations and mutable reference counting.
-`ScopeAllocationGroup` temporarily replaces that context.
-
-Values do not keep allocation groups alive. Any value that can outlive the
-current owner must be stored together with an explicit owner:
-
-- cowns own their dormant state group;
-- queued behavior bodies own their copied closure group;
-- executing behaviors own one combined execution group;
-- queued teardown callbacks own their copied callback group;
-- standalone synchronous results use `Thread::OwnedRegister`.
-
-Owner/value pairs must clear the value with their owned group active before
-releasing the group. `Thread::OwnedRegister` implements this protocol.
+Values and fields are the only managed roots. Runtime boundaries that consume
+roots synchronously classify mutable-cycle candidates after releasing those
+roots.
 
 ## Object reference counting
 
@@ -42,14 +17,12 @@ releasing the group. `Thread::OwnedRegister` implements this protocol.
 Register and field references use the same `inc()` / `dec()` operations.
 Reaching zero collects the individual object. Headers already claimed by the
 collector use the `Finalizing` header state, whose increments and decrements
-are no-ops. Newly allocated objects remain `Mutable` even when their region is
-being finalized, so their ordinary decrements still collect acyclic garbage.
-The write barrier separately rejects storing readonly borrowed values. Mutable
-headers carry no group pointer; decrementing uses `current_region()` when zero
-removes the object from its group.
+are no-ops. The write barrier separately rejects storing readonly borrowed
+values.
 
-Object RC can collect acyclic garbage early. Allocation-group destruction also
-collects remaining cyclic or otherwise live objects as a group.
+Object RC collects acyclic garbage immediately. Mutable cycles are reclaimed
+by synchronous trial deletion at copy, scheduling, completion, and cown
+teardown boundaries.
 Mutable counts are thread-confined and use relaxed atomic loads and stores;
 only shared immutable and cown counts use atomic read-modify-write operations.
 
@@ -115,17 +88,13 @@ counts are live; their members return to ordinary `Mutable` state by slot
 iteration without retraversing the live graph. No separate SCC worklist,
 member table, garbage-slot list, or garbage pointer vector is allocated.
 
-While allocation groups remain, reclamation is a separate adapter: the caller
-removes the already-finalizing intrusive garbage list from its region and
-transfers the same links to the collector before dropping fields. Copying
-drains the candidate table before tracing the source, then drains it again
-after post-copy hooks. The first pass leaves no old candidates, so the second
-pass contains only hook-created candidates. Each pass repeats if finalization
-creates further candidates.
+The already-finalizing intrusive garbage list transfers directly to the
+collector before any fields are dropped. Copying drains the candidate table
+before tracing the source, after consuming the source root, and after post-copy
+hooks. Each drain repeats if finalization creates further candidates.
 
-Readonly behavior arguments do not adjust object RC because their cown-owned
-allocation group remains alive for the behavior. Cown handles themselves
-remain independently reference counted.
+Readonly behavior arguments remain borrowed for the behavior lifetime. Cown
+handles themselves are independently reference counted.
 
 ## Stores
 
@@ -138,22 +107,27 @@ remain independently reference counted.
 - release the outgoing value.
 
 Initialization may write immutable storage only with immutable or immortal
-values. Mutable cross-group references are prevented by copying at ownership
-boundaries rather than repaired by stores.
+values.
 
 ## Copy-on-split boundaries
 
 Ownership boundaries deep-copy reachable mutable graphs:
 
-- `freeze` copies into a fresh group, freezes the copy, and consumes the
-  source reference;
-- scheduling copies a closure into a queued owner;
-- behavior completion copies each writable cown, including the result cown,
-  into a fresh owned group;
-- teardown registration copies its callback into queued owned work.
+- `freeze` copies, freezes the copy, and consumes the source reference;
+- scheduling copies a closure into queued work;
+- behavior completion copies each writable cown, including the result cown;
+- teardown registration copies its callback into queued work.
 
-Post-copy hooks execute with the destination group as the active allocation
-context.
+The returned register, cown content, or queued callback is the destination
+graph's explicit root.
+
+Fresh copies are represented by `IsolatedGraph` until ownership is transferred
+to their destination. Every fresh mutable node is reachable from its root, and
+there are no external mutable references into the graph. Destroying an
+uncommitted `IsolatedGraph` therefore claims and finalizes its complete mutable
+graph directly; it does not use mutable-cycle trial deletion. Shared,
+immortal, and cown references are traversal boundaries and are released by
+normal finalization. `release()` commits the root to its destination.
 
 ## Freezing
 
@@ -169,22 +143,12 @@ The pending-stack loop must compare `pending.back() != rep` directly. Calling
 `Header::find(pending.back())` there is incorrect because union can change the
 representative during the loop.
 
-Frozen objects are removed from their mutable allocation group. When the
-temporary copy group is released after freezing, only non-frozen leftovers
-remain to be collected.
-
 ## Finalization
 
 Each outer collection creates a stack-local collector. Reentrant collection
-reaches it through one thread-local pointer; the collector's queues and active
-mutable batch are ordinary fields, not independent thread-local state. The
-batch finalizes all queued headers, then frees those headers and optionally the
-whole group. Work for another group is deferred until that group becomes
-active. Cross-region trial deletion is the exception: it uses a nested
-collector so the candidate records are resolved before that region can cross
-an ownership boundary. A mutable root starts or joins the active batch
-directly. Frozen SCC roots use a tagged work queue, while cowns remain
-intrusive.
+reaches it through one thread-local pointer. Mutable headers and classified
+cycle lists enter the common header-finalization queue directly. Frozen SCC
+roots use a separate work queue, while cowns remain intrusive.
 
 `HeaderState` encapsulates one atomic tagged word. The bottom three bits
 identify the state; the upper bits hold mutable RC, shared ARC, an SCC
@@ -202,10 +166,11 @@ batch. Field dropping performs the normal ARC decrements for immutable
 references outside the SCC, so another SCC is queued only when its external
 count reaches zero.
 
-The SCC root is marked `Pending` before discovery. Membership must test whether
-`Header::find(member)` reaches a `Pending` header, not whether it still returns
-the original root pointer: marking an intermediate member `Pending` terminates
-the representative chain at that member.
+The SCC root is marked `Finalizing` before discovery. Membership must test
+whether `Header::find(member)` reaches a `Finalizing` header, not whether it
+still returns the original root pointer: marking an intermediate member
+`Finalizing` terminates the representative chain at that member. `Pending` is
+reserved for SCC construction during freezing.
 
 Collection within the active mutable batch is two phase:
 
@@ -216,24 +181,16 @@ Collection within the active mutable batch is two phase:
 lifetime continues in a copy. Copy finalization must distinguish the live
 source image from abandoned garbage so finalizers run exactly once.
 
-Finalizers execute with readonly access and allocate in the current group,
-including when that group is finalizing. The collector removes every current
-header from `RegionRC` into its intrinsic finalization queue before invoking
-user code, marks those headers `Finalizing`, and leaves the region set empty
-for finalizer allocations. Acyclic finalizer allocations can still reach zero
-normally; only remaining cycles are transferred in the next batch. Finalized
-headers move to the collector's deletion queue. The collector repeats until
-the region set remains empty, then deletes all headers and the region.
+Finalizers execute with readonly access. New objects allocated by finalizers
+are ordinary mutable allocations. Acyclic objects collect immediately; cycles
+enter the candidate table and are processed by the next explicit cycle drain.
 
 ## Cowns
 
-A dormant cown owns both its content and its `AllocationGroup`. Writable cown
-acquisition transfers that owner into the behavior execution group. Completion
-copies the resulting state into a fresh group and returns that owner to the
-cown.
-
-Readonly acquisition leaves the cown's group in place and exposes only a
-readonly borrowed value for the behavior lifetime.
+A dormant cown owns its content through the content root. Writable acquisition
+borrows that state for execution, and completion installs a deep copy back into
+the cown. Readonly acquisition exposes only a readonly borrowed value for the
+behavior lifetime.
 
 `Cown` derives from `Header` and uses the `Cown` header state. Cowns and
 immutable SCC representatives use the same atomic header count with relaxed
@@ -248,7 +205,7 @@ keeps the scheduler alive; it does not own managed values.
 
 Future asynchronous FFI support must use explicit mechanisms for each foreign
 lifetime, such as an exported byte-buffer token or an identity-bearing callback
-component. It must not reintroduce an allocation-group reference count.
+component.
 
 ## Key files
 
@@ -257,13 +214,11 @@ component. It must not reintroduce an allocation-group reference count.
 | `frame_id.h` | Frame ordering for register-reference lifetime checks |
 | `header_state.h` | Tagged header state, counts, SCC links, and collector links |
 | `mutable_cycle_candidates.h/cc` | Thread-local mutable candidate RC records |
-| `region.h` | `Region` and move-only `AllocationGroup` |
-| `region_rc.h/cc` | Mutable allocation storage and group collection |
 | `header.h` | Mutable RC, shared atomic RC, and collector links |
 | `register.h` | Register ownership and transfer semantics |
 | `writebarrier.h` | Managed field/array exchange |
-| `copy_graph.cc` | Graph copying and destination hooks |
+| `copy_graph.h/cc` | Isolated copied-graph ownership, copying, and destination hooks |
 | `freeze.cc` | SCC construction and immutable ARC conversion |
-| `cown.h` | Cown lifetime and allocation-group transfer |
+| `cown.h` | Cown lifetime and content ownership |
 | `thread.cc` | Behavior, synchronous-call, teardown, and callback ownership |
-| `collect.cc` | Deferred object and group finalization |
+| `collect.cc` | Reentrant two-phase object finalization |

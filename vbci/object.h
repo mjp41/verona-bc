@@ -15,34 +15,44 @@ namespace vbci
   struct Object : public Header
   {
   private:
-    Object(HeaderState::Snapshot state, Class& cls)
-    : Header(state, cls.type_id)
+    explicit Object(Class& cls)
+    : Header(HeaderState::mutable_(), cls.type_id)
     {
       LOG(Trace) << "Creating object of class " << cls.type_id << "@" << this;
     }
 
   public:
-    static Object* create(
-      void* mem, Class& cls, HeaderState::Snapshot state)
+    static Object* create(Class& cls)
     {
-      return new (mem) Object(state, cls);
+      auto* mem = new uint8_t[cls.size];
+      return new (mem) Object(cls);
     }
 
     Object& init(Frame& frame, Class& cls)
     {
       uint8_t* base = reinterpret_cast<uint8_t*>(this + 1);
       auto state = this->state();
+      size_t initialized = 0;
 
-      for (size_t i = 0; i < cls.fields.size(); i++)
+      try
       {
-        auto& f = cls.fields.at(i);
-        auto& v = frame.arg(i);
+        for (; initialized < cls.fields.size(); initialized++)
+        {
+          auto& f = cls.fields.at(initialized);
+          auto& v = frame.arg(initialized);
 
-        if (!Program::get().subtype(v->type_id(), f.type_id))
-          Value::error(Error::BadType);
+          if (!Program::get().subtype(v->type_id(), f.type_id))
+            Value::error(Error::BadType);
 
-        void* addr = base + f.offset;
-        writebarrier::init(state, addr, f.value_type, std::move(v));
+          void* addr = base + f.offset;
+          writebarrier::init(state, addr, f.value_type, std::move(v));
+        }
+      }
+      catch (...)
+      {
+        drop_fields(initialized);
+        delete[] reinterpret_cast<uint8_t*>(this);
+        throw;
       }
 
       return *this;
@@ -97,7 +107,7 @@ namespace vbci
     }
 
     template<bool is_move>
-    ValueTransfer exchange(size_t idx, Reg<is_move> v)
+    [[nodiscard]] ValueTransfer exchange(size_t idx, Reg<is_move> v)
     {
       auto& f = cls().fields.at(idx);
 
@@ -132,6 +142,8 @@ namespace vbci
         {
           case ValueType::Object:
           case ValueType::Array:
+          case ValueType::FieldRef:
+          case ValueType::ArrayRef:
           case ValueType::Dyn:
           {
             auto prev = load(i);
@@ -162,6 +174,8 @@ namespace vbci
         {
           case ValueType::Object:
           case ValueType::Array:
+          case ValueType::FieldRef:
+          case ValueType::ArrayRef:
           case ValueType::Dyn:
           {
             auto v = load(i);
@@ -192,6 +206,8 @@ namespace vbci
         {
           case ValueType::Object:
           case ValueType::Array:
+          case ValueType::FieldRef:
+          case ValueType::ArrayRef:
           case ValueType::Cown:
           case ValueType::Dyn:
             load(i).immortalize();
@@ -203,15 +219,45 @@ namespace vbci
       }
     }
 
+  private:
+    void drop_fields(size_t count)
+    {
+      auto& fields = cls().fields;
+
+      for (size_t i = 0; i < count; i++)
+      {
+        switch (fields.at(i).value_type)
+        {
+          case ValueType::Object:
+          case ValueType::Array:
+          case ValueType::FieldRef:
+          case ValueType::ArrayRef:
+          case ValueType::Dyn:
+          {
+            auto value = load(i);
+            writebarrier::drop(value);
+            break;
+          }
+
+          case ValueType::Cown:
+          {
+            auto value = load(i);
+            value.dec();
+            break;
+          }
+
+          default:
+            break;
+        }
+      }
+    }
+
+  public:
     std::string to_string()
     {
       return std::format(
         "{}: {}", Program::get().di_class(cls()), static_cast<void*>(this));
     }
 
-    size_t allocation_size_bytes() const
-    {
-      return cls().size;
-    }
   };
 }

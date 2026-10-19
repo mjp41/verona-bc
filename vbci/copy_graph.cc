@@ -3,10 +3,9 @@
 #include "array.h"
 #include "collect.h"
 #include "cown.h"
-#include "mutable_cycle_candidates.h"
+#include "header_queue.h"
 #include "object.h"
 #include "program.h"
-#include "region.h"
 #include "thread.h"
 #include "traverse.h"
 
@@ -17,19 +16,43 @@ namespace vbci
 {
   namespace
   {
-    void collect_candidate_garbage(Region& region)
+    void destroy_isolated_graph(Register root)
     {
-      while (auto* garbage = classify_mutable_cycle_candidates())
-        collect(garbage, region);
+      if (!root->is_header())
+        return;
+
+      auto* root_header = root->get_header();
+      auto state = root_header->state();
+      if (state.is_shared() || state.is_immortal())
+        return;
+
+      root.extract();
+      assert(state.is_mutable());
+      root_header->set_state(HeaderState::finalizing());
+
+      HeaderQueue finalizing;
+      auto claim_child = [&](Header* header) {
+        auto state = header->state();
+        if (state.is_finalizing() || state.is_shared() || state.is_immortal())
+          return false;
+
+        assert(state.is_mutable());
+        header->set_state(HeaderState::finalizing());
+        return true;
+      };
+
+      traverse_intrusive(
+        root_header,
+        claim_child,
+        [&](Header* header) { finalizing.push_front(header); });
+
+      collect_finalizing(std::move(finalizing));
     }
 
     struct GraphCopy
     {
-      Region& region;
       std::unordered_map<Header*, Header*> copies;
       std::vector<std::pair<Function*, Object*>> post_copies;
-
-      GraphCopy(Region& region) : region(region) {}
 
       Header* allocate(Header* source)
       {
@@ -39,12 +62,13 @@ namespace vbci
         if (program.is_array(source->get_type_id()))
         {
           auto source_array = static_cast<Array*>(source);
-          copy = region.array(source->get_type_id(), source_array->get_size());
+          copy =
+            Array::create(source->get_type_id(), source_array->get_size());
         }
         else
         {
           auto source_object = static_cast<Object*>(source);
-          copy = region.object(source_object->cls());
+          copy = Object::create(source_object->cls());
         }
 
         copies.emplace(source, copy);
@@ -133,52 +157,69 @@ namespace vbci
           [&](Header* source) { fill(source); });
 
         // A hook can follow a back edge to a copy that has not yet been filled.
-        Thread::ScopeAllocationGroup scope(region);
         for (auto [post_copy, copy] : post_copies)
           Thread::run_sync(post_copy, ValueBorrow(copy));
 
-        collect_candidate_garbage(region);
+        collect_mutable_cycles();
 
         return map_value(root);
       }
     };
 
-    Register copy_graph(ValueBorrow root, Region& region)
+    IsolatedGraph copy_graph(ValueBorrow root)
     {
       if (!root.is_header())
-        return root;
+        return IsolatedGraph(Register(root));
 
       auto state = root.get_header()->state();
       if (state.is_shared() || state.is_immortal())
-        return root;
+        return IsolatedGraph(Register(root));
 
-      auto* source_region = current_region();
-      assert(source_region);
-      collect_candidate_garbage(*source_region);
+      collect_mutable_cycles();
 
-      auto copy = GraphCopy(region).run(root);
-      return copy;
+      auto copy = GraphCopy().run(root);
+      return IsolatedGraph(std::move(copy));
     }
 
   }
 
-  Register copy_graph_and_consume(Register root, Region& destination)
+  IsolatedGraph::~IsolatedGraph()
   {
-    Register copy = copy_graph(root.borrow(), destination);
+    reset();
+  }
+
+  IsolatedGraph& IsolatedGraph::operator=(IsolatedGraph&& other) noexcept
+  {
+    if (this == &other)
+      return *this;
+
+    reset();
+    root = std::move(other.root);
+    return *this;
+  }
+
+  void IsolatedGraph::reset()
+  {
+    destroy_isolated_graph(std::move(root));
+  }
+
+  IsolatedGraph copy_graph_and_consume(Register root)
+  {
+    IsolatedGraph copy = copy_graph(root.borrow());
 
     SuppressFinalizers suppress;
     root.clear();
+    collect_mutable_cycles();
     return copy;
   }
 
   void copy_graph_and_consume(Cown& cown)
   {
-    auto group = AllocationGroup::create();
-    Register copy = copy_graph(cown.load(), group.get());
-    Register source = cown.exchange<true>(std::move(copy));
-    cown.set_allocation_group(std::move(group));
+    IsolatedGraph copy = copy_graph(cown.load());
+    Register source = cown.exchange<true>(copy.release());
 
     SuppressFinalizers suppress;
     source.clear();
+    collect_mutable_cycles();
   }
 }

@@ -102,10 +102,10 @@ namespace vbci
     auto& slot = memo_slots.at(index);
     assert(slot->is_invalid());
     auto result = Thread::run_sync(&functions.at(memo_func_ids.at(index)));
-    slot = std::move(result.value);
+    slot = std::move(result);
 
     if (slot->is_header())
-      freeze(slot->get_header(), result.allocation_group.get());
+      freeze(slot->get_header());
 
     slot.borrow().immortalize();
   }
@@ -622,16 +622,11 @@ namespace vbci
     {
       auto& str = strings.at(i);
       auto str_size = str.size() + 1;
-      auto arr = Array::create(
-        new uint8_t[Array::size_of(str_size, ffi_type_uint8.size)],
-        HeaderState::immortal(),
-        typeid_arg,
-        ValueType::U8,
-        str_size,
-        ffi_type_uint8.size);
+      auto arr = Array::create(typeid_arg, str_size);
 
       auto p = arr->get_pointer();
       std::memcpy(p, str.c_str(), str_size);
+      Value(arr).immortalize();
       // Array size honestly includes the null terminator.
       // The string wrapper (in Verona) sets len = data.size - 1.
       string_arrays[i] = arr;
@@ -661,36 +656,23 @@ namespace vbci
 
   void Program::setup_argv(std::vector<std::string>& args)
   {
-    auto arg_rep = layout_type_id(unarray(typeid_arg));
-    auto argv_rep = layout_type_id(unarray(typeid_argv));
-
-    argv = Array::create(
-      new uint8_t[Array::size_of(args.size(), argv_rep.second->size)],
-      HeaderState::immortal(),
-      typeid_argv,
-      argv_rep.first,
-      args.size(),
-      argv_rep.second->size);
+    argv = Array::create(typeid_argv, args.size());
 
     for (size_t i = 0; i < args.size(); i++)
     {
       auto str = args.at(i);
       auto str_size = str.size() + 1;
-      auto arg = Array::create(
-        new uint8_t[Array::size_of(str_size, arg_rep.second->size)],
-        HeaderState::immortal(),
-        typeid_arg,
-        arg_rep.first,
-        str_size,
-        arg_rep.second->size);
+      auto arg = Array::create(typeid_arg, str_size);
 
       auto p = arg->get_pointer();
       std::memcpy(p, str.c_str(), str_size);
       arg->set_size(str_size - 1);
 
-      Register val = ValueImmortal(Value(arg));
+      Register val = ValueTransfer(arg);
       argv->initialize(i, std::move(val));
     }
+
+    Value(argv).immortalize();
   }
 
   bool Program::load()
@@ -1043,6 +1025,10 @@ namespace vbci
   void Program::calculate_cycle_capabilities()
   {
     auto type_count = min_complex_type_id + complex_types.size();
+    auto graph_index = [](uint32_t type_id) { return type_id + 1; };
+    auto type_id = [](uint32_t graph_index) { return graph_index - 1; };
+    auto graph_size = type_count + 1;
+
     auto is_cycle_candidate = [&](uint32_t type_id) {
       if ((type_id < NumPrimitiveClasses) || (type_id >= type_count))
         return false;
@@ -1087,30 +1073,31 @@ namespace vbci
 
     can_cycle_by_type.assign(type_count, false);
     std::vector<SccState> states;
-    states.reserve(type_count);
-    for (uint32_t type_id = 0; type_id < type_count; type_id++)
-      states.push_back({type_id});
+    states.reserve(graph_size);
+    for (uint32_t index = 0; index < graph_size; index++)
+      states.push_back({index});
 
-    auto find = [&](uint32_t type_id) {
-      auto root = type_id;
+    auto find = [&](uint32_t index) {
+      auto root = index;
       while (states.at(root).parent != root)
         root = states.at(root).parent;
 
-      while (states.at(type_id).parent != type_id)
+      while (states.at(index).parent != index)
       {
-        auto next = states.at(type_id).parent;
-        states.at(type_id).parent = root;
-        type_id = next;
+        auto next = states.at(index).parent;
+        states.at(index).parent = root;
+        index = next;
       }
 
       return root;
     };
 
-    auto trace_node = [&](uint32_t source, auto add_child) {
+    auto trace_node = [&](uint32_t source_index, auto add_child) {
+      auto source = type_id(source_index);
       if (source == DynamicTypeId)
       {
         for (uint32_t target = 0; target < type_count; target++)
-          add_child(target);
+          add_child(graph_index(target));
         return;
       }
 
@@ -1119,7 +1106,7 @@ namespace vbci
         if (source >= NumPrimitiveClasses)
         {
           for (auto& field : classes.at(source).fields)
-            add_child(field.type_id);
+            add_child(graph_index(field.type_id));
         }
 
         return;
@@ -1134,7 +1121,7 @@ namespace vbci
           for (uint32_t target = 0; target < type_count; target++)
           {
             if (is_cycle_candidate(target) && contains_referee(target, referee))
-              add_child(target);
+              add_child(graph_index(target));
           }
           return;
         }
@@ -1143,7 +1130,7 @@ namespace vbci
         case TypeTag::Array:
         case TypeTag::Tuple:
           for (auto child : type.children)
-            add_child(child);
+            add_child(graph_index(child));
           return;
 
         case TypeTag::Cown:
@@ -1152,11 +1139,11 @@ namespace vbci
     };
 
     std::vector<uint32_t> pending;
-    auto enter = [&](uint32_t type_id) {
-      if (type_id >= type_count)
+    auto enter = [&](uint32_t index) {
+      if (index >= graph_size)
         return false;
 
-      auto rep = find(type_id);
+      auto rep = find(index);
       auto& state = states.at(rep);
       if (state.visit == Visit::Complete)
         return false;
@@ -1178,11 +1165,11 @@ namespace vbci
       return true;
     };
 
-    auto leave = [&](uint32_t type_id) {
-      if (!pending.empty() && (pending.back() == type_id))
+    auto leave = [&](uint32_t index) {
+      if (!pending.empty() && (pending.back() == index))
       {
         pending.pop_back();
-        states.at(find(type_id)).visit = Visit::Complete;
+        states.at(find(index)).visit = Visit::Complete;
       }
     };
 
@@ -1191,14 +1178,15 @@ namespace vbci
       if (!is_cycle_candidate(type_id))
         continue;
 
-      traverse_graph(type_id, trace_node, enter, leave);
+      traverse_graph(graph_index(type_id), trace_node, enter, leave);
     }
 
     assert(pending.empty());
     for (uint32_t type_id = 0; type_id < type_count; type_id++)
     {
       if (is_cycle_candidate(type_id))
-        can_cycle_by_type.at(type_id) = states.at(find(type_id)).cyclic;
+        can_cycle_by_type.at(type_id) =
+          states.at(find(graph_index(type_id))).cyclic;
     }
   }
 

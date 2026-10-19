@@ -17,12 +17,14 @@ namespace vbci
     ValueType value_type;
 
     Array(
-      HeaderState::Snapshot state,
       uint32_t type_id,
       ValueType value_type,
       size_t size,
       size_t stride)
-    : Header(state, type_id), size(size), stride(stride), value_type(value_type)
+    : Header(HeaderState::mutable_(), type_id),
+      size(size),
+      stride(stride),
+      value_type(value_type)
     {
       if (value_type == ValueType::Dyn)
       {
@@ -37,21 +39,20 @@ namespace vbci
       }
     }
 
-  public:
-    static Array* create(
-      void* mem,
-      HeaderState::Snapshot state,
-      uint32_t type_id,
-      ValueType value_type,
-      size_t size,
-      size_t stride)
-    {
-      return new (mem) Array(state, type_id, value_type, size, stride);
-    }
-
     static size_t size_of(size_t size, size_t stride)
     {
       return sizeof(Array) + (size * stride);
+    }
+
+  public:
+    static Array* create(uint32_t type_id, size_t size)
+    {
+      auto content_type_id = Program::get().unarray(type_id);
+      auto [value_type, layout] =
+        Program::get().layout_type_id(content_type_id);
+      auto* mem = new uint8_t[size_of(size, layout->size)];
+      return new (mem)
+        Array(type_id, value_type, size, layout->size);
     }
 
     uint32_t content_type_id()
@@ -92,7 +93,7 @@ namespace vbci
     }
 
     template<bool is_move>
-    ValueTransfer exchange(size_t idx, Reg<is_move> v)
+    [[nodiscard]] ValueTransfer exchange(size_t idx, Reg<is_move> v)
     {
       if (!Program::get().subtype(v->type_id(), content_type_id()))
         Value::error(Error::BadType);
@@ -138,7 +139,7 @@ namespace vbci
         for (size_t i = len; i > 0; i--)
         {
           auto in_val = src->load(src_off + i - 1);
-          exchange<false>(dst_off + i - 1, in_val);
+          Register previous(exchange<false>(dst_off + i - 1, in_val));
         }
       }
       else
@@ -146,7 +147,7 @@ namespace vbci
         for (size_t i = 0; i < len; i++)
         {
           auto in_val = src->load(src_off + i);
-          exchange<false>(dst_off + i, in_val);
+          Register previous(exchange<false>(dst_off + i, in_val));
         }
       }
     }
@@ -184,7 +185,7 @@ namespace vbci
       {
         // Make a copy of fill_val for each exchange.
         ValueBorrow v(fill_val);
-        exchange<false>(off + i, v);
+        Register previous(exchange<false>(off + i, v));
       }
     }
 
@@ -215,6 +216,8 @@ namespace vbci
       {
         case ValueType::Object:
         case ValueType::Array:
+        case ValueType::FieldRef:
+        case ValueType::ArrayRef:
         case ValueType::Cown:
         case ValueType::Dyn:
         {
@@ -244,6 +247,9 @@ namespace vbci
       {
         case ValueType::Object:
         case ValueType::Array:
+        case ValueType::FieldRef:
+        case ValueType::ArrayRef:
+        case ValueType::Cown:
         case ValueType::Dyn:
         {
           for (size_t i = 0; i < size; i++)
@@ -262,6 +268,9 @@ namespace vbci
       {
         case ValueType::Object:
         case ValueType::Array:
+        case ValueType::FieldRef:
+        case ValueType::ArrayRef:
+        case ValueType::Cown:
         case ValueType::Dyn:
         {
           for (size_t i = 0; i < size; i++)
@@ -283,9 +292,5 @@ namespace vbci
       return std::format("array[{}]: {}", size, static_cast<void*>(this));
     }
 
-    size_t allocation_size_bytes() const
-    {
-      return Array::size_of(size, stride);
-    }
   };
 }

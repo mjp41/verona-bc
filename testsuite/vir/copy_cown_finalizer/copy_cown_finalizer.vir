@@ -5,8 +5,11 @@
 lib
   @set_exit_code = "set_exit_code"(i32): none
 
+type @Next = @Capture | none
+
 class @Capture
   @copied: bool
+  @next: @Next
   @post_copy @mark_copied
   @final @capture_final
 
@@ -34,7 +37,12 @@ func @capture_final($self: @Capture): none
 
 func @make_capture(): @Capture
   $false = const bool false
-  $capture = new @Capture($false)
+  $none = const none
+  $capture = new @Capture($false, $none)
+  $next_ref = ref $capture @next
+  $capture_for_store = copy $capture
+  $_old = store $next_ref $capture_for_store
+  drop $next_ref
   ret $capture
 
 func @touch($capture_ref: ref @Capture): none

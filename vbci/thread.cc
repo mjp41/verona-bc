@@ -8,7 +8,6 @@
 #include "function_signature.h"
 #include "object.h"
 #include "program.h"
-#include "region_ext.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -23,38 +22,9 @@ namespace vbci
     struct BehaviorBody
     {
       Value function;
-      AllocationGroup closure_group;
       Value closure;
     };
   }
-
-  class Thread::EnsureAllocationGroup
-  {
-    AllocationGroup owned_group;
-
-  public:
-    EnsureAllocationGroup()
-    {
-      if (current_region() != nullptr)
-        return;
-
-      owned_group = AllocationGroup::create();
-      exchange_current_region(&owned_group.get());
-    }
-
-    ~EnsureAllocationGroup()
-    {
-      if (!owned_group)
-        return;
-
-      assert(current_region() == &owned_group.get());
-      exchange_current_region(nullptr);
-      owned_group.clear();
-    }
-
-    EnsureAllocationGroup(const EnsureAllocationGroup&) = delete;
-    EnsureAllocationGroup& operator=(const EnsureAllocationGroup&) = delete;
-  };
 
   template<typename>
   struct always_false : std::false_type
@@ -357,13 +327,6 @@ namespace vbci
           process<F, Args..., Thread&>(
             self, fun, std::forward<Args>(args)..., self);
         }
-        else if constexpr (std::is_same_v<T, Region&>)
-        {
-          auto* region = current_region();
-          assert(region);
-          process<F, Args..., Region&>(
-            self, fun, std::forward<Args>(args)..., *region);
-        }
         else if constexpr (std::is_same_v<T, Class&>)
         {
           load_class_param<F, Args...>(self, fun, std::forward<Args>(args)...);
@@ -418,7 +381,7 @@ namespace vbci
       result,
       verona::rt::AccessMode::Write,
       verona::rt::Ownership::Borrowed);
-    new (construction.body) BehaviorBody{Value(func), {}, Value()};
+    new (construction.body) BehaviorBody{Value(func), Value()};
     BehaviourCore::schedule(BehaviourCore::finish_construction(construction));
 
     // Safe to convert to Register: this only contains a refcounted cown
@@ -438,7 +401,6 @@ namespace vbci
 
   Thread::Thread()
   : program(&Program::get()),
-    allocation_group(nullptr),
     frame(nullptr),
     args(0)
   {
@@ -450,16 +412,6 @@ namespace vbci
   {
     thread_local Thread thread;
     return thread;
-  }
-
-  Region* current_region()
-  {
-    return Thread::get().allocation_group;
-  }
-
-  Region* exchange_current_region(Region* region)
-  {
-    return std::exchange(Thread::get().allocation_group, region);
   }
 
   void Thread::run_behavior(verona::rt::Work* work) noexcept
@@ -476,21 +428,13 @@ namespace vbci
   {
     assert(!frame);
     assert(!args);
-    assert(current_region() == nullptr);
-    auto execution_group = AllocationGroup::create();
-    ScopeAllocationGroup allocation_scope(execution_group.get());
     auto b = BehaviourCore::from_work(work);
     auto* body = b->get_body<BehaviorBody>();
     behavior = body->function.function();
     auto& closure = body->closure;
 
     if (!closure.is_invalid())
-    {
-      if (body->closure_group)
-        execution_group.absorb(std::move(body->closure_group));
-
       locals.at(args++) = ValueTransfer(closure);
-    }
 
     body->~BehaviorBody();
 
@@ -511,7 +455,6 @@ namespace vbci
       // slot release path doesn't release the move RC with successors).
       if (!is_readonly)
       {
-        execution_group.absorb(cown->take_allocation_group());
         cown->inc();
       }
 
@@ -543,6 +486,8 @@ namespace vbci
       if (b->acquired_mode(i) != verona::rt::AccessMode::Read)
         copy_graph_and_consume(*b->acquired_cown(i));
     }
+
+    collect_mutable_cycles();
 
 #ifndef NDEBUG
     {
@@ -1065,10 +1010,9 @@ namespace vbci
                   Register& dst,
                   Class& cls,
                   Thread& self,
-                  Frame& frame,
-                  Region& allocation_group) INLINE {
+                  Frame& frame) INLINE {
           self.check_args(cls.fields);
-          dst = ValueTransfer(&allocation_group.object(cls)->init(frame, cls));
+          dst = ValueTransfer(&Object::create(cls)->init(frame, cls));
         });
         break;
       }
@@ -1078,10 +1022,9 @@ namespace vbci
         process([](
                   Register& dst,
                   const Register& size,
-                  Constant<size_t> type_id,
-                  Region& allocation_group) INLINE {
+                  Constant<size_t> type_id) INLINE {
           dst =
-            ValueTransfer(allocation_group.array(type_id, size->get_size()));
+            ValueTransfer(Array::create(type_id, size->get_size()));
         });
         break;
       }
@@ -1091,9 +1034,8 @@ namespace vbci
         process([](
                   Register& dst,
                   Constant<size_t> type_id,
-                  Constant<size_t> size,
-                  Region& allocation_group) INLINE {
-          dst = ValueTransfer(allocation_group.array(type_id, size));
+                  Constant<size_t> size) INLINE {
+          dst = ValueTransfer(Array::create(type_id, size));
         });
         break;
       }
@@ -1127,18 +1069,13 @@ namespace vbci
           if (!apply)
             Value::error(Error::MethodNotFound);
 
-          auto group = AllocationGroup::create();
-          callback = copy_graph_and_consume(
-            std::move(callback), group.get());
-          OwnedRegister owned_callback{
-            std::move(group), std::move(callback)};
+          auto isolated_callback =
+            copy_graph_and_consume(std::move(callback));
 
           auto* work = verona::rt::Closure::make(
-            [owned_callback = std::move(owned_callback),
+            [isolated_callback = std::move(isolated_callback),
              apply](verona::rt::Work*) mutable {
-              Thread::ScopeAllocationGroup scope(
-                owned_callback.allocation_group.get());
-              Thread::run_cleanup(apply, owned_callback.value.borrow());
+              Thread::run_cleanup(apply, isolated_callback.borrow());
               return true;
             });
           verona::rt::Scheduler::schedule_at_quiescence(work);
@@ -1154,13 +1091,10 @@ namespace vbci
 
           if (src->is_header())
           {
-            auto group = AllocationGroup::create();
-            auto copy =
-              copy_graph_and_consume(std::move(src), group.get());
+            auto copy = copy_graph_and_consume(std::move(src));
+            freeze(copy.borrow().get_header());
 
-            freeze(copy->get_header(), group.get());
-
-            dst = std::move(copy);
+            dst = copy.release();
             return;
           }
 
@@ -1714,7 +1648,6 @@ namespace vbci
         process([](
                   Register& dst,
                   Constant<size_t> layout_type_id,
-                  Region& allocation_group,
                   Program& program) INLINE {
           std::vector<ValueType> kinds;
           std::vector<ffi_type*> reps;
@@ -1744,9 +1677,9 @@ namespace vbci
           auto kinds_type_id = program.get_typeid_arg();
 
           auto* offsets_arr =
-            allocation_group.array(offsets_type_id, offsets.size());
-          auto* kinds_arr = allocation_group.array(kinds_type_id, kinds.size());
-          auto* tuple_arr = allocation_group.array(result_type_id, 3);
+            Array::create(offsets_type_id, offsets.size());
+          auto* kinds_arr = Array::create(kinds_type_id, kinds.size());
+          auto* tuple_arr = Array::create(result_type_id, 3);
 
           for (size_t i = 0; i < offsets.size(); i++)
           {
@@ -1754,8 +1687,8 @@ namespace vbci
               ValueTransfer(Value(ValueType::USize, offsets.at(i)));
             Register kind_reg = ValueTransfer(
               Value(ValueType::U8, static_cast<uint8_t>(kinds.at(i))));
-            offsets_arr->exchange<false>(i, off_reg);
-            kinds_arr->exchange<false>(i, kind_reg);
+            offsets_arr->initialize(i, std::move(off_reg));
+            kinds_arr->initialize(i, std::move(kind_reg));
           }
 
           Register size_reg =
@@ -1763,11 +1696,11 @@ namespace vbci
           Register offsets_reg = ValueTransfer(offsets_arr);
           Register kinds_reg = ValueTransfer(kinds_arr);
 
-          tuple_arr->exchange<false>(0, size_reg);
-          tuple_arr->exchange<false>(1, offsets_reg);
-          tuple_arr->exchange<false>(2, kinds_reg);
+          tuple_arr->initialize(0, std::move(size_reg));
+          tuple_arr->initialize(1, std::move(offsets_reg));
+          tuple_arr->initialize(2, std::move(kinds_reg));
 
-          freeze(tuple_arr, allocation_group);
+          freeze(tuple_arr);
 
           dst = ValueTransfer(tuple_arr);
         });
@@ -2092,7 +2025,7 @@ namespace vbci
     if (!func)
       Value::error(Error::MethodNotFound);
 
-    // Preserve the behaviour allocation group.
+    // Preserve the current behavior's arguments across frame teardown.
     teardown(true);
     check_args(func->param_types);
 
@@ -2245,7 +2178,7 @@ namespace vbci
     size_t num_cowns = args;
     size_t first_cown = 0;
     Register closure_source;
-    OwnedRegister closure_copy;
+    IsolatedGraph closure_copy;
     std::vector<Register> cown_args;
 
     if (args > 0)
@@ -2286,13 +2219,7 @@ namespace vbci
     args = 0;
 
     if (is_closure)
-    {
-      auto closure_group = AllocationGroup::create();
-      auto copy = copy_graph_and_consume(
-        std::move(closure_source), closure_group.get());
-      closure_copy = OwnedRegister{
-        std::move(closure_group), std::move(copy)};
-    }
+      closure_copy = copy_graph_and_consume(std::move(closure_source));
 
     if (!program->subtype(func->return_type, program->uncown(type_id)))
       Value::error(Error::BadType);
@@ -2334,13 +2261,11 @@ namespace vbci
         verona::rt::Ownership::Transferred);
     }
 
-    auto* body = new (construction.body) BehaviorBody{
-      Value(func), std::move(closure_copy.allocation_group), Value()};
+    auto* body =
+      new (construction.body) BehaviorBody{Value(func), Value()};
 
     if (is_closure)
-    {
-      body->closure = closure_copy.value.extract();
-    }
+      body->closure = closure_copy.release().extract();
 
     BehaviourCore::schedule(BehaviourCore::finish_construction(construction));
   }
@@ -2383,8 +2308,6 @@ namespace vbci
   void
   Thread::thread_handle_callback(CallbackClosure* cc, void* ret, void** args_)
   {
-    EnsureAllocationGroup ensure_allocation_group;
-
     assert(args == 0);
     auto num_c_args = cc->arg_value_types.size();
     arg(args++) = ValueBorrow(cc->lambda);

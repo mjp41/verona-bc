@@ -2,7 +2,6 @@
 
 #include "header.h"
 #include "program.h"
-#include "region.h"
 #include "value.h"
 
 #include <boc/behaviourcore.h>
@@ -21,11 +20,9 @@ namespace vbci
 
     verona::rt::CownSchedulerState<VbciObjectModel> scheduler_state;
     Value content;
-    AllocationGroup allocation_group;
 
     Cown(uint32_t type_id)
-    : Header(type_id),
-      allocation_group(AllocationGroup::create())
+    : Header(type_id)
     {}
 
   public:
@@ -44,16 +41,14 @@ namespace vbci
     {
       LOG(Trace) << "Destroying cown @" << this;
       assert(content.is_invalid());
-      assert(!allocation_group);
       LOG(Trace) << "Destroyed cown @" << this;
     }
 
     void finalize()
     {
-      assert(allocation_group);
       content.dec();
       content = Value();
-      allocation_group.clear();
+      collect_mutable_cycles();
     }
 
     void destroy()
@@ -69,30 +64,15 @@ namespace vbci
 
     void immortalize() noexcept
     {
+      if (state().is_immortal())
+        return;
+
       mark_immortal();
     }
 
     ValueBorrow load()
     {
       return content;
-    }
-
-    Region& get_allocation_group()
-    {
-      assert(allocation_group);
-      return allocation_group.get();
-    }
-
-    AllocationGroup take_allocation_group()
-    {
-      assert(allocation_group);
-      return std::move(allocation_group);
-    }
-
-    void set_allocation_group(AllocationGroup group)
-    {
-      assert(group);
-      allocation_group = std::move(group);
     }
 
     template<bool is_move>
@@ -114,7 +94,7 @@ namespace vbci
     }
 
     template<bool is_move>
-    ValueTransfer exchange(Reg<is_move> next)
+    [[nodiscard]] ValueTransfer exchange(Reg<is_move> next)
     {
       if (
         !next->is_error() &&

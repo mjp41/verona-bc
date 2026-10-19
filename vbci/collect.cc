@@ -1,5 +1,5 @@
 /**
- * Implements a two-phase collector for objects, regions, and arrays.
+ * Implements a two-phase collector for objects and arrays.
  *
  * Phase 1 (finalizing): Run finalizers and drop field references. This may
  * cause other objects' RCs to hit 0, adding them to the finalizing worklist.
@@ -17,126 +17,39 @@
 #include "cown.h"
 #include "header.h"
 #include "header_queue.h"
+#include "mutable_cycle_candidates.h"
 #include "object.h"
-#include "region.h"
+#include "traverse.h"
 
 #include <queue>
-#include <vector>
 
 namespace vbci
 {
-  enum class WorkType
-  {
-    Region,
-    Immutable
-  };
-
-  struct WorkItem
-  {
-    WorkType type;
-    union
-    {
-      Region* region;
-      Header* header;
-    };
-
-    explicit WorkItem(Region* region)
-    : type(WorkType::Region), region(region)
-    {}
-
-    explicit WorkItem(Header* header)
-    : type(WorkType::Immutable), header(header)
-    {}
-  };
-
   struct Collector
   {
-    std::queue<WorkItem> work;
+    std::queue<Header*> immutable_work;
     HeaderQueue headers_to_finalize;
     HeaderQueue headers_to_delete;
     HeaderQueue cowns_to_finalize;
-    Region* collecting_region = nullptr;
-    Region* region_to_delete = nullptr;
 
-    void enqueue_header(Header* header)
+    void enqueue_mutable(Header* header)
     {
+      header->set_state(HeaderState::finalizing());
       headers_to_finalize.push(header);
     }
 
-    void enqueue(Header* header, Region* region)
+    void enqueue_finalizing(HeaderQueue headers)
     {
-      header->set_state(HeaderState::finalizing());
-
-      if (collecting_region)
-      {
-        assert(collecting_region == region);
-        enqueue_header(header);
-        return;
-      }
-
-      assert(current_region() == region);
-      collecting_region = region;
-      enqueue_header(header);
-      drain_batch();
-      collecting_region = nullptr;
+      headers_to_finalize.append(std::move(headers));
     }
 
-    void enqueue(Header* headers, Region& region)
-    {
-      if (!headers)
-        return;
-
-      auto starts_batch = collecting_region == nullptr;
-      if (starts_batch)
-      {
-        assert(current_region() == &region);
-        collecting_region = &region;
-      }
-      else
-      {
-        assert(collecting_region == &region);
-      }
-
-      // Classification has already claimed the complete garbage set and
-      // linked it through the Finalizing headers.
-      while (headers)
-      {
-        auto* header = headers;
-        headers = header->next();
-
-        assert(header->state().is_finalizing());
-        auto removed = region.remove(header);
-        assert(removed);
-        enqueue_header(header);
-      }
-
-      if (starts_batch)
-      {
-        drain_batch();
-        collecting_region = nullptr;
-      }
-    }
-
-    void enqueue(Region* region)
-    {
-      if (collecting_region == region)
-      {
-        assert(region_to_delete == nullptr);
-        region_to_delete = region;
-      }
-      else
-      {
-        work.emplace(region);
-      }
-    }
-
-    void enqueue(Header* header)
+    void enqueue_shared(Header* header)
     {
       assert(header->state().is_shared());
 
       if (!header->state().is_cown())
       {
-        work.emplace(header);
+        immutable_work.push(header);
         return;
       }
 
@@ -148,131 +61,91 @@ namespace vbci
     {
       auto& program = Program::get();
 
-      while (true)
+      while (!headers_to_finalize.empty())
       {
-        while (!headers_to_finalize.empty())
-        {
-          auto* header = headers_to_finalize.pop();
-          LOG(Trace) << "Finalizing work item: " << static_cast<void*>(header);
+        auto* header = headers_to_finalize.pop();
+        LOG(Trace) << "Finalizing work item: " << static_cast<void*>(header);
 
-          if (program.is_array(header->get_type_id()))
-            static_cast<Array*>(header)->finalize();
-          else
-            static_cast<Object*>(header)->finalize();
-          headers_to_delete.push_front(header);
-        }
-
-        if (!region_to_delete)
-          break;
-
-        auto* header = region_to_delete->take_header();
-        if (!header)
-          break;
-
-        do
-        {
-          header->set_state(HeaderState::finalizing());
-          enqueue_header(header);
-          header = region_to_delete->take_header();
-        } while (header);
+        if (program.is_array(header->get_type_id()))
+          static_cast<Array*>(header)->finalize();
+        else
+          static_cast<Object*>(header)->finalize();
+        headers_to_delete.push_front(header);
       }
 
-      // Delete storage only after every generation has been finalized.
       while (!headers_to_delete.empty())
       {
         auto* header = headers_to_delete.pop();
         LOG(Trace) << "Deleting work item: " << static_cast<void*>(header);
 
-        assert(
-          header->state().is_pending() ||
-          header->state().is_finalizing());
+        assert(header->state().is_finalizing());
         delete[] reinterpret_cast<uint8_t*>(header);
-      }
-
-      if (region_to_delete)
-      {
-        LOG(Trace) << "Deleting work item: "
-                   << static_cast<void*>(region_to_delete);
-        region_to_delete->destroy();
-        region_to_delete = nullptr;
       }
     }
 
-    void enqueue_scc_members(Header* root)
+    HeaderQueue claim_immutable_scc(Header* root)
     {
       assert(root->state().is_shared() && !root->state().is_cown());
-      root->set_state(HeaderState::pending());
-      std::vector<Header*> work;
-      work.push_back(root);
+      root->set_state(HeaderState::finalizing());
+      HeaderQueue finalizing;
 
-      auto& program = Program::get();
       auto add_member = [&](Header* header) {
         if (!header->state().is_scc_ptr())
-          return;
+          return false;
 
         auto* representative = Header::find(header);
-        if (representative->state().is_pending())
+        if (representative->state().is_finalizing())
         {
-          header->set_state(HeaderState::pending());
-          work.push_back(header);
+          header->set_state(HeaderState::finalizing());
+          return true;
         }
+
+        return false;
       };
 
-      while (!work.empty())
-      {
-        auto* header = work.back();
-        work.pop_back();
-        enqueue_header(header);
+      // Only discover members of this SCC. Normal finalization drops external
+      // immutable references and queues them if their ARC reaches zero.
+      traverse_intrusive(
+        root,
+        add_member,
+        [&](Header* header) { finalizing.push(header); });
 
-        // Only discover members of this SCC. Normal finalization drops
-        // external immutable references and queues them if their ARC reaches
-        // zero.
-        if (program.is_array(header->get_type_id()))
-          static_cast<Array*>(header)->trace_fn(add_member);
-        else
-          static_cast<Object*>(header)->trace_fn(add_member);
-      }
+      return finalizing;
     }
 
     void drain()
     {
-      while (!work.empty() || !cowns_to_finalize.empty())
+      while (true)
       {
-        if (!work.empty())
+        drain_batch();
+
+        auto garbage = classify_mutable_cycle_candidates();
+        if (!garbage.empty())
         {
-          auto item = work.front();
-          work.pop();
-
-          if (item.type == WorkType::Immutable)
-          {
-            collecting_region = current_region();
-            enqueue_scc_members(item.header);
-            drain_batch();
-            collecting_region = nullptr;
-            continue;
-          }
-
-          collecting_region = item.region;
-
-          ScopeRegion region_scope(*collecting_region);
-          region_to_delete = collecting_region;
-          drain_batch();
-
-          collecting_region = nullptr;
+          enqueue_finalizing(std::move(garbage));
           continue;
         }
 
-        auto* cown = static_cast<Cown*>(cowns_to_finalize.pop());
-        collecting_region = &cown->get_allocation_group();
+        if (!immutable_work.empty())
+        {
+          auto* header = immutable_work.front();
+          immutable_work.pop();
+          enqueue_finalizing(claim_immutable_scc(header));
+          continue;
+        }
 
-        ScopeRegion region_scope(*collecting_region);
-        LOG(Trace) << "Finalizing cown: " << static_cast<void*>(cown);
-        cown->finalize();
-        drain_batch();
-        LOG(Trace) << "Deleting work item: " << static_cast<void*>(cown);
-        cown->destroy();
+        if (!cowns_to_finalize.empty())
+        {
+          auto* cown = static_cast<Cown*>(cowns_to_finalize.pop());
+          LOG(Trace) << "Finalizing cown: " << static_cast<void*>(cown);
+          cown->finalize();
+          drain_batch();
+          LOG(Trace) << "Deleting work item: " << static_cast<void*>(cown);
+          cown->destroy();
+          continue;
+        }
 
-        collecting_region = nullptr;
+        break;
       }
     }
   };
@@ -337,49 +210,38 @@ namespace vbci
   {
     if (h->state().is_shared())
     {
-      use_collector([&](Collector& collector) { collector.enqueue(h); });
+      use_collector([&](Collector& collector) {
+        collector.enqueue_shared(h);
+      });
       return;
     }
 
     assert(h->state().is_mutable());
-    auto* region = current_region();
-    assert(region);
-
-    // Detach explicit header work items from the region up front so a later
-    // Region work item won't re-finalize them.
-    if (!region->remove(h))
-      return;
-
-    use_collector(
-      [&](Collector& collector) { collector.enqueue(h, region); });
+    use_collector([&](Collector& collector) {
+      collector.enqueue_mutable(h);
+    });
   }
 
-  void collect(Header* headers, Region& region)
+  void collect_finalizing(HeaderQueue headers)
   {
-    if (!headers)
+    if (headers.empty())
       return;
 
-    if (
-      current_collector &&
-      current_collector->collecting_region != &region)
+    use_collector([&](Collector& collector) {
+      collector.enqueue_finalizing(std::move(headers));
+    });
+  }
+
+  void collect_mutable_cycles()
+  {
+    while (true)
     {
-      Collector collector;
-      CurrentCollector current(collector);
-      collector.enqueue(headers, region);
-      collector.drain();
-      return;
+      auto garbage = classify_mutable_cycle_candidates();
+      if (garbage.empty())
+        return;
+
+      collect_finalizing(std::move(garbage));
     }
-
-    use_collector(
-      [&](Collector& collector) { collector.enqueue(headers, region); });
-  }
-
-  void collect(Region* region)
-  {
-    if (!region->begin_finalizing())
-      return;
-
-    use_collector([&](Collector& collector) { collector.enqueue(region); });
   }
 
 }

@@ -44,7 +44,7 @@ namespace vbci::writebarrier
   }
 
   template<bool is_move>
-  ValueTransfer exchange(
+  [[nodiscard]] ValueTransfer exchange(
     HeaderState::Snapshot store_state,
     void* addr,
     ValueType type,

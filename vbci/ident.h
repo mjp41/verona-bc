@@ -27,9 +27,7 @@ namespace vbci
     BadStackEscape,
     BadArgs,
     BadType,
-    BadRegionEntryPoint,
     BadFreeze,
-    BadMerge,
     SchedulerAlreadyRunning,
   };
 
@@ -37,7 +35,6 @@ namespace vbci
   struct FrameId;
   using RC = uint32_t;
 
-  struct Region;
   struct Header;
   struct Object;
   struct Array;
@@ -87,12 +84,8 @@ namespace vbci
         return "bad args";
       case Error::BadType:
         return "bad type";
-      case Error::BadRegionEntryPoint:
-        return "bad region entry point";
       case Error::BadFreeze:
         return "cannot freeze a readonly value";
-      case Error::BadMerge:
-        return "cannot merge regions: both have owners";
       case Error::SchedulerAlreadyRunning:
         return "scheduler already running";
 

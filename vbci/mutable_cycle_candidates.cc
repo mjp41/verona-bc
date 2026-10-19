@@ -1,9 +1,7 @@
 #include "mutable_cycle_candidates.h"
 
-#include "array.h"
 #include "header.h"
 #include "header_queue.h"
-#include "object.h"
 #include "program.h"
 #include "traverse.h"
 
@@ -109,15 +107,6 @@ namespace vbci
           slot.rc--;
 
         return previous;
-      }
-
-      static void trace(Header* header, auto&& fn)
-      {
-        auto& program = Program::get();
-        if (program.is_array(header->get_type_id()))
-          static_cast<Array*>(header)->trace_fn(fn);
-        else
-          static_cast<Object*>(header)->trace_fn(fn);
       }
 
       struct Classification
@@ -447,8 +436,8 @@ namespace vbci
 
             traverse_graph(
               representative,
-              [&](Header* header, auto add_child) {
-                MutableCycleCandidates::trace(header, add_child);
+              [](Header* header, auto add_child) {
+                trace_header(header, add_child);
               },
               [&](Header* header) {
                 return visit_zero_scc(representative, header);
@@ -497,8 +486,8 @@ namespace vbci
 
             traverse_graph(
               slot.header,
-              [&](Header* header, auto add_child) {
-                MutableCycleCandidates::trace(header, add_child);
+              [](Header* header, auto add_child) {
+                trace_header(header, add_child);
               },
               [&](Header* header) { return visit_candidate(header); },
               [&](Header* header) { complete_candidate(header); });
@@ -524,21 +513,21 @@ namespace vbci
 
         // Finalizing members were claimed during SCC reconstruction, but no
         // finalizer or field drop can run until this list reaches the collector.
-        Header* claim_garbage()
+        HeaderQueue claim_garbage()
         {
-          return garbage.release();
+          return std::move(garbage);
         }
       };
 
-      Header* classify()
+      HeaderQueue classify()
       {
         if (!std::ranges::any_of(
               slots, [](const auto& slot) { return slot.rc != 0; }))
-          return nullptr;
+          return {};
 
         Classification classification(*this);
         classification.discover_sccs();
-        auto* garbage = classification.claim_garbage();
+        auto garbage = classification.claim_garbage();
         classification.restore_live_candidates();
         return garbage;
       }
@@ -570,7 +559,7 @@ namespace vbci
     return candidates.decrement(index);
   }
 
-  Header* classify_mutable_cycle_candidates()
+  HeaderQueue classify_mutable_cycle_candidates()
   {
     return candidates.classify();
   }

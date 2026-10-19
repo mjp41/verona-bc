@@ -1,10 +1,7 @@
 #include "freeze.h"
 
-#include "array.h"
 #include "header.h"
-#include "object.h"
-#include "program.h"
-#include "region_ext.h"
+#include "traverse.h"
 
 #include <vector>
 
@@ -48,7 +45,6 @@ namespace vbci
   // Trace a header's fields, pushing children onto the DFS stack.
   static void trace_fields(Header* h, std::vector<Header*>& dfs)
   {
-    auto& program = Program::get();
     auto fn = [&](Header* h) {
       auto state = h->state();
 
@@ -65,13 +61,10 @@ namespace vbci
         dfs.push_back(h);
     };
 
-    if (program.is_array(h->get_type_id()))
-      static_cast<Array*>(h)->trace_fn(fn);
-    else
-      static_cast<Object*>(h)->trace_fn(fn);
+    trace_header(h, fn);
   }
 
-  void freeze(Header* root, Region& region)
+  void freeze(Header* root)
   {
     assert(root);
     auto state = root->state();
@@ -123,9 +116,6 @@ namespace vbci
       }
       else if (rep_state.is_mutable())
       {
-        if (!region.remove(h))
-          Value::error(Error::BadFreeze);
-
         h->set_state(HeaderState::pending());
 
         pending.push_back(h);

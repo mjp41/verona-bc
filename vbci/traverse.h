@@ -2,6 +2,7 @@
 
 #include "array.h"
 #include "header.h"
+#include "header_queue.h"
 #include "object.h"
 #include "program.h"
 
@@ -17,6 +18,16 @@ namespace vbci
       void operator()(T)
       {}
     };
+  }
+
+  template<typename AddChild>
+  void trace_header(Header* header, AddChild add_child)
+  {
+    auto& program = Program::get();
+    if (program.is_array(header->get_type_id()))
+      static_cast<Array*>(header)->trace_fn(add_child);
+    else
+      static_cast<Object*>(header)->trace_fn(add_child);
   }
 
   template<
@@ -58,13 +69,28 @@ namespace vbci
   void traverse(Header* root, Pre pre, Post post = detail::NopPost())
   {
     auto trace = [](Header* header, auto add_child) {
-      auto& program = Program::get();
-      if (program.is_array(header->get_type_id()))
-        static_cast<Array*>(header)->trace_fn(add_child);
-      else
-        static_cast<Object*>(header)->trace_fn(add_child);
+      trace_header(header, add_child);
     };
 
     traverse_graph(root, trace, pre, post);
+  }
+
+  template<typename ClaimChild, typename Visit>
+  void
+  traverse_intrusive(Header* root, ClaimChild claim_child, Visit visit)
+  {
+    HeaderQueue work;
+    work.push_front(root);
+
+    while (!work.empty())
+    {
+      auto* header = work.pop();
+      visit(header);
+
+      trace_header(header, [&](Header* child) {
+        if (claim_child(child))
+          work.push_front(child);
+      });
+    }
   }
 }

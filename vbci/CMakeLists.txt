@@ -11,8 +11,6 @@ add_executable(vbci
   main.cc
   mutable_cycle_candidates.cc
   program.cc
-  region.cc
-  region_rc.cc
   thread.cc
   value.cc
   ffi/ffi.cc
@@ -49,12 +47,15 @@ endif()
 
 target_link_libraries(vbci
   Threads::Threads
-  snmallocshim-static
   verona_rt
   deps::libffi
   deps::zstd
   CLI11::CLI11
   verona::include
 )
+
+if(NOT SANITIZER)
+  target_link_libraries(vbci snmallocshim-static)
+endif()
 
 install(TARGETS vbci RUNTIME DESTINATION vbci)

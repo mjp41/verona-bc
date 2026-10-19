@@ -9,9 +9,37 @@ namespace vbci
     Header* first = nullptr;
     Header* last = nullptr;
 
+    HeaderQueue() = default;
+
+    HeaderQueue(HeaderQueue&& other) noexcept
+    : first(other.first), last(other.last)
+    {
+      other.first = nullptr;
+      other.last = nullptr;
+    }
+
+    HeaderQueue(const HeaderQueue&) = delete;
+    HeaderQueue& operator=(const HeaderQueue&) = delete;
+    HeaderQueue& operator=(HeaderQueue&&) = delete;
+
     bool empty() const
     {
       return first == nullptr;
+    }
+
+    void append(HeaderQueue queue)
+    {
+      if (queue.empty())
+        return;
+
+      if (last)
+        last->set_next(queue.first);
+      else
+        first = queue.first;
+
+      last = queue.last;
+      queue.first = nullptr;
+      queue.last = nullptr;
     }
 
     void push(Header* header)
@@ -44,12 +72,5 @@ namespace vbci
       return header;
     }
 
-    Header* release()
-    {
-      auto* headers = first;
-      first = nullptr;
-      last = nullptr;
-      return headers;
-    }
   };
 }

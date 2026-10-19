@@ -2,11 +2,9 @@
 // that is part of a cycle. The finalizer schedules an increment on a shared
 // counter and sets the exit code to its new value.
 //
-// The runtime currently exits 2 because consuming the source root does not
-// collect its cycle. Later ordinary cycle collection finalizes that source
-// cycle, in addition to the independently finalized destination copy. Backup
-// cycle detection at the ownership split would suppress the source finalizer
-// and change this result to 1. Until that is implemented, expected exit: 2.
+// Consuming the source root collects its cycle with finalizers suppressed
+// because its semantic lifetime continues in the destination copy. Only the
+// independently finalized destination reports. Expected exit: 1.
 
 lib
   @set_exit_code = "set_exit_code"(i32): none

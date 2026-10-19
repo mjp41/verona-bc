@@ -5,7 +5,7 @@
 namespace vbci
 {
   struct Header;
-  struct Region;
+  struct HeaderQueue;
 
   struct SuppressFinalizers
   {
@@ -19,6 +19,6 @@ namespace vbci
   };
 
   void collect(Header* h);
-  void collect(Header* headers, Region& region);
-  void collect(Region* region);
+  void collect_finalizing(HeaderQueue headers);
+  void collect_mutable_cycles();
 } // namespace vbci

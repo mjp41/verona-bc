@@ -96,7 +96,7 @@ irreversible-action guardrails (git commit/push/PR require explicit permission).
   - **RC-transfer in SCC union**: During SCC detection, `scc_union(child, rep)` transfers `child.rc - 1` to rep (the -1 subtracts the tree edge). Back edges decrement `rep.rc` before the union loop. At SCC completion, `set_arc(rep->get_rc())` gives the exact external ref count.
   - **Union-by-address**: Uses `uintptr_t` of the header address as rank (no ties, no storage needed). With path compression, gives O(α(n)) amortized.
   - **Pending loop correctness**: The back-edge union loop MUST use `pending.back() != rep` (pointer comparison), NOT `Header::find(pending.back()) != rep`. Union can change the representative mid-loop, invalidating find-based comparison.
-  - **Explicit group ownership**: Allocation groups have no `stack_rc`; move-only `AllocationGroup` owners determine their lifetime. Any queued or returned register that can outlive a call must be paired with its owner and destroyed before that owner.
+  - **Regionless mutable lifetime**: Mutable objects allocate directly and are kept alive only by registers, fields, cown content, and queued values. Per-object RC collects acyclic garbage; copy/scheduling/completion/cown teardown boundaries synchronously drain thread-local mutable-cycle candidates.
 - **Type system**: `Dyn` is a top type (`anything <: Dyn`). The bottom type is an empty `Union` (no members). In IRSubtype, the axiom table is keyed by the right operand's type (`r->type()` lookup in `reduce()`).
 
 ## Skills

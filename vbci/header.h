@@ -1,9 +1,9 @@
 #pragma once
 
+#include "collect.h"
 #include "header_state.h"
 #include "ident.h"
 #include "mutable_cycle_candidates.h"
-#include "region.h"
 #include "register.h"
 #include "value.h"
 
@@ -175,9 +175,6 @@ namespace vbci
       }
 
       assert(state.is_mutable());
-      auto* r = current_region();
-      assert(r);
-
       auto previous = header_state.decrement_count();
       assert(previous > 0);
       if (previous == 1)
