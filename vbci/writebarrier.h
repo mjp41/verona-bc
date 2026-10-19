@@ -23,24 +23,34 @@ namespace vbci::writebarrier
   }
 
   inline void
+  check_init(HeaderState::Snapshot store_state, const Value& value)
+  {
+    check_value(value);
+
+    if (store_state.is_shared() || store_state.is_immortal())
+    {
+      auto value_state = value.state();
+
+      if (!value_state.is_shared() && !value_state.is_immortal())
+        Value::error(Error::BadStore);
+    }
+  }
+
+  inline void init_unchecked(void* addr, ValueType type, Register next)
+  {
+    next->to_addr(type, addr);
+    next.clear_unsafe();
+  }
+
+  inline void
   init(
     HeaderState::Snapshot store_state,
     void* addr,
     ValueType type,
     Register next)
   {
-    check_value(next.borrow());
-
-    if (store_state.is_shared() || store_state.is_immortal())
-    {
-      auto next_state = next->state();
-
-      if (!next_state.is_shared() && !next_state.is_immortal())
-        Value::error(Error::BadStore);
-    }
-
-    next->to_addr(type, addr);
-    next.clear_unsafe();
+    check_init(store_state, next.borrow());
+    init_unchecked(addr, type, std::move(next));
   }
 
   template<bool is_move>

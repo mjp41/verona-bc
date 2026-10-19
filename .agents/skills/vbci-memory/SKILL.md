@@ -90,8 +90,9 @@ member table, garbage-slot list, or garbage pointer vector is allocated.
 
 The already-finalizing intrusive garbage list transfers directly to the
 collector before any fields are dropped. Copying drains the candidate table
-before tracing the source, after consuming the source root, and after post-copy
-hooks. Each drain repeats if finalization creates further candidates.
+before tracing the source, after dropping construction references, after
+post-copy hooks, and after consuming source roots. Each drain repeats if
+finalization creates further candidates.
 
 Readonly behavior arguments remain borrowed for the behavior lifetime. Cown
 handles themselves are independently reference counted.
@@ -124,10 +125,30 @@ graph's explicit root.
 Fresh copies are represented by `IsolatedGraph` until ownership is transferred
 to their destination. Every fresh mutable node is reachable from its root, and
 there are no external mutable references into the graph. Destroying an
-uncommitted `IsolatedGraph` therefore claims and finalizes its complete mutable
-graph directly; it does not use mutable-cycle trial deletion. Shared,
-immortal, and cown references are traversal boundaries and are released by
-normal finalization. `release()` commits the root to its destination.
+`IsolatedGraph` therefore claims and finalizes its complete mutable graph
+directly; it does not use mutable-cycle trial deletion. Shared, immortal, and
+cown references are traversal boundaries and are released by normal
+finalization.
+
+Graph copying uses a single post-order traversal. First discovery allocates a
+destination and records it in the source-to-destination map. The post-order
+callback initializes its fields with unchecked writes. After traversal, the
+allocation's initial reference represents the first incoming edge, including
+the result root, and repeated mutable edges increment the destination during
+traversal. Field initialization transfers those already-accounted references.
+Non-copied references encountered by the traversal are incremented there and
+transferred during field initialization. Post-copy hooks then run after the
+complete graph is initialized.
+
+`IsolatedGraph` is always a staging owner. Abandoning it suppresses destination
+finalizers because successful paths transfer the root to its semantic owner
+with `release()`.
+
+Behavior completion first validates the result cown, then stages copies for
+the result and every writable cown. Only after every copy and post-copy hook
+succeeds does it install all roots with unchecked exchanges. It then releases
+all source roots together with finalizers suppressed. A copy or hook failure
+therefore cannot leave a partially committed set of cowns.
 
 ## Freezing
 
@@ -177,9 +198,10 @@ Collection within the active mutable batch is two phase:
 1. run finalizers and drop managed fields;
 2. release object storage.
 
-`SuppressFinalizers` is used when consuming a source graph whose semantic
-lifetime continues in a copy. Copy finalization must distinguish the live
-source image from abandoned garbage so finalizers run exactly once.
+`SuppressFinalizers` is used both when consuming source graphs whose semantic
+lifetimes continue in copies and when reclaiming an abandoned staged copy
+whose finalizers must not run. Suppression scopes do not nest. This ensures
+that each semantic object is finalized exactly once.
 
 Finalizers execute with readonly access. New objects allocated by finalizers
 are ordinary mutable allocations. Acyclic objects collect immediately; cycles

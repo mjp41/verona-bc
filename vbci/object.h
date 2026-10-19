@@ -31,28 +31,12 @@ namespace vbci
     Object& init(Frame& frame, Class& cls)
     {
       uint8_t* base = reinterpret_cast<uint8_t*>(this + 1);
-      auto state = this->state();
-      size_t initialized = 0;
 
-      try
+      for (size_t i = 0; i < cls.fields.size(); i++)
       {
-        for (; initialized < cls.fields.size(); initialized++)
-        {
-          auto& f = cls.fields.at(initialized);
-          auto& v = frame.arg(initialized);
-
-          if (!Program::get().subtype(v->type_id(), f.type_id))
-            Value::error(Error::BadType);
-
-          void* addr = base + f.offset;
-          writebarrier::init(state, addr, f.value_type, std::move(v));
-        }
-      }
-      catch (...)
-      {
-        drop_fields(initialized);
-        delete[] reinterpret_cast<uint8_t*>(this);
-        throw;
+        auto& f = cls.fields.at(i);
+        void* addr = base + f.offset;
+        writebarrier::init_unchecked(addr, f.value_type, std::move(frame.arg(i)));
       }
 
       return *this;
@@ -104,6 +88,13 @@ namespace vbci
 
       void* addr = reinterpret_cast<uint8_t*>(this + 1) + f.offset;
       writebarrier::init(state(), addr, f.value_type, std::move(v));
+    }
+
+    void initialize_unchecked(size_t idx, Register v)
+    {
+      auto& f = cls().fields.at(idx);
+      void* addr = reinterpret_cast<uint8_t*>(this + 1) + f.offset;
+      writebarrier::init_unchecked(addr, f.value_type, std::move(v));
     }
 
     template<bool is_move>
@@ -219,40 +210,6 @@ namespace vbci
       }
     }
 
-  private:
-    void drop_fields(size_t count)
-    {
-      auto& fields = cls().fields;
-
-      for (size_t i = 0; i < count; i++)
-      {
-        switch (fields.at(i).value_type)
-        {
-          case ValueType::Object:
-          case ValueType::Array:
-          case ValueType::FieldRef:
-          case ValueType::ArrayRef:
-          case ValueType::Dyn:
-          {
-            auto value = load(i);
-            writebarrier::drop(value);
-            break;
-          }
-
-          case ValueType::Cown:
-          {
-            auto value = load(i);
-            value.dec();
-            break;
-          }
-
-          default:
-            break;
-        }
-      }
-    }
-
-  public:
     std::string to_string()
     {
       return std::format(

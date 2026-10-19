@@ -92,6 +92,17 @@ namespace vbci
 
   Value Symbol::call(std::vector<const void*>& args)
   {
+    struct ResetVarargs
+    {
+      std::vector<ffi_type*>& types;
+      size_t count;
+
+      ~ResetVarargs()
+      {
+        types.resize(count);
+      }
+    } reset{param_ffi_types, param_types.size()};
+
     if (!func)
       Value::error(Error::UnknownFFI);
 
@@ -131,9 +142,6 @@ namespace vbci
       ffi_call(&cif, func, &r, const_cast<void**>(args.data()));
       ret = Value::from_ffi(return_value_type, r);
     }
-
-    if (vararg)
-      param_ffi_types.resize(param_types.size());
 
     return ret;
   }

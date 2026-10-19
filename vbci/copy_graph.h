@@ -6,8 +6,6 @@
 
 namespace vbci
 {
-  struct Cown;
-
   /**
    * Owns a fresh mutable copy whose nodes have no external mutable references.
    * Releasing transfers the root; otherwise destruction reclaims the complete
@@ -24,7 +22,6 @@ namespace vbci
     IsolatedGraph() = default;
     explicit IsolatedGraph(Register root) : root(std::move(root)) {}
     ~IsolatedGraph();
-
     IsolatedGraph(IsolatedGraph&& other) noexcept
     : root(std::move(other.root))
     {}
@@ -45,11 +42,11 @@ namespace vbci
     }
   };
 
+  [[nodiscard]] IsolatedGraph copy_graph(ValueBorrow root);
+
   /**
    * Copy a graph and consume the source reference without finalizing objects
    * whose semantic lifetimes continue in the copy.
    */
   [[nodiscard]] IsolatedGraph copy_graph_and_consume(Register root);
-
-  void copy_graph_and_consume(Cown& cown);
 }

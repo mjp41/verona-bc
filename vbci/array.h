@@ -92,6 +92,12 @@ namespace vbci
       writebarrier::init(state(), addr, value_type, std::move(v));
     }
 
+    void initialize_unchecked(size_t idx, Register v)
+    {
+      void* addr = reinterpret_cast<uint8_t*>(this + 1) + (stride * idx);
+      writebarrier::init_unchecked(addr, value_type, std::move(v));
+    }
+
     template<bool is_move>
     [[nodiscard]] ValueTransfer exchange(size_t idx, Reg<is_move> v)
     {

@@ -75,13 +75,21 @@ namespace vbci
       return content;
     }
 
-    template<bool is_move>
-    bool add_reference(Reg<is_move>& next)
+    void check_store(const Value& next)
     {
-      // Can't store a stack value in a cown.
-      if (next->get_value_type() == ValueType::RegisterRef)
-        return false;
+      if (
+        !next.is_error() &&
+        !Program::get().subtype(next.type_id(), content_type_id()))
+        Value::error(Error::BadType);
 
+      if (next.get_value_type() == ValueType::RegisterRef)
+        Value::error(Error::BadStore);
+    }
+
+    template<bool is_move>
+    [[nodiscard]] ValueTransfer exchange_unchecked(Reg<is_move> next)
+    {
+      Value prev = content;
       if constexpr (is_move)
         content = next.extract();
       else
@@ -90,22 +98,14 @@ namespace vbci
         content = next.borrow();
       }
 
-      return true;
+      return ValueTransfer(prev);
     }
 
     template<bool is_move>
     [[nodiscard]] ValueTransfer exchange(Reg<is_move> next)
     {
-      if (
-        !next->is_error() &&
-        !Program::get().subtype(next->type_id(), content_type_id()))
-        Value::error(Error::BadType);
-
-      Value prev = content;
-      if (!add_reference<is_move>(next))
-        Value::error(Error::BadStore);
-
-      return ValueTransfer(prev);
+      check_store(next.borrow());
+      return exchange_unchecked<is_move>(std::forward<Reg<is_move>>(next));
     }
 
     std::string to_string()

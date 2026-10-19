@@ -8,6 +8,7 @@
 #include "function_signature.h"
 #include "object.h"
 #include "program.h"
+#include "writebarrier.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -368,10 +369,14 @@ namespace vbci
   // The Value returns an rc to the cown.
   ValueTransfer Thread::run_async(uint32_t type_id, Function* func)
   {
-    auto result = Cown::create(type_id);
-
-    if (!Program::get().subtype(func->return_type, result->content_type_id()))
+    auto& program = Program::get();
+    if (!program.is_cown(type_id))
       Value::error(Error::BadType);
+
+    if (!program.subtype(func->return_type, program.uncown(type_id)))
+      Value::error(Error::BadType);
+
+    auto result = Cown::create(type_id);
 
     auto construction = BehaviourCore::make(
       1, sizeof(BehaviorBody), alignof(BehaviorBody), run_behavior);
@@ -478,16 +483,53 @@ namespace vbci
       outcome = ValueImmortal(error_value);
     }
 
-    // Store the function return value in the result cown.
-    Register r = result->exchange<true>(std::move(outcome));
+    result->check_store(outcome.borrow());
 
+    std::vector<Cown*> copy_destinations;
+    std::vector<IsolatedGraph> copies;
+    copy_destinations.reserve(num_cowns);
+    copies.reserve(num_cowns);
+
+    // Build every writable destination before changing any cown root.
     for (size_t i = 0; i < num_cowns; i++)
     {
-      if (b->acquired_mode(i) != verona::rt::AccessMode::Read)
-        copy_graph_and_consume(*b->acquired_cown(i));
+      if (b->acquired_mode(i) == verona::rt::AccessMode::Read)
+        continue;
+
+      auto* cown = b->acquired_cown(i);
+      auto source = (i == 0) ? outcome.borrow() : cown->load();
+      copy_destinations.push_back(cown);
+      copies.emplace_back(copy_graph(source));
     }
 
-    collect_mutable_cycles();
+    std::vector<Register> consumed_sources;
+    consumed_sources.reserve(copy_destinations.size());
+
+    // Commit is no-fail: all values were checked or copied from the
+    // destination cown's existing content type.
+    for (size_t i = 0; i < copy_destinations.size(); i++)
+    {
+      auto* cown = copy_destinations.at(i);
+      Register previous(
+        cown->exchange_unchecked<true>(copies.at(i).release()));
+
+      if (cown == result)
+      {
+        assert(previous->is_invalid());
+        consumed_sources.emplace_back(std::move(outcome));
+      }
+      else
+      {
+        consumed_sources.emplace_back(std::move(previous));
+      }
+    }
+
+    {
+      SuppressFinalizers suppress;
+      for (auto& source : consumed_sources)
+        source.clear();
+      collect_mutable_cycles();
+    }
 
 #ifndef NDEBUG
     {
@@ -1280,6 +1322,11 @@ namespace vbci
               Value::error(Error::BadType);
             }
           }
+
+          // Validate every variable argument before mutating the symbol's
+          // reusable CIF parameter list.
+          for (size_t i = params.size(); i < num_args; i++)
+            program.layout_type_id(frame.arg(i)->type_id());
 
           self.args = 0;
 
@@ -2131,10 +2178,21 @@ namespace vbci
 
     for (size_t i = 0; i < args; i++)
     {
-      if (!program->subtype(frame->arg(i)->type_id(), fields.at(i).type_id))
+      auto& value = frame->arg(i);
+      if (!program->subtype(value->type_id(), fields.at(i).type_id))
       {
         frame->drop_args(args);
         Value::error(Error::BadType);
+      }
+
+      try
+      {
+        writebarrier::check_init(HeaderState::mutable_(), value.borrow());
+      }
+      catch (...)
+      {
+        frame->drop_args(args);
+        throw;
       }
     }
 
@@ -2172,6 +2230,12 @@ namespace vbci
   {
     if (func->param_types.size() != args)
       Value::error(Error::BadArgs);
+
+    if (!program->is_cown(type_id))
+      Value::error(Error::BadType);
+
+    if (!program->subtype(func->return_type, program->uncown(type_id)))
+      Value::error(Error::BadType);
 
     auto& params = func->param_types;
     bool is_closure = false;
@@ -2220,9 +2284,6 @@ namespace vbci
 
     if (is_closure)
       closure_copy = copy_graph_and_consume(std::move(closure_source));
-
-    if (!program->subtype(func->return_type, program->uncown(type_id)))
-      Value::error(Error::BadType);
 
     // Create the result cown.
     auto result_cown = Cown::create(type_id);

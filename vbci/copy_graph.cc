@@ -117,7 +117,8 @@ namespace vbci
           auto copy_array = static_cast<Array*>(copy);
 
           for (size_t i = 0; i < source_array->get_size(); i++)
-            copy_array->initialize(i, map_value(source_array->load(i)));
+            copy_array->initialize_unchecked(
+              i, map_value(source_array->load(i)));
         }
         else
         {
@@ -125,14 +126,15 @@ namespace vbci
           auto copy_object = static_cast<Object*>(copy);
 
           for (size_t i = 0; i < source_object->cls().fields.size(); i++)
-            copy_object->initialize(i, map_value(source_object->load(i)));
+            copy_object->initialize_unchecked(
+              i, map_value(source_object->load(i)));
 
           if (auto post_copy = copy_object->cls().post_copy())
             post_copies.emplace_back(post_copy, copy_object);
         }
       }
 
-      Register run(ValueBorrow root)
+      IsolatedGraph run(ValueBorrow root)
       {
         auto root_header = root.get_header();
         traverse(
@@ -156,17 +158,18 @@ namespace vbci
           },
           [&](Header* source) { fill(source); });
 
-        // A hook can follow a back edge to a copy that has not yet been filled.
+        IsolatedGraph graph(map_value(root));
+
+        // Run hooks only after every copied edge has been initialized.
         for (auto [post_copy, copy] : post_copies)
           Thread::run_sync(post_copy, ValueBorrow(copy));
 
         collect_mutable_cycles();
-
-        return map_value(root);
+        return graph;
       }
     };
 
-    IsolatedGraph copy_graph(ValueBorrow root)
+    IsolatedGraph copy_graph_impl(ValueBorrow root)
     {
       if (!root.is_header())
         return IsolatedGraph(Register(root));
@@ -176,9 +179,7 @@ namespace vbci
         return IsolatedGraph(Register(root));
 
       collect_mutable_cycles();
-
-      auto copy = GraphCopy().run(root);
-      return IsolatedGraph(std::move(copy));
+      return GraphCopy().run(root);
     }
 
   }
@@ -200,7 +201,13 @@ namespace vbci
 
   void IsolatedGraph::reset()
   {
+    SuppressFinalizers suppress;
     destroy_isolated_graph(std::move(root));
+  }
+
+  IsolatedGraph copy_graph(ValueBorrow root)
+  {
+    return copy_graph_impl(root);
   }
 
   IsolatedGraph copy_graph_and_consume(Register root)
@@ -213,13 +220,4 @@ namespace vbci
     return copy;
   }
 
-  void copy_graph_and_consume(Cown& cown)
-  {
-    IsolatedGraph copy = copy_graph(cown.load());
-    Register source = cown.exchange<true>(copy.release());
-
-    SuppressFinalizers suppress;
-    source.clear();
-    collect_mutable_cycles();
-  }
 }
