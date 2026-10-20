@@ -14,14 +14,14 @@ namespace vbci
   private:
     static constexpr auto MutableCycleCandidate = uintptr_t(0x0);
     static constexpr auto Mutable = uintptr_t(0x1);
-    static constexpr auto Immutable = uintptr_t(0x2);
+    static constexpr auto Shared = uintptr_t(0x2);
     static constexpr auto Pending = uintptr_t(0x3);
     // Immortal and Finalizing are both uncounted. They remain distinct until
     // we prove that readonly finalizer references cannot reach a copy boundary;
     // after that they may be collapsed to recover a tag value.
     static constexpr auto Immortal = uintptr_t(0x4);
     static constexpr auto SccPtr = uintptr_t(0x5);
-    static constexpr auto Cown = uintptr_t(0x6);
+    // 0x6 is available.
     static constexpr auto Finalizing = uintptr_t(0x7);
     static constexpr auto Shift = 3;
     static constexpr auto Mask = uintptr_t(0x7);
@@ -62,7 +62,7 @@ namespace vbci
       bool is_shared() const
       {
         auto tag = value & Mask;
-        return tag == Immutable || tag == SccPtr || tag == Cown;
+        return tag == Shared || tag == SccPtr;
       }
 
       bool is_scc_ptr() const
@@ -73,11 +73,6 @@ namespace vbci
       bool is_pending() const
       {
         return (value & Mask) == Pending;
-      }
-
-      bool is_cown() const
-      {
-        return (value & Mask) == Cown;
       }
 
       bool is_finalizing() const
@@ -122,11 +117,6 @@ namespace vbci
       return Snapshot((uintptr_t(index) << Shift) | MutableCycleCandidate);
     }
 
-    static constexpr Snapshot immutable()
-    {
-      return Snapshot(Immutable);
-    }
-
     static constexpr Snapshot immortal()
     {
       return Snapshot(Immortal);
@@ -137,9 +127,9 @@ namespace vbci
       return Snapshot(Pending);
     }
 
-    static constexpr Snapshot cown()
+    static constexpr Snapshot shared()
     {
-      return Snapshot(Cown);
+      return Snapshot(Shared);
     }
 
     static constexpr Snapshot finalizing()

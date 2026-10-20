@@ -47,7 +47,7 @@ namespace vbci
     {
       assert(header->state().is_shared());
 
-      if (!header->state().is_cown())
+      if (!Program::get().is_cown(header->get_type_id()))
       {
         immutable_work.push(header);
         return;
@@ -85,7 +85,9 @@ namespace vbci
 
     HeaderQueue claim_immutable_scc(Header* root)
     {
-      assert(root->state().is_shared() && !root->state().is_cown());
+      assert(
+        root->state().is_shared() &&
+        !Program::get().is_cown(root->get_type_id()));
       root->set_state(HeaderState::finalizing());
       HeaderQueue finalizing;
 

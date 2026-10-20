@@ -21,7 +21,7 @@ namespace vbci
     {}
 
     explicit Header(uint32_t type_id)
-    : header_state(HeaderState::cown()), type_id(type_id)
+    : header_state(HeaderState::shared()), type_id(type_id)
     {}
 
     void mark_immortal()

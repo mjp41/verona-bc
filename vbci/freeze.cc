@@ -90,7 +90,7 @@ namespace vbci
         {
           pending.pop_back();
           auto rep = Header::find(h);
-          rep->set_state(HeaderState::immutable());
+          rep->set_state(HeaderState::shared());
         }
 
         continue;
