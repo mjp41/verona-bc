@@ -243,14 +243,22 @@ Array index out of bounds. Check that your loop counter stays within `0..arr.siz
 
 ### `bad stack escape`
 
-A stack-allocated value is escaping its frame — typically returned from a function or stored into a heap object. This usually means a primitive was expected but an object reference was used.
+A transient reference to a local register would outlive the frame containing
+that register. This can happen when returning such a reference, raising it past
+its frame, or passing it through a tail call.
 
 ### `bad store`
 
-A region invariant was violated. Common causes:
-- Storing creates a cycle between regions (A references B and B references A)
-- Storing a frame-local value into a frozen or read-only region
-- Double-parenting: an object already has a region parent and you're trying to move it to another
+The stored value or destination is not mutable storage. Common causes include:
+
+- storing a read-only value;
+- storing a transient register reference into managed storage;
+- writing mutable state into immutable storage.
+
+### `bad store target`
+
+The left-hand reference is read-only, has an invalid lifetime, or does not
+refer to writable register, field, array, or cown storage.
 
 ### `bad operand`
 

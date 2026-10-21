@@ -166,7 +166,9 @@ The `*` operator is defined as a `ref` method on `ref[T]`, returning a `ref[T]` 
 
 Cowns are reference-counted. When no references to a cown remain (no variables, no pending behaviors), the cown and its contents are deallocated.
 
-When a value is placed into a cown, ownership of the value's region transfers to the cown. See [Memory Model](19-memory-model.md).
+When a behavior is scheduled, its ordinary captured graph is copied while cown
+handles retain their identities. On completion, writable state is copied back
+into each acquired cown. See [Memory Model §19.10](19-memory-model.md).
 
 ---
 
@@ -211,12 +213,15 @@ main(): i32
 
 ## 15.9 Runtime Errors in Behaviors
 
-If a behavior (the body of a `when` block) encounters a runtime error (type mismatch, out-of-bounds access, stack reference escape), the error is **fatal to that behavior**:
+If a behavior (the body of a `when` block) encounters a runtime error (such as
+a type mismatch, out-of-bounds access, or escaping register reference), the
+error is **fatal to that behavior**:
 
 - The behavior terminates immediately.
-- All interpreter frames for the behavior are torn down (registers, stack allocations, finalizers, and frame-local regions are cleaned up).
+- All interpreter frames for the behavior are torn down, releasing their
+  registers and managed values.
 - The cowns held by the behavior are released so other behaviors can proceed.
-- The result cown of the failed `when` block receives no value.
+- The runtime stores the error value in the result cown.
 
 There is no way to catch or recover from a runtime error within the behavior that caused it. This is by design — runtime errors indicate logic bugs, not expected failure modes. For expected failure cases, use `nomatch` return values or `raise` for non-local return. See [Error Handling](24-error-handling.md).
 
@@ -276,6 +281,10 @@ The scheduler tracks external resources — things outside Verona's control (fil
 - `ffi::external.remove` decrements the count.
 
 See [FFI §17.8](17-ffi.md) for details.
+
+External-resource tracking keeps the scheduler alive but does not retain
+callbacks, arrays, or native contexts. See
+[FFI §17.9](17-ffi.md) for asynchronous callback ownership.
 
 ### How do I chain cowns in a pipeline?
 

@@ -44,7 +44,8 @@ p.x = 10;                            // allowed — mutates the object
 | `let` | No | Yes |
 | `var` | Yes | Yes |
 
-If you want true immutability, region freezing will provide it (see [Memory Model §19.9](19-memory-model.md)) — but it is not yet implemented.
+`mem::freeze` provides graph immutability by producing an immutable deep copy (see
+[Memory Model §19.9](19-memory-model.md)).
 
 See [Declarations §4.1](04-declarations.md) and [Memory Model §19.4](19-memory-model.md).
 
@@ -83,7 +84,8 @@ var b: i32 = 42;
 a = b = 0;                           // a is now 42, b is now 0
 ```
 
-These patterns will become especially important when regions are fully implemented — they enable ownership transfers without temporary variables.
+These patterns express exchanges directly without requiring temporary
+variables.
 
 See [Expressions §5.13](05-expressions.md) and [Memory Model §19.5](19-memory-model.md).
 

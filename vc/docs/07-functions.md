@@ -128,7 +128,8 @@ With this definition, `arr(i) = val` works:
 
 1. `arr(i)` on the left-hand side of `=` calls `ref apply`, returning a `ref[T]`.
 2. The compiler emits a `Store` instruction that writes `val` through the reference.
-3. The store performs a region-aware exchange — it updates reference counts, checks ownership rules, and returns the previous value.
+3. The store retains or transfers `val`, installs it, releases the previous
+   value, and returns that previous value.
 
 Reading `arr(i)` on the right-hand side calls the regular (non-ref) `apply` method. If no explicit RHS `apply` exists, one is auto-generated that calls the `ref` version and loads the value.
 

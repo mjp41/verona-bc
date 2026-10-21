@@ -2,96 +2,65 @@
 
 [← Table of Contents](README.md) | [Previous: Type Inference](18-type-inference.md) | [Next: Compiler Pipeline →](20-compiler-pipeline.md)
 
-This chapter describes Verona's memory and ownership model — how objects are allocated, where they live, and what rules govern references between them.
+This chapter describes Verona's copy-based memory and ownership model — how objects are allocated, where they live, and what rules govern references between them.
 
 ---
 
 ## 19.1 Overview
 
-Verona uses **region-based memory management** with reference counting. There is no tracing garbage collector. Memory is reclaimed deterministically through reference counting and region deallocation.
+Mutable objects and arrays are independently reference counted. The runtime
+also detects unreachable mutable cycles, so cyclic object graphs do not require
+a tracing garbage collector or explicit region ownership.
 
-Objects are organized into **regions**. A region is a group of objects managed together, with a single entry point (its root). When the root becomes unreachable, the entire region and all its objects are deallocated.
+Ordinary assignment creates aliases. Isolation is introduced only at explicit
+ownership boundaries, where the language semantics require a deep copy:
 
----
+- `mem::freeze` returns an immutable deep copy;
+- scheduling a `when` copies the non-cown captured graph;
+- behavior completion copies each writable result graph into its cown;
+- `native_state(value)` copies `value` behind a foreign-owned state handle;
+- `ffi::callback(callable)` copies the callable graph into the callback.
 
-## 19.2 Allocation Locations
-
-Every object lives in one of three locations:
-
-| Location | Description | Lifetime |
-|----------|-------------|----------|
-| **Stack** | Fast, scoped allocation | Current function call |
-| **Frame-local region** | Default heap allocation | Until dragged or frame exits |
-| **Heap region** | Explicit region allocation | Until region root becomes unreachable |
-
-### How Allocation Location Is Determined
-
-The programmer does not choose where objects are allocated — the runtime decides:
-
-- **Primitives** (`i32`, `bool`, etc.) and small values are typically stack-allocated.
-- **`new` expressions** allocate objects in the current function's **frame-local region** (a temporary heap region).
-- **Heap regions** are created when a value is placed into a cown (via `when`), or when an object is dragged into another region.
-
-You don't need to annotate allocation locations. The rules are simple: `new` goes to the frame-local region, cowns create heap regions, and the runtime drags objects between regions as needed.
-
-### Stack Allocation
-
-Stack objects are the fastest to allocate and free. They live on the function's stack and are destroyed when the function returns. Stack objects **cannot escape their frame** — returning a stack-allocated value is a runtime error (`bad stack escape`).
-
-### Frame-Local Regions
-
-Every function call has its own **frame-local region** — a temporary heap region that holds objects created during the call. This is the default allocation target for `new`. When the function returns:
-
-- If the return value is frame-local, it is **dragged** (moved) to the caller's frame-local region.
-- All remaining frame-local objects are freed.
-
-Frame-local regions do not participate in stack reference counting — they are managed by the call stack.
-
-### Heap Regions
-
-Heap regions are explicitly created and persist until collected. Each heap region has:
-- A root object as its entry point.
-- A **parent**, which can be another region, a cown, or nothing.
-- A **stack reference count** tracking how many registers point into the region.
-
-When a heap region's stack reference count drops to zero and it has no parent, the region and all its contents are freed.
+The runtime may later reuse an exclusively owned graph in place, but programs
+must behave as if the copy occurred.
 
 ---
 
-## 19.3 Region Dragging
+## 19.2 Allocation and Lifetime
 
-**Dragging** is the automatic process of moving objects from one region to another. It happens transparently — the programmer does not need to manage it. Dragging occurs in several situations:
+`new` and array construction allocate ordinary managed values. There are no
+program-visible stack, frame-region, heap-region, dragging, or region-parent
+distinctions.
 
-### Storing into a Field
+A managed value remains alive while it is reachable from a runtime root such
+as:
 
-When you assign a frame-local object into a field of an object in a different region, the frame-local object (and everything it references) is dragged into the target region:
+- a local register or object field;
+- an array element;
+- cown content;
+- queued behavior state;
+- a callback-owned callable;
+- a `native_state[T]` cell.
 
-```verona
-let container = cell(none::create());
-let value = myobj(42);               // frame-local
-container.inner = value;             // value is dragged into container's region
-```
+Dropping the last acyclic reference reclaims the value. Decrements that may
+leave a cycle are classified by the mutable-cycle collector. Finalization and
+cycle collection are synchronous at runtime ownership boundaries.
 
-### Returning a Value
+---
 
-When a function returns a frame-local object, it is dragged to the caller's frame-local region:
+## 19.3 Aliasing and Copy Boundaries
 
-```verona
-make(): cell
-{
-  let c = cell(42);                  // frame-local in make's region
-  c                                  // dragged to caller's region on return
-}
-```
+Local bindings, field stores, function arguments, and returns alias their
+values. They do not implicitly deep-copy mutable graphs. Deep copying is
+reserved for the ownership boundaries listed in §19.1.
 
-### Placing into a Cown
+Copying preserves sharing within the copied graph. If two source paths point to
+the same object, the corresponding destination paths point to one copied
+object. Cycles are likewise reproduced as cycles.
 
-When a frame-local object is placed into a cown (via `when`), it is dragged into a fresh heap region owned by the cown.
-
-### What Cannot Be Dragged
-
-- **Stack objects** cannot be dragged into any region. Attempting to store a stack object into a heap field or return it from a function produces a runtime error.
-- **Region objects with existing parents** — a region can only have one owner. Attempting to place an already-owned region into another is an error.
+Some handles are ownership boundaries rather than traversable graph nodes.
+Copying a cown, callback handle, or `native_state[T]` handle retains the same
+identity instead of copying the state behind that handle.
 
 ---
 
@@ -124,7 +93,7 @@ let r = point(1, 2);
 // r = point(3, 4);                  // NOT allowed — let is single-assignment
 ```
 
-> **Aliasing and concurrency:** Because assignment aliases, two aliases to the same object can both mutate it. Within a single thread, this is intentional — Verona is not a pure language. Across threads, shared mutable state must go through [cowns](15-concurrency.md), which serialize access and prevent data races.
+> **Aliasing and concurrency:** Because assignment aliases, two aliases to the same object can both mutate it. Within a single thread, this is intentional — Verona is not a pure language. Across concurrent behaviors, shared mutable state must go through [cowns](15-concurrency.md). Native callbacks may instead use an explicitly unsafe, externally serialized FFI contract.
 
 ---
 
@@ -156,7 +125,7 @@ When you write `obj.field = val`, three things happen:
    ```
    This returns a `ref[i32]` pointing into the object.
 
-2. **The compiler emits a Store instruction.** The store writes `val` through the reference, performing a region-aware exchange — it checks ownership rules, updates reference counts, and sets parent pointers as needed.
+2. **The compiler emits a Store instruction.** The store retains or transfers `val`, installs it through the reference, and releases the previous value.
 
 3. **The old value is returned.** Assignment is an exchange — it returns the previous value (see §19.5).
 
@@ -166,15 +135,16 @@ When you read `obj.field`, the compiler either calls a non-ref accessor (if one 
 
 You cannot create `ref[T]` values directly. They are produced only by `ref` methods (field accessors, `ref apply` on arrays).
 
-### `ref[T]` and Regions
+### Register Reference Lifetimes
 
-A `ref[T]` points into the same region as the object it was obtained from. Using a `ref[T]` within that region is safe. What you **cannot** do:
+A `ref[T]` to a local register must not outlive the function frame containing
+that register. Returning it, raising it past that frame, or carrying it through
+a tail call produces `bad stack escape`. Register references also cannot be
+stored into managed object or array fields.
 
-- **Return a `ref[T]` to a stack variable** — the stack variable is destroyed when the function returns. This is caught at runtime (`bad stack escape`).
-- **Return any stack-allocated value** from a function — runtime error (`bad stack escape`).
-- **Return a frame-local value that contains a reference to a stack value** — the contained reference becomes dangling. This is caught at runtime.
-
-The compiler generates code that stores through or loads from references immediately. You should not store a `ref[T]` in a `let` or `var` for later use — the compiler's generated code handles references transiently.
+The compiler normally generates code that stores through or loads from
+references immediately. Prefer using the resulting value rather than retaining
+a reference for later use:
 
 ```verona
 let val = obj.field;                  // loads through ref, binds the value
@@ -183,54 +153,67 @@ obj.field = new_val;                  // stores through ref in one statement
 
 ---
 
-## 19.7 Region Strategies
+## 19.7 Reference Counting and Cycles
 
-The runtime supports two region strategies:
+Mutable objects use per-object reference counts. A decrement that leaves a
+cycle-capable object alive records it as a cycle candidate. At collection
+boundaries, the runtime performs synchronous trial deletion over the candidate
+graph and reclaims unreachable strongly connected components.
 
-| Strategy | Description |
-|----------|-------------|
-| **Reference-counted** | Each object in the region tracks individual references. When an object's internal RC reaches zero, it is freed immediately. |
-| **Arena** | Internal reference counting is disabled. All objects are freed together when the region is collected. Faster allocation, no per-object overhead. |
+Immutable graphs produced by `mem::freeze` use shared reference counting over
+their immutable components. Native-state handles and callback closures have
+separate atomic reference counts because native code may hold or invoke them
+outside ordinary object traversal.
 
-Both strategies use the same **stack reference count** at the region level to determine when the region itself can be freed.
+These mechanisms are runtime implementation details. Programs observe only
+the value-level copying and lifetime rules.
 
 ---
 
 ## 19.8 Runtime Errors
 
-The runtime detects several region and reference errors at runtime:
+The runtime reports errors for invalid value operations, not region topology:
 
-| Error | Message | Cause |
-|-------|---------|-------|
-| `bad stack escape` | Returning a stack-allocated value from a function, or raising past its frame. |
-| `bad store` | Region invariant violation: storing causes a cycle, double parent, or frame-local→stack reference. Storing a read-only value. |
-| `bad store target` | Writing to an immutable or read-only reference. RegisterRef lifetime violation. |
-| `bad type` | Subtype check failed on call argument, return value, field store, or array store. |
+| Error | Cause |
+|-------|-------|
+| `bad store` | Storing a read-only value or transient register reference, or writing mutable state into immutable storage. |
+| `bad store target` | Writing through a read-only or otherwise invalid reference target. |
+| `bad type` | A call, return, field store, array store, or native-state store fails its subtype check. |
 | `bad array index` | Array index out of bounds. |
 | `bad args` | Wrong number of arguments to a function or constructor. |
+| `bad stack escape` | A transient register reference would outlive the frame that owns its register. |
+
+There are no region-parent, region-merge, or dragging errors.
 
 These errors are **fatal** — the current function (or behavior, in a `when` block) terminates immediately. They indicate logic bugs, not expected failure modes.
 
 ---
 
-## 19.9 Freezing (Immutability)
+## 19.9 Freezing and Other Ownership Splits
 
-> **Status:** Region freezing is being designed but not yet exposed at the language level.
+`mem::freeze(value)` returns an immutable deep clone of `value`. The mutable
+source and immutable destination are semantically independent. The runtime may
+freeze in place only when it can prove that no observable external alias
+remains.
 
-When implemented, freezing will convert a mutable region into an **immutable snapshot** that can be shared freely:
-- No reference counting overhead for reads — immutable objects use atomic reference counting on the group.
-- No mutable references into the region can exist after freezing.
-- Immutable objects can be shared between threads without synchronization.
+Scheduling a `when` similarly copies its non-cown captures. Cown handles retain
+their identities and provide the serialized access set for the behavior.
 
-Currently, all user-created objects are mutable. `let` constrains only the binding — see [Declarations §4.1](04-declarations.md) and [Gotchas §26.2](26-gotchas.md).
+When a behavior completes, each writable cown receives a graph semantically
+copied from the behavior's final state. Exclusive ownership may permit an
+in-place implementation, but cannot change program behavior.
 
 ---
 
 ## 19.10 Cowns and Ownership Transfer
 
-When a value is placed into a `cown` (via a `when` block), ownership of the value's region transfers to the cown. The region's parent is set to the cown, and the stack reference count is adjusted.
+A cown is an asynchronous serialization boundary. Its contents are accessed
+only inside a `when` that acquires that cown.
 
-Inside a `when` block, the cown's content is temporarily accessible via the bound parameter. When the `when` block completes, the result value is placed into the result cown, and ownership is again transferred.
+Scheduling copies ordinary captured state into the behavior. The cown itself
+is not copied; its handle identifies the same serialized resource. On
+completion, writable state is copied back into the cown before acquired cowns
+are released.
 
 See [Concurrency](15-concurrency.md) for the user-facing semantics of cowns.
 
@@ -238,26 +221,23 @@ See [Concurrency](15-concurrency.md) for the user-facing semantics of cowns.
 
 ## 19.11 Object Teardown
 
-When a region is collected or a frame is unwound, objects are torn down:
-1. Finalizers run (releasing child region references, cown references, etc.)
-2. Object memory is freed.
+When a managed value or unreachable cycle is reclaimed, the runtime runs its
+registered finalization logic and then releases its fields or elements.
+Finalization may create more managed work, so collection continues until the
+resulting candidate set is stable.
 
-There are no user-defined destructors or finalizers in the language. Resource cleanup is managed entirely by the runtime through region deallocation and reference counting.
+Callback closures release their copied callable graphs after the last callback
+handle and explicit native retention are released. Native-state handles
+release their contained graph on the last `native_state[T]` handle.
 
 ---
 
-## 19.12 What's Being Designed
+## 19.12 Native FFI State
 
-Several memory model features are actively being designed:
+`native_state[T]` is a synchronous, reference-counted state handle intended for
+native access. Construction deep-copies its initial value. Copying the handle
+shares the same state identity. Each `with[R]` copies its handler in and its
+result out, preventing aliases from crossing the state boundary.
 
-### Explicit Region Syntax
-
-Currently, regions are created implicitly (frame-local regions per function call, heap regions via cowns). The planned feature will allow programmers to explicitly create and manage regions, enabling patterns like sendable subgraphs and region transfer between cowns.
-
-### Region Freezing
-
-Freezing will convert a mutable region into a permanently immutable snapshot. Once frozen, the region can be shared freely without synchronization overhead. This is the mechanism for true immutability — unlike `let` (which only constrains the binding), freezing makes the object graph itself immutable.
-
-### Compile-Time Region Safety
-
-Currently, region violations (stack escape, invalid stores, lifetime errors) are caught at **runtime**. The planned feature will catch many of these errors at **compile time** through static analysis, reducing the chance of runtime crashes and giving programmers earlier feedback.
+See [FFI §17.9](17-ffi.md) for serialization, retained-pointer, callback
+ownership, deregistration, and scheduler-liveness requirements.

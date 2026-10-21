@@ -130,10 +130,13 @@ When you write `p.x = 5`, the compiler:
 
 1. Calls the compiler-generated `ref x(self: point): ref[i32]` accessor, producing a `ref[i32]` pointing into the object.
 2. Emits a `Store` instruction that writes `5` through the reference.
-3. The store performs a region-aware exchange — checking ownership rules, updating reference counts, and setting parent pointers if the stored value comes from a different region.
+3. The store retains or transfers the new value, installs it, and releases the
+   previous value.
 4. The old value at that field is returned (assignment is an exchange — see [Expressions §5.13](05-expressions.md)).
 
-You don't need to think about these steps — `p.x = 5` just works. But understanding the mechanism explains why field writes can trigger region dragging (see [Memory Model §19.3](19-memory-model.md)).
+You don't need to think about these steps — `p.x = 5` just works. The store
+retains or transfers the new value, installs it, and releases the previous
+value (see [Memory Model §19.5](19-memory-model.md)).
 
 ---
 

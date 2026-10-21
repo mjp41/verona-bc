@@ -152,12 +152,14 @@ See [Control Flow §6.7](06-control-flow.md) for details.
 
 ## 24.5 Runtime Errors
 
-Runtime errors (type mismatches, out-of-bounds access, stack reference escapes) are **fatal to the current behavior**. There is no way to catch or recover from a runtime error within the behavior that caused it.
+Runtime errors (such as type mismatches, out-of-bounds access, and escaping
+register references) are **fatal to the current behavior**. There is no way to
+catch or recover from a runtime error within the behavior that caused it.
 
 In the context of `when` blocks:
 - If a behavior (the body of a `when` block) encounters a runtime error, that behavior terminates.
 - The cowns held by the behavior are released so other behaviors can proceed.
-- The result cown of the failed `when` block receives no value.
+- The runtime stores the error value in the result cown.
 
 For synchronous code (not inside a `when` block), a runtime error terminates the program.
 
@@ -223,7 +225,9 @@ process_all(items: array[string]): i32 | parse_error
 }
 ```
 
-When `raise e` executes, `process_all` returns immediately with the `parse_error` value. No cleanup blocks are needed — frame-local regions are freed automatically.
+When `raise e` executes, `process_all` returns immediately with the
+`parse_error` value. Intermediate frames are torn down and their managed
+values are released automatically.
 
 ### Chaining Fallible Operations
 
