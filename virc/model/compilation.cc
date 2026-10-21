@@ -448,6 +448,10 @@ namespace virc
     {
       info = {TypeKind::Cown, {type_id(type / Type)}};
     }
+    else if (type == Native)
+    {
+      info = {TypeKind::Native, {type_id(type / Type)}};
+    }
     else if (type == Ref)
     {
       info = {TypeKind::Ref, {type_id(type / Type)}};

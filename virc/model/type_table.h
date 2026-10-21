@@ -42,6 +42,7 @@ namespace virc
     Ref,
     Union,
     Tuple,
+    Native,
   };
 
   struct TypeInfo

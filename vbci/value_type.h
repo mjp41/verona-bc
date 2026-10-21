@@ -36,6 +36,7 @@ namespace vbci
     FieldRef,
     ArrayRef,
     CownRef,
+    Native,
     Function,
     Error,
     Dyn,

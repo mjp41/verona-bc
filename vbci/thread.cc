@@ -6,6 +6,7 @@
 #include "copy_graph.h"
 #include "freeze.h"
 #include "function_signature.h"
+#include "native_state.h"
 #include "object.h"
 #include "program.h"
 #include "writebarrier.h"
@@ -124,6 +125,7 @@ namespace vbci
       case ValueType::Object:
       case ValueType::Array:
       case ValueType::Cown:
+      case ValueType::Native:
         return true;
 
       default:
@@ -705,6 +707,10 @@ namespace vbc
         return os << "AtTeardown";
       case Op::Freeze:
         return os << "Freeze";
+      case Op::NewNative:
+        return os << "NewNative";
+      case Op::NativeWith:
+        return os << "NativeWith";
       case Op::FFIStruct:
         return os << "FFIStruct";
       case Op::FFILoad:
@@ -1144,6 +1150,56 @@ namespace vbci
 
           Register value = std::move(src);
           dst = std::move(value);
+        });
+        break;
+      }
+
+      case Op::NewNative:
+      {
+        process(
+          [](Register& dst, Register& src, Constant<uint32_t> type_id)
+            INLINE {
+              auto copy = copy_graph_and_consume(std::move(src));
+              auto root = copy.release();
+              auto* native = NativeState::create(type_id, root.extract());
+              dst = ValueTransfer(Value(native));
+            });
+        break;
+      }
+
+      case Op::NativeWith:
+      {
+        process([](
+                  Register& dst,
+                  const Register& state,
+                  Register& handler,
+                  Constant<size_t> method_id) INLINE {
+          auto* native = state->get_native();
+          auto* apply = handler->method(method_id);
+          if (!apply)
+            Value::error(Error::MethodNotFound);
+
+          auto handler_copy = copy_graph_and_consume(std::move(handler));
+          auto local_handler = handler_copy.release();
+
+          // TODO: Audit failure semantics across copy boundaries, including
+          // whether exceptional paths can leak interior references from
+          // isolated graphs and thereby violate ownership.
+          Register local_result;
+          try
+          {
+            local_result = Thread::run_sync(
+              apply, std::move(local_handler), native->load());
+          }
+          catch (...)
+          {
+            collect_mutable_cycles();
+            throw;
+          }
+
+          collect_mutable_cycles();
+          auto result = copy_graph_and_consume(std::move(local_result));
+          dst = result.release();
         });
         break;
       }

@@ -379,6 +379,19 @@ namespace vbc
     // Arg0 = dst (none).
     // Arg1 = src (opaque release handle, ptr).
     ReleaseCallback,
+
+    // Creates a native state cell containing a deep copy of consumed src.
+    // Arg0 = dst.
+    // Arg1 = src.
+    // Arg2 = native type ID.
+    NewNative,
+
+    // Runs a consumed-and-copied handler synchronously with native state and
+    // copies out the result.
+    // Arg0 = dst.
+    // Arg1 = native state.
+    // Arg2 = handler.
+    NativeWith,
   };
 
   std::ostream& operator<<(std::ostream& output, Op op);
@@ -414,6 +427,7 @@ namespace vbc
     Ref,
     Union,
     Tuple,
+    Native,
   };
 
   enum class DIOp : uint8_t

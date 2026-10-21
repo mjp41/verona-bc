@@ -7,9 +7,9 @@ namespace virc
   const auto FloatType = T(F32, F64);
   const auto PrimitiveType = T(None, Bool) / IntType / FloatType;
   const auto BuiltinType = PrimitiveType / T(Ptr, Callback) /
-    (T(Array, Ref, Cown) << Any) / (T(TupleType) << Any);
+    (T(Array, Ref, Cown, Native) << Any) / (T(TupleType) << Any);
   const auto TypeNoUnion = PrimitiveType / T(Ptr, Callback, Dyn, GlobalId) /
-    (T(Array, Ref, Cown) << Any) / (T(TupleType) << Any);
+    (T(Array, Ref, Cown, Native) << Any) / (T(TupleType) << Any);
   const auto TypePat = (TypeNoUnion / (T(Union) << Any)) * --(T(Union) << End);
 
   const auto IntLiteral = T(Bin, Oct, Hex, Int, Char);
@@ -187,6 +187,9 @@ namespace virc
         // Cown type.
         T(Cown) * TypePat[Type] >> [](Match& _) { return Cown << _(Type); },
 
+        // Native state type.
+        T(Native) * TypePat[Type] >> [](Match& _) { return Native << _(Type); },
+
         // Merge union types.
         (T(Union) << Any)[Lhs] * (T(Union) << End) * (T(Union) << Any)[Rhs] >>
           [](Match& _) { return _(Lhs) << *_[Rhs]; },
@@ -208,6 +211,7 @@ namespace virc
           Array,
           Ref,
           Cown,
+          Native,
           Union,
           FFIParams,
           Type,
@@ -391,6 +395,18 @@ namespace virc
 
         Dst * T(Freeze) * T(LocalId)[Rhs] >>
           [](Match& _) { return Freeze << _(LocalId) << _(Rhs); },
+
+        Dst * T(NewNative) * T(LocalId)[Rhs] * T(Colon) * TypePat[Type] >>
+          [](Match& _) {
+            return NewNative << _(LocalId) << _(Rhs) << (Native << _(Type));
+          },
+
+        Dst * T(NativeWith) * T(LocalId)[Lhs] * T(LocalId)[Rhs] *
+            T(GlobalId)[GlobalId] * T(Colon) * TypePat[Type] >>
+          [](Match& _) {
+            return NativeWith << _(LocalId) << _(Lhs) << _(Rhs)
+                              << _(Type) << (MethodId ^ _(GlobalId));
+          },
 
         Dst * T(FFIStruct) * TypePat[Type] >>
           [](Match& _) { return FFIStruct << _(LocalId) << _(Type); },

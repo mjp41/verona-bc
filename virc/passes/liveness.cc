@@ -146,6 +146,17 @@ namespace virc
             kill(node / Rhs);
             def(node / LocalId);
           }
+          else if (node == NewNative)
+          {
+            kill(node / Rhs);
+            def(node / LocalId);
+          }
+          else if (node == NativeWith)
+          {
+            use(node / Lhs);
+            kill(node / Rhs);
+            def(node / LocalId);
+          }
           else if (node->in({Add, Sub, Mul, Div,     Mod,  Pow, And,
                              Or,  Xor, Shl, Shr,     Eq,   Ne,  Lt,
                              Le,  Gt,  Ge,  Min,     Max,  LogBase, Atan2}))

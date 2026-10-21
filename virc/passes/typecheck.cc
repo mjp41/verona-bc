@@ -153,6 +153,20 @@ namespace virc
     return t == Cown;
   }
 
+  static bool is_native_type(const Node& t)
+  {
+    if (t == Dyn)
+      return true;
+    if (t == Union)
+    {
+      for (auto& child : *t)
+        if (!is_native_type(child))
+          return false;
+      return t->size() > 0;
+    }
+    return t == Native;
+  }
+
   static bool is_optional_callback_type(const Node& t)
   {
     // callback.v stores an unbound callback as `callback_handle | none`.
@@ -240,7 +254,7 @@ namespace virc
   }
 
   // Get a human-readable type name for error messages.
-  // Recursively formats compound types (Union, Array, Cown, Ref).
+  // Recursively formats compound types (Union, Array, Cown, Native, Ref).
   static std::string type_name(const Node& t)
   {
     if (!t)
@@ -264,6 +278,12 @@ namespace virc
       if (t->size() > 0)
         return std::format("Cown({})", type_name(t / Type));
       return "Cown";
+    }
+    if (t == Native)
+    {
+      if (t->size() > 0)
+        return std::format("Native({})", type_name(t / Type));
+      return "Native";
     }
     if (t == Ref)
     {
@@ -416,7 +436,7 @@ namespace virc
 
       // Resolve TypeId to its definition (typically a Union) through the
       // assign_ids-built Compilation map. Recursively resolves through Union,
-      // Array, Cown, and Ref.
+      // Array, Cown, Native, and Ref.
       std::function<Node(const Node&)> resolve_type =
         [&](const Node& t) -> Node {
         if (!t)
@@ -464,7 +484,7 @@ namespace virc
             result << clone(rc);
           return result;
         }
-        if (t->type().in({Array, Cown, Ref}))
+        if (t->type().in({Array, Cown, Native, Ref}))
         {
           Node inner = t / Type;
           auto resolved = resolve_type(inner);
@@ -573,7 +593,9 @@ namespace virc
           cls = find_class(type_node);
         else if (is_primitive(type_node))
           cls = find_primitive(type_node);
-        else if (type_node == Array || type_node == Cown || type_node == Ref)
+        else if (
+          type_node == Array || type_node == Cown || type_node == Native ||
+          type_node == Ref)
         {
           // Complex primitives - find the matching primitive definition.
           for (auto& child : *top)
@@ -1098,7 +1120,7 @@ namespace virc
                 cls = find_class(t);
               else if (is_primitive(t))
                 cls = find_primitive(t);
-              else if (t->type().in({Array, Cown, Ref}))
+              else if (t->type().in({Array, Cown, Native, Ref}))
               {
                 for (auto& child : *top)
                 {
@@ -1295,6 +1317,41 @@ namespace virc
         {
           // Freeze returns the frozen object (same type as src).
           set_type(env, node / LocalId, typed(node / Rhs));
+        }
+        else if (node == NewNative)
+        {
+          auto src_type = typed(node / Rhs);
+          auto state_type = node / Native / Type;
+
+          if (src_type && !IRSubtype(top, src_type, state_type))
+          {
+            type_err(
+              node,
+              std::format(
+                "newnative: source type '{}' is not a subtype of state type "
+                "'{}'",
+                type_name(src_type),
+                type_name(state_type)));
+            return true;
+          }
+
+          set_type(env, node / LocalId, clone(node / Native));
+        }
+        else if (node == NativeWith)
+        {
+          auto state_type = typed(node / Lhs);
+
+          if (state_type && !is_native_type(state_type))
+          {
+            type_err(
+              node,
+              std::format(
+                "nativewith: operand type '{}' is not a native type",
+                type_name(state_type)));
+            return true;
+          }
+
+          set_type(env, node / LocalId, clone(node / Type));
         }
         else if (node == FFIStruct)
         {

@@ -1,0 +1,64 @@
+// NewNative copies its source, while copies of the native handle share state.
+// NativeWith copies its handler in and its result out.
+// Expected exit code: 0.
+
+lib
+  @set_exit_code = "set_exit_code"(i32): none
+
+class @State
+  @value: u64
+
+class @Read
+  @callback @read_apply
+
+class @Set
+  @value: u64
+  @callback @set_apply
+
+func @read_apply($_self: @Read, $state: @State): u64
+  $value_ref = ref $state @value
+  $value = load $value_ref
+  ret $value
+
+func @set_apply($self: @Set, $state: @State): u64
+  $self_value_ref = ref $self @value
+  $value = load $self_value_ref
+  $state_value_ref = ref $state @value
+  $_old = store $state_value_ref $value
+  ret $value
+
+func @main(): none
+  $one = const u64 1
+  $source = new @State($one)
+  $source_for_native = copy $source
+  $native = newnative $source_for_native : @State
+
+  $source_value_ref = ref $source @value
+  $two = const u64 2
+  $_old_source = store $source_value_ref $two
+
+  $reader = new @Read()
+  $reader_for_copy = copy $reader
+  $copied_value = nativewith $native $reader_for_copy @callback : u64
+  $source_was_copied = eq $copied_value $one
+
+  $native_copy = copy $native
+  $three = const u64 3
+  $setter = new @Set($three)
+  $_set = nativewith $native_copy $setter @callback : u64
+
+  $shared_value = nativewith $native $reader @callback : u64
+  $handles_share_state = eq $shared_value $three
+
+  $ok = and $source_was_copied $handles_share_state
+  cond $ok ^success ^failure
+
+^success
+  $_none = const none
+  ret $_none
+
+^failure
+  $one_i32 = const i32 1
+  $_exit = ffi @set_exit_code($one_i32)
+  $_none = const none
+  ret $_none

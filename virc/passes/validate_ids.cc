@@ -12,7 +12,7 @@ namespace virc
         // Accumulate complex primitive classes. This happens in this pass to
         // be able to call state->type_id(), which depends on all user-defined
         // classes already having been assigned an id.
-        T(Primitive)[Primitive] << (T(Array, Ref, Cown)[Type] * T(Methods)) >>
+        T(Primitive)[Primitive] << (T(Array, Ref, Cown, Native)[Type] * T(Methods)) >>
           [state](Match& _) -> Node {
           auto primitive = _(Primitive);
           auto type = _(Type);

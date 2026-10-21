@@ -266,6 +266,8 @@ namespace vbci
           return {ValueType::Array, &ffi_type_pointer};
         case TypeTag::Cown:
           return {ValueType::Cown, &ffi_type_pointer};
+        case TypeTag::Native:
+          return {ValueType::Native, &ffi_type_pointer};
         case TypeTag::Ref:
           return {ValueType::Dyn, &ffi_type_value};
         case TypeTag::Union:
@@ -342,6 +344,12 @@ namespace vbci
     return is_complex(type_id) && (complex_type(type_id).tag == TypeTag::Cown);
   }
 
+  bool Program::is_native(uint32_t type_id)
+  {
+    return is_complex(type_id) &&
+      (complex_type(type_id).tag == TypeTag::Native);
+  }
+
   bool Program::is_union(uint32_t type_id)
   {
     return is_complex(type_id) && (complex_type(type_id).tag == TypeTag::Union);
@@ -371,6 +379,16 @@ namespace vbci
     auto& t = complex_type(type_id);
 
     if (t.tag != TypeTag::Cown)
+      Value::error(Error::BadType);
+
+    return t.children.at(0);
+  }
+
+  uint32_t Program::unnative(uint32_t type_id)
+  {
+    auto& t = complex_type(type_id);
+
+    if (t.tag != TypeTag::Native)
       Value::error(Error::BadType);
 
     return t.children.at(0);
@@ -1136,6 +1154,7 @@ namespace vbci
           return;
 
         case TypeTag::Cown:
+        case TypeTag::Native:
           return;
       }
     };
@@ -1200,6 +1219,7 @@ namespace vbci
     {
       case TypeTag::Array:
       case TypeTag::Cown:
+      case TypeTag::Native:
       {
         t.children.push_back(uleb(pc));
         break;

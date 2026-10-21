@@ -61,6 +61,7 @@ namespace vbci
       Object* obj;
       Array* arr;
       Cown* cown;
+      NativeState* native;
       CallbackClosure* callback;
       Err err;
       Function* func;
@@ -94,6 +95,7 @@ namespace vbci
     explicit Value(Object* obj, bool ro);
     explicit Value(Array* arr);
     explicit Value(Cown* cown);
+    explicit Value(NativeState* native);
     explicit Value(CallbackClosure* callback);
     explicit Value(uint64_t idx, FrameId frame);
     explicit Value(Object* obj, size_t f, bool ro);
@@ -139,6 +141,7 @@ namespace vbci
     bool is_array() const;
     bool is_function() const;
     bool is_cown() const;
+    bool is_native() const;
     bool is_error() const;
     bool get_bool() const;
     int32_t get_i32() const;
@@ -151,6 +154,7 @@ namespace vbci
     Value remap_reference(Header* base) const;
     Object* get_object() const;
     Cown* get_cown() const;
+    NativeState* get_native() const;
     CallbackClosure* get_callback() const;
     Array* get_array() const;
     Function* function() const;
@@ -324,6 +328,9 @@ namespace vbci
 
         case ValueType::Cown:
           return Value(cown == v.cown);
+
+        case ValueType::Native:
+          return Value(native == v.native);
 
         case ValueType::Callback:
           return Value(callback == v.callback);
@@ -798,6 +805,9 @@ namespace vbci
         case ValueType::Cown:
           return reinterpret_cast<size_t>(cown);
 
+        case ValueType::Native:
+          return reinterpret_cast<size_t>(native);
+
         case ValueType::Callback:
           return reinterpret_cast<size_t>(callback);
 
@@ -939,6 +949,8 @@ namespace vbci
         return os << "Array";
       case ValueType::Cown:
         return os << "Cown";
+      case ValueType::Native:
+        return os << "Native";
       case ValueType::Callback:
         return os << "Callback";
       case ValueType::RegisterRef:

@@ -19,6 +19,7 @@
 #include "header.h"
 #include "header_queue.h"
 #include "mutable_cycle_candidates.h"
+#include "native_state.h"
 #include "object.h"
 #include "traverse.h"
 
@@ -39,7 +40,8 @@ namespace vbci
       if (type_id == +ValueType::Callback)
         return false;
 
-      return !Program::get().is_cown(type_id);
+      auto& program = Program::get();
+      return !program.is_cown(type_id) && !program.is_native(type_id);
     }
 
     void enqueue_mutable(Header* header)
@@ -146,7 +148,9 @@ namespace vbci
         if (!identities_to_finalize.empty())
         {
           auto* header = identities_to_finalize.pop();
-          if (header->get_type_id() == +ValueType::Callback)
+          auto type_id = header->get_type_id();
+
+          if (type_id == +ValueType::Callback)
           {
             auto* callback = static_cast<CallbackClosure*>(header);
             LOG(Trace) << "Finalizing callback: "
@@ -159,7 +163,20 @@ namespace vbci
             continue;
           }
 
-          assert(Program::get().is_cown(header->get_type_id()));
+          if (Program::get().is_native(type_id))
+          {
+            auto* native = static_cast<NativeState*>(header);
+            LOG(Trace) << "Finalizing native state: "
+                       << static_cast<void*>(native);
+            native->finalize();
+            drain_batch();
+            LOG(Trace) << "Deleting work item: "
+                       << static_cast<void*>(native);
+            native->destroy();
+            continue;
+          }
+
+          assert(Program::get().is_cown(type_id));
           auto* cown = static_cast<Cown*>(header);
           LOG(Trace) << "Finalizing cown: " << static_cast<void*>(cown);
           cown->finalize();

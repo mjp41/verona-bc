@@ -53,6 +53,7 @@ namespace vir
   inline const auto Array = TokenDef("array");
   inline const auto Ref = TokenDef("ref");
   inline const auto Cown = TokenDef("cown");
+  inline const auto Native = TokenDef("native");
 
   // Op codes.
   inline const auto Const = TokenDef("const");
@@ -66,6 +67,8 @@ namespace vir
   inline const auto Drop = TokenDef("drop");
   inline const auto AtTeardown = TokenDef("atteardown");
   inline const auto Freeze = TokenDef("freeze");
+  inline const auto NewNative = TokenDef("newnative");
+  inline const auto NativeWith = TokenDef("nativewith");
   inline const auto FFIStruct = TokenDef("ffistruct");
   inline const auto FFILoad = TokenDef("ffiload");
   inline const auto FFIStore = TokenDef("ffistore");
@@ -219,7 +222,8 @@ namespace vir
   inline const auto wfFloatType = F32 | F64;
   inline const auto wfPrimitiveType =
     None | Bool | wfIntType | wfFloatType | Ptr | Callback;
-  inline const auto wfBuiltinType = wfPrimitiveType | Array | Ref | Cown;
+  inline const auto wfBuiltinType =
+    wfPrimitiveType | Array | Ref | Cown | Native;
   inline const auto wfType =
     wfBuiltinType | Dyn | ClassId | TypeId | Union | TupleType;
 
@@ -239,12 +243,12 @@ namespace vir
 
   inline const auto wfStatement = Source | Offset | Const | ConstStr | Convert |
     Singleton | New | NewArray | NewArrayConst | Copy | Move | Drop |
-    AtTeardown | Freeze | FFIStruct | FFILoad | FFIStore | RegisterRef |
-    FieldRef | ArrayRef | ArrayRefConst | Load | Store | Lookup | Arg | Call |
-    CallDyn | TryCallDyn | FFI | When | WhenDyn | GetRaise | SetRaise |
-    wfBinop | wfUnop | wfNulop | Typetest | MakeCallback | CodePtrCallback |
-    RetainCallback | ReleaseCallback | MemoSlot | ArrayCopy | ArrayFill |
-    ArrayCompare;
+    AtTeardown | Freeze | NewNative | NativeWith | FFIStruct | FFILoad |
+    FFIStore | RegisterRef | FieldRef | ArrayRef | ArrayRefConst | Load |
+    Store | Lookup | Arg | Call | CallDyn | TryCallDyn | FFI | When | WhenDyn |
+    GetRaise | SetRaise | wfBinop | wfUnop | wfNulop | Typetest | MakeCallback |
+    CodePtrCallback | RetainCallback | ReleaseCallback | MemoSlot | ArrayCopy |
+    ArrayFill | ArrayCompare;
 
   inline const auto wfTerminator =
     Tailcall | TailcallDyn | Return | Raise | Cond | Jump;
@@ -267,6 +271,7 @@ namespace vir
     | (Array <<= (Type >>= wfType))
     | (Ref <<= (Type >>= wfType))
     | (Cown <<= (Type >>= wfType))
+    | (Native <<= (Type >>= wfType))
     | (Union <<= wfType++)
     | (TupleType <<= wfType++[2])
     | (Lib <<= String * Symbols)
@@ -306,6 +311,9 @@ namespace vir
     | (Drop <<= LocalId)
     | (AtTeardown <<= LocalId)
     | (Freeze <<= wfDst * wfSrc)
+    | (NewNative <<= wfDst * wfSrc * Native)
+    | (NativeWith <<=
+        wfDst * wfLhs * wfRhs * (Type >>= wfType) * MethodId)
     | (FFIStruct <<= wfDst * (Type >>= wfType))
     | (FFILoad <<= wfDst * wfLhs * wfRhs * wfKind * (Type >>= wfType))
     | (FFIStore <<=

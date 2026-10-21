@@ -5,7 +5,7 @@ namespace virc
   const auto wfParserTokens = Lib | Type | Primitive | Class | Func | Memo |
     Vars | Source | GlobalId | LocalId | LabelId | Equals | LParen | RParen |
     LBracket | RBracket | Comma | Colon | Union | TupleType | Vararg |
-    wfPrimitiveType | Dyn | Ref | Cown | wfStatement | wfTerminator |
+    wfPrimitiveType | Dyn | Ref | Cown | Native | wfStatement | wfTerminator |
     wfLiteral | String | RawString;
 
   // clang-format off
@@ -57,6 +57,7 @@ namespace virc
         "callback\\b" >> [](auto& m) { m.add(Callback); },
         "dyn\\b" >> [](auto& m) { m.add(Dyn); },
         "cown\\b" >> [](auto& m) { m.add(Cown); },
+        "native\\b" >> [](auto& m) { m.add(Native); },
         "tuple\\b" >> [](auto& m) { m.add(TupleType); },
 
         // Op codes.
@@ -68,6 +69,8 @@ namespace virc
         "drop\\b" >> [](auto& m) { m.add(Drop); },
         "atteardown\\b" >> [](auto& m) { m.add(AtTeardown); },
         "freeze\\b" >> [](auto& m) { m.add(Freeze); },
+        "newnative\\b" >> [](auto& m) { m.add(NewNative); },
+        "nativewith\\b" >> [](auto& m) { m.add(NativeWith); },
         "ffistruct\\b" >> [](auto& m) { m.add(FFIStruct); },
         "ffiload\\b" >> [](auto& m) { m.add(FFILoad); },
         "ffistore\\b" >> [](auto& m) { m.add(FFIStore); },

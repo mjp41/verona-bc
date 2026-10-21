@@ -146,10 +146,12 @@ namespace vbci
     bool is_tuple(uint32_t type_id);
     bool is_ref(uint32_t type_id);
     bool is_cown(uint32_t type_id);
+    bool is_native(uint32_t type_id);
     bool is_union(uint32_t type_id);
     bool can_cycle(uint32_t type_id);
     uint32_t unarray(uint32_t type_id);
     uint32_t uncown(uint32_t type_id);
+    uint32_t unnative(uint32_t type_id);
     uint32_t unref(uint32_t type_id);
     uint32_t ref(uint32_t type_id);
     bool subtype(uint32_t sub, uint32_t super);

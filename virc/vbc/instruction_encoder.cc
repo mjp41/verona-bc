@@ -210,6 +210,17 @@ namespace virc::vbc_backend
         {
           output << uleb(+Op::Freeze) << dst(statement) << src(statement);
         }
+        else if (statement == NewNative)
+        {
+          output << uleb(+Op::NewNative) << dst(statement) << src(statement)
+                 << uleb(compilation.type_id(statement / Native));
+        }
+        else if (statement == NativeWith)
+        {
+          output << uleb(+Op::NativeWith) << dst(statement) << lhs(statement)
+                 << rhs(statement)
+                 << mth(statement);
+        }
         else if (statement == RegisterRef)
         {
           output << uleb(+Op::RegisterRef) << dst(statement) << src(statement);

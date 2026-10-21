@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sequent.h"
+
 #include <vir.h>
 
 namespace virc
@@ -84,6 +85,7 @@ namespace virc
       Array >> IRAxiomInvariant(IRSubtype),
       Ref >> IRAxiomInvariant(IRSubtype),
       Cown >> IRAxiomInvariant(IRSubtype),
+      Native >> IRAxiomInvariant(IRSubtype),
 
       TupleType >>
         [](const SequentCtx& ctx, Node& l, Node& r) {

@@ -144,6 +144,7 @@ namespace vbci
 
           case ValueType::Cown:
           case ValueType::Callback:
+          case ValueType::Native:
           {
             auto prev = load(i);
             prev.dec();
@@ -202,6 +203,7 @@ namespace vbci
           case ValueType::ArrayRef:
           case ValueType::Cown:
           case ValueType::Callback:
+          case ValueType::Native:
           case ValueType::Dyn:
             load(i).immortalize();
             break;

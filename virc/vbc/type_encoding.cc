@@ -53,6 +53,9 @@ namespace virc::vbc_backend
         case TypeKind::Cown:
           output << uleb(+TypeTag::Cown);
           break;
+        case TypeKind::Native:
+          output << uleb(+TypeTag::Native);
+          break;
         case TypeKind::Ref:
           output << uleb(+TypeTag::Ref);
           break;

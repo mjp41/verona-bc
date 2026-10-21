@@ -102,7 +102,7 @@ namespace virc
           cls = find_class(src_type);
         else if (is_primitive(src_type))
           cls = find_primitive(src_type);
-        else if (src_type->type().in({Array, Cown, Ref}))
+        else if (src_type->type().in({Array, Cown, Native, Ref}))
         {
           for (auto& child : *top)
           {

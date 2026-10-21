@@ -107,6 +107,8 @@ namespace virc
       AddExternal,
       RemoveExternal,
       Freeze,
+      NewNative,
+      NativeWith,
       MemoSlot,
       ArrayCopy,
       ArrayFill,

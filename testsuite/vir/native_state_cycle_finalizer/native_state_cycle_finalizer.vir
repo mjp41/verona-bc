@@ -1,0 +1,58 @@
+// Releasing a native state collects and finalizes its copied cyclic graph.
+// The source cycle is independent and must not report as the copied graph.
+// Expected exit code: 0.
+
+lib
+  @set_exit_code = "set_exit_code"(i32): none
+
+type @Next = @Node | none
+
+class @Root
+  @next: @Next
+  @copied: bool
+  @post_copy @mark_copied
+  @final @root_final
+
+class @Node
+  @root: @Root
+
+func @mark_copied($self: @Root): none
+  $copied_ref = ref $self @copied
+  $true = const bool true
+  $_old = store $copied_ref $true
+  $_none = const none
+  ret $_none
+
+func @root_final($self: @Root): none
+  $copied_ref = ref $self @copied
+  $copied = load $copied_ref
+  cond $copied ^copied_graph ^done
+
+^copied_graph
+  $success = const i32 0
+  $_set = ffi @set_exit_code($success)
+  jump ^done
+
+^done
+  $_none = const none
+  ret $_none
+
+func @main(): none
+  $not_finalized = const i32 99
+  $_initial = ffi @set_exit_code($not_finalized)
+
+  $none = const none
+  $false = const bool false
+  $root = new @Root($none, $false)
+  $node = new @Node($root)
+  $next_ref = ref $root @next
+  $node_for_store = copy $node
+  $_old = store $next_ref $node_for_store
+  drop $next_ref
+  drop $node
+
+  $native = newnative $root : @Root
+  drop $native
+
+  $_none = const none
+  ret $_none

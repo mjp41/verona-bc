@@ -3,6 +3,7 @@
 #include "array.h"
 #include "callback.h"
 #include "cown.h"
+#include "native_state.h"
 #include "object.h"
 #include "platform.h"
 #include "program.h"
@@ -61,6 +62,7 @@ namespace vbci
 
   Value::Value(Array* arr) : arr(arr), tag(ValueType::Array), readonly(0) {}
   Value::Value(Cown* cown) : cown(cown), tag(ValueType::Cown) {}
+  Value::Value(NativeState* native) : native(native), tag(ValueType::Native) {}
   Value::Value(CallbackClosure* callback)
   : callback(callback), tag(ValueType::Callback)
   {}
@@ -230,6 +232,12 @@ namespace vbci
           value.tag = ValueType::Invalid;
         break;
 
+      case ValueType::Native:
+        value.native = *reinterpret_cast<NativeState**>(v);
+        if (value.native == nullptr)
+          value.tag = ValueType::Invalid;
+        break;
+
       case ValueType::Callback:
         value.callback = *reinterpret_cast<CallbackClosure**>(v);
         if (value.callback == nullptr)
@@ -331,6 +339,10 @@ namespace vbci
         *reinterpret_cast<Cown**>(v) = cown;
         break;
 
+      case ValueType::Native:
+        *reinterpret_cast<NativeState**>(v) = native;
+        break;
+
       case ValueType::Callback:
         *reinterpret_cast<CallbackClosure**>(v) = callback;
         break;
@@ -353,6 +365,9 @@ namespace vbci
 
       case ValueType::Cown:
         return cown->get_type_id();
+
+      case ValueType::Native:
+        return native->get_type_id();
 
       case ValueType::Callback:
         return +ValueType::Callback;
@@ -425,6 +440,11 @@ namespace vbci
   bool Value::is_cown() const
   {
     return tag == ValueType::Cown;
+  }
+
+  bool Value::is_native() const
+  {
+    return tag == ValueType::Native;
   }
 
   bool Value::is_error() const
@@ -543,6 +563,14 @@ namespace vbci
     return cown;
   }
 
+  NativeState* Value::get_native() const
+  {
+    if (tag != ValueType::Native)
+      Value::error(Error::BadConversion);
+
+    return native;
+  }
+
   CallbackClosure* Value::get_callback() const
   {
     if (tag != ValueType::Callback)
@@ -651,6 +679,9 @@ namespace vbci
 
       case ValueType::Cown:
         return &cown;
+
+      case ValueType::Native:
+        return &native;
 
       case ValueType::Callback:
         return &callback;
@@ -773,6 +804,10 @@ namespace vbci
         cown->inc();
         break;
 
+      case ValueType::Native:
+        native->inc();
+        break;
+
       case ValueType::Callback:
         callback->inc();
         break;
@@ -808,6 +843,10 @@ namespace vbci
         cown->dec();
         break;
 
+      case ValueType::Native:
+        native->dec();
+        break;
+
       case ValueType::Callback:
         callback->dec();
         break;
@@ -832,6 +871,9 @@ namespace vbci
       case ValueType::Cown:
       case ValueType::CownRef:
         return cown->state();
+
+      case ValueType::Native:
+        return native->state();
 
       case ValueType::Callback:
         return callback->state();
@@ -1041,6 +1083,9 @@ namespace vbci
 
       case ValueType::Cown:
         return cown->to_string();
+
+      case ValueType::Native:
+        return native->to_string();
 
       case ValueType::Callback:
         return std::format("callback: {}", static_cast<void*>(callback));
