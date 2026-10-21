@@ -212,6 +212,7 @@ _builtin/
   isize.v         isize — pointer-width signed integer
   is.v            is(), isnt(), bits() — identity and raw pointer operations
   nomatch.v       nomatch — sentinel for failed matches
+  native_state.v  native_state[T] — synchronous state for native access
   none.v          none — unit type
   ptr.v           ptr — raw pointer type
   ref.v           ref[T] — mutable reference wrapper

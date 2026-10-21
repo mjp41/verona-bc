@@ -341,32 +341,45 @@ Used to pass C function pointers and opaque handles through FFI. See [FFI §17.7
 
 ---
 
-## 22.12 `callback`
+## 22.12 `native_state[T]`
 
-C-compatible function pointer wrapper. Defined in `_builtin/ffi/callback.v`:
-
-```verona
-callback
-{
-  create[T](callable: T): callback    // wrap a Verona callable
-  apply(self: callback): ptr          // get the C function pointer
-  free(self: callback): none          // free the closure
-}
-```
+Synchronous, reference-counted state shared by native callbacks. Defined in
+`_builtin/native_state.v`:
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `create[T]` | `create(callable: T): callback` | Wrap a callable (lambda, object with `apply`) in a C closure |
-| `apply` | `apply(self): ptr` | Get the C-compatible function pointer |
-| `free` | `free(self): none` | Free the underlying `libffi` closure |
+| `create` | `create(value: T): native_state[T]` | Deep-copy `value` behind a new native state handle |
+| `with` | `with[R](self, handler: T->R): R` | Copy the handler in, invoke it synchronously with the contained `T`, and copy the result out |
 
-Constructor sugar: `callback(my_lambda)` calls `callback::create(my_lambda)`.
+Constructor sugar allows `native_state(value)`. Copying the resulting handle
+shares the same identity. The contained root is stable; use an explicit mutable
+wrapper inside `T` when whole-root replacement is required. See
+[FFI §17.9](17-ffi.md).
+
+---
+
+## 22.13 `ffi::callback[T]`
+
+C-compatible function pointer wrapper. Defined in `_builtin/ffi/callback.v`:
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `create` | `create(): callback[T]` | Create an empty callback owner |
+| `create` | `create(callable: T): callback[T]` | Deep-copy a callable into a C closure |
+| `bind` | `bind(self, callable: T): callback[T]` | Replace the owned closure with a copy of `callable` |
+| `raw` | `raw(self): ptr` | Get the C-compatible function pointer |
+| `retain` | `retain(self): ptr` | Retain the closure and return an opaque release handle |
+| `release` | `release(self, handle: ptr): none` | Release one opaque retention |
+
+The callback object releases its closure automatically when finalized.
+Constructor sugar is `ffi::callback(callable)`. A raw function pointer remains
+valid only while a callback object or retained handle keeps its closure alive.
 
 See [FFI §17.7](17-ffi.md) for full callback documentation.
 
 ---
 
-## 22.13 FFI Module Functions
+## 22.14 FFI Module Functions
 
 Free functions in `_builtin/ffi/`:
 
@@ -381,7 +394,7 @@ See [FFI §17.8](17-ffi.md) for external resource management details.
 
 ---
 
-## 22.14 Identity Functions
+## 22.15 Identity Functions
 
 Free functions in `_builtin/is.v`:
 

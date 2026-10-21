@@ -205,7 +205,7 @@ Key points:
 The `_builtin/ffi/` directory defines wrapper functions for common FFI operations. Because `_builtin` is always imported and `ffi/` is a nested scope, these functions are accessed via `ffi::`:
 
 ```verona
-ffi::external.add;                    // call add_external from _builtin/ffi/notify.v
+ffi::external.add;                    // wrapper from _builtin/ffi/external.v
 let cb = ffi::callback(my_lambda);    // callback from _builtin/ffi/callback.v
 ```
 

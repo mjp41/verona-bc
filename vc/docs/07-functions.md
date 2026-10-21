@@ -353,4 +353,4 @@ external
 }
 ```
 
-This pattern (from `_builtin/ffi/notify.v`) creates a single shared instance with a cown field. All callers of `ffi::external()` get the same instance.
+This pattern (from `_builtin/ffi/external.v`) creates a single shared instance with a cown field. All callers of `ffi::external()` get the same instance.

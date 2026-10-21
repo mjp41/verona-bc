@@ -114,8 +114,8 @@ This table summarizes the common user-visible categories; it is not exhaustive.
 | **Conversion** | `convi8`, `convi16`, `convi32`, `convi64`, `convu8`, `convu16`, `convu32`, `convu64`, `convf32`, `convf64`, `convilong`, `convulong`, `convisize`, `convusize` |
 | **Identity** | `eq` (pointer), `ne` (pointer), `bits` |
 | **Constants** | `none`, `e`, `pi`, `inf`, `nan` |
-| **Memory** | `len`, `ptr`, `read`, `arrayref`, `newarray` |
-| **Callback** | `make_callback`, `free_callback` |
+| **Memory** | `len`, `ptr`, `read`, `arrayref`, `newarray`, `newnative`, `nativewith` |
+| **Callback** | `make_callback`, `codeptr_callback`, `retain_callback`, `release_callback` |
 | **External** | `add_external`, `remove_external` |
 
 ---
@@ -181,7 +181,14 @@ Strings are Verona objects containing a `data: array[u8]` field, so to pass stri
 
 ### Memory Ownership
 
-Memory allocated by Verona (objects, arrays, strings) is managed by Verona's region system. Memory allocated by C code is **not** tracked by Verona. If a C function returns a pointer to allocated memory, Verona will store it as a `ptr` but will not free it — the C side is responsible for cleanup.
+Memory allocated by Verona is managed by reference counting and mutable-cycle
+collection. Memory allocated by C is not tracked by Verona. If C returns an
+allocated pointer, Verona stores it as a `ptr` but does not free it; the C side
+remains responsible for cleanup.
+
+Passing an object or array pointer to a synchronous FFI call borrows that
+storage for the call. Retaining an interior pointer after return requires the
+`native_state[T]` contract in §17.9.
 
 ### Thread Safety
 
@@ -190,8 +197,9 @@ Calls made by an FFI initializer run synchronously during startup. Native code
 that invokes a Verona callback runs that callback synchronously on the calling
 thread. Independent `when` blocks may call the same FFI function concurrently,
 potentially on different threads. Verona does not add synchronization around
-FFI calls — the external library must be thread-safe, or accesses must be
-serialized through a shared cown.
+FFI calls. Ordinary external libraries must be thread-safe or called through a
+shared cown. Native callbacks sharing a `native_state[T]` must be serialized by
+the native library as described in §17.9.
 
 ---
 
@@ -311,15 +319,20 @@ let fptr = cb.raw;
 
 | Operation | Description |
 |-----------|-------------|
+| `ffi::callback[T]()` | Create an empty callback owner |
 | `ffi::callback(callable)` | Create a callback wrapping `callable` (constructor sugar for `ffi::callback[T]::create`) |
+| `cb.bind(callable)` | Replace the owned closure with a copy of `callable` |
 | `cb.raw` | Get the C function pointer as `ptr` |
+| `cb.retain` | Retain the closure and return an opaque release handle |
+| `cb.release(handle)` | Release one opaque retention after native use ends |
 
 ### Under the Hood
 
-`ffi::callback[T]::create` calls `:::make_callback(callable)`, which uses
-`libffi` to create a closure. The closure captures the Verona callable and
-presents a C-compatible function pointer. Calling that function pointer from C
-invokes the Verona lambda synchronously on the calling thread.
+`ffi::callback[T]::create` calls `:::make_callback(callable)`, which deep-copies
+the callable graph and stores the copy in a reference-counted `libffi` closure.
+The source callable remains independently usable. Calling the C-compatible
+function pointer invokes the copied callable synchronously on the calling
+thread.
 
 ### Example: Passing a Callback to C
 
@@ -339,16 +352,16 @@ main(): i32
 }
 ```
 
-Passing `handler.raw` does not retain `handler`. If native code stores the
-function pointer for later use, the Verona program must keep the callback object
-alive until the handler is deregistered. The current FFI has no general
-foreign-retention operation, so wrappers must not retain callback pointers
-unless the callback is held by a process-lifetime Verona value. A dedicated
-callback owner is planned for shorter native lifetimes. Native code may invoke
-the same callback concurrently on multiple calling threads; Verona does not
-serialize those invocations, so captured state must be safe for that access
-pattern. Asynchronous native resources should also use the external-resource
-tracking wrappers described below.
+Passing `handler.raw` does not itself retain `handler`. If native code stores
+the function pointer, a Verona owner must keep the callback object reachable
+until native deregistration is acknowledged, or `retain` must create an
+explicit native retention. A `native_state[T]` context can own callback objects
+for this purpose. Replacing those callback fields after acknowledgement
+releases the closures and their copied callable graphs.
+
+Callback invocation borrows the closure. Native code must keep either the
+callback object or an explicit retained handle alive for the complete call. It
+must not release the last owner while an invocation is in flight.
 
 ---
 
@@ -372,8 +385,9 @@ The runtime tracks "external resources" — things outside the Verona scheduler'
 - **`ffi::external.remove`** — Tells the scheduler an external resource has been released.
 
 External-resource tracking affects scheduler quiescence only. It does not keep
-a Verona object, array, cown, or callback alive. A separate explicit ownership
-mechanism is required before native code can retain such values.
+a Verona object, array, cown, or callback alive. Callback objects and retained
+callback handles own closures. `native_state[T]` can own callback objects and
+buffers used by a native operation.
 
 ### Raw Struct Layout Helpers
 
@@ -403,8 +417,8 @@ Allowed field types are the FFI-compatible leaf types: primitive scalars, `ptr`,
 
 Verona-managed pointer-like values loaded from or stored into foreign memory
 are borrowed for the synchronous FFI interaction. Native code must not retain
-them after the call returns. Explicit retained-buffer and callback-owner APIs
-will define asynchronous lifetimes separately.
+them after the call returns unless an explicit owner, such as a
+`native_state[T]` context, defines and maintains that asynchronous lifetime.
 
 The `external` class is a singleton (using `once create()`) that serializes add/remove operations through an internal cown. The dot syntax `ffi::external.add` auto-calls `create()` to get the singleton and then dispatches `.add` on it. See [Functions §7.10](07-functions.md) for more on `once` functions.
 
@@ -414,6 +428,81 @@ Each `.v` file in `_builtin/ffi/` defines either a class (like `callback`, `exte
 
 The wrappers internally use `:::` builtins:
 - `ffi::callback[T]::create` uses `:::make_callback`
+- `ffi::callback[T]::raw` uses `:::codeptr_callback`
+- `ffi::callback[T]::retain` and `release` use `:::retain_callback` and
+  `:::release_callback`
 - `external` uses `once create()` for singleton initialization and serializes `:::add_external`/`:::remove_external` through an internal cown
 - `add_external` and `remove_external` call their corresponding `:::` builtins
 - `struct[A]` uses `:::ffistruct[A]`, `:::ffiload[B]`, and `:::ffistore[B]`
+
+---
+
+## 17.9 Native Callback State
+
+`native_state[T]` is a synchronous shared state handle for foreign callbacks:
+
+```verona
+callback_state
+{
+  count: u64;
+  buffer: array[u8];
+}
+
+let context = native_state(callback_state(0, ::(u8 0)));
+
+let handler = ffi::callback (_event: u64): none ->
+{
+  context.with[none] state ->
+  {
+    state.count = state.count + 1
+  };
+};
+```
+
+| Operation | Semantics |
+|-----------|-----------|
+| `native_state(value)` | Deep-copy `value` into a new reference-counted native state handle |
+| `context.with[R](handler)` | Copy `handler` in, invoke it synchronously with the contained `T`, and copy its `R` result out |
+| copying `context` | Share the same native state identity |
+
+The contained root is stable: the handler receives `T`, not `ref[T]`. It may
+mutate objects and arrays reachable from `T`, but cannot directly replace the
+root. Use an explicit wrapper such as `native_state[cell[T]]` when whole-root
+replacement is required.
+
+Handler captures are copied before invocation. Mutable values returned by the
+handler are copied out, so callers do not gain aliases into native state.
+Values copied from handler captures into state likewise do not alias the
+caller's originals.
+
+`with` does not lock. The native library is responsible for serializing every
+callback and access that shares a context, including different callback
+functions. Same-context reentrancy is initially prohibited by contract.
+
+### Retained Interior Pointers
+
+Native code may retain a pointer into state such as `state.buffer` only under an
+explicitly unsafe wrapper contract:
+
+1. the native state must keep the complete path to the allocation reachable;
+2. Verona code must not replace, remove, resize, or otherwise relocate that
+   allocation;
+3. the restriction lasts until native code acknowledges that it has released
+   the pointer.
+
+This is not statically checked. Wrapper design is responsible for enforcing the
+invariant.
+
+### Asynchronous Lifecycle
+
+An asynchronous wrapper must coordinate three separate lifetimes:
+
+1. call `ffi::external.add` before native work can outlive scheduler work;
+2. keep retained buffers and callback objects reachable from the shared native
+   context;
+3. after native deregistration/close acknowledgement, clear callback fields and
+   call `ffi::external.remove`.
+
+`ffi::external` affects scheduler liveness only; it does not retain the native
+state, arrays, or callbacks. The native library must not invoke a callback
+after acknowledging deregistration.

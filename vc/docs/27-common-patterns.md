@@ -286,7 +286,7 @@ use "eventlib"
 
 main(): i32
 {
-  let handler = callback((): none -> { /* handle event */ });
+  let handler = ffi::callback (): none -> { /* handle event */ };
   :::set_handler(handler.raw);
   // ... use the library ...
   :::clear_handler();
@@ -295,8 +295,9 @@ main(): i32
 ```
 
 Key points:
-- `callback(lambda)` creates a C-compatible closure (constructor sugar for `callback::create`).
+- `ffi::callback(lambda)` creates a C-compatible closure containing a deep copy of the callable.
 - `.raw` returns the `ptr` to pass to C.
+- Keep the callback object reachable until native code acknowledges deregistration.
 
 See [FFI §17.7](17-ffi.md) for full callback documentation.
 
@@ -327,7 +328,35 @@ The scheduler will not exit while external resources remain. See [FFI §17.8](17
 
 ---
 
-## 27.15 Global Singleton with `once`
+## 27.15 Shared Native Callback Context
+
+Use `native_state[T]` when multiple serialized native callbacks need the same
+mutable state:
+
+```verona
+state
+{
+  count: u64;
+  buffer: array[u8];
+}
+
+let context = native_state(state(0, ::(u8 0)));
+let callback = ffi::callback (_event: u64): none ->
+{
+  context.with[none] shared ->
+  {
+    shared.count = shared.count + 1
+  };
+};
+```
+
+The native library must serialize every callback sharing `context`. If it
+retains the buffer, the wrapper must keep `state.buffer` reachable and unchanged
+until native release acknowledgement. See [FFI §17.9](17-ffi.md).
+
+---
+
+## 27.16 Global Singleton with `once`
 
 Use `once` to create a global singleton that is initialized before `main()`:
 
@@ -350,4 +379,4 @@ main(): i32
 }
 ```
 
-This pattern is commonly used in `_builtin/ffi/` for managing external resource state (e.g., the `external` class in `notify.v`). See [Functions §7.10](07-functions.md).
+This pattern is commonly used in `_builtin/ffi/` for managing external resource state (e.g., the `external` class in `external.v`). See [Functions §7.10](07-functions.md).
