@@ -3,7 +3,7 @@ bad array index
   |   $_bad_ref = ref $array $one
   |   ^
 Stack trace:
-  at @mutate_then_error (pc=431)
+  at @mutate_then_error (pc=432)
  --> copy_cown_commit.vir:82:3
   |   $_bad_ref = ref $array $one
   |   ^

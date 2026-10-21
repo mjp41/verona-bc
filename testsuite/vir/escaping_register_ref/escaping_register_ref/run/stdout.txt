@@ -3,7 +3,7 @@ bad store
   |   $previous = store $holder_ref $register_ref
   |   ^
 Stack trace:
-  at @main (pc=104)
+  at @main (pc=105)
  --> escaping_register_ref.vir:18:3
   |   $previous = store $holder_ref $register_ref
   |   ^
