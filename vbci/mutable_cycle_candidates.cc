@@ -340,7 +340,7 @@ namespace vbci
 
         void enqueue_zero(Header* representative)
         {
-          auto& slot = representative_trial(representative);
+          [[maybe_unused]] auto& slot = representative_trial(representative);
           assert(slot.trial_rc() == 0);
           zero.push(representative);
         }
@@ -480,7 +480,7 @@ namespace vbci
             if (slot.rc == 0 || !trial(index).is_unvisited())
               continue;
 
-            auto state = slot.header->state();
+            [[maybe_unused]] auto state = slot.header->state();
             assert(state.is_mutable_cycle_candidate());
             assert(state.mutable_cycle_candidate_index() == index);
 

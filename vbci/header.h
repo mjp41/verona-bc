@@ -129,13 +129,14 @@ namespace vbci
 
       if (state.is_shared())
       {
-        auto previous = header_state.increment_shared_count();
+        [[maybe_unused]] auto previous =
+          header_state.increment_shared_count();
         assert(previous > 0);
         return;
       }
 
       assert(state.is_mutable());
-      auto previous = header_state.increment_count();
+      [[maybe_unused]] auto previous = header_state.increment_count();
       assert(previous > 0);
     }
 
