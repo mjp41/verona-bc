@@ -1,0 +1,13 @@
+bad store
+ --> freeze_immutable.v:17:3
+  |   frozen.value = 2;
+  |   ^
+Stack trace:
+  at @main (pc=170)
+ --> freeze_immutable.v:17:3
+  |   frozen.value = 2;
+  |   ^
+bad store
+ --> freeze_immutable.v:17:3
+  |   frozen.value = 2;
+  |   ^
