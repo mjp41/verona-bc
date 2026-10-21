@@ -48,6 +48,7 @@ namespace vir
   inline const auto ISize = TokenDef("isize");
   inline const auto USize = TokenDef("usize");
   inline const auto Ptr = TokenDef("ptr");
+  inline const auto Callback = TokenDef("callback");
   inline const auto Dyn = TokenDef("dyn");
   inline const auto Array = TokenDef("array");
   inline const auto Ref = TokenDef("ref");
@@ -142,7 +143,8 @@ namespace vir
   // Callback operations.
   inline const auto MakeCallback = TokenDef("makecallback");
   inline const auto CodePtrCallback = TokenDef("codeptrcallback");
-  inline const auto FreeCallback = TokenDef("freecallback");
+  inline const auto RetainCallback = TokenDef("retaincallback");
+  inline const auto ReleaseCallback = TokenDef("releasecallback");
   inline const auto AddExternal = TokenDef("addexternal");
   inline const auto RemoveExternal = TokenDef("removeexternal");
 
@@ -216,7 +218,7 @@ namespace vir
     I8 | I16 | I32 | I64 | U8 | U16 | U32 | U64 | ILong | ULong | ISize | USize;
   inline const auto wfFloatType = F32 | F64;
   inline const auto wfPrimitiveType =
-    None | Bool | wfIntType | wfFloatType | Ptr;
+    None | Bool | wfIntType | wfFloatType | Ptr | Callback;
   inline const auto wfBuiltinType = wfPrimitiveType | Array | Ref | Cown;
   inline const auto wfType =
     wfBuiltinType | Dyn | ClassId | TypeId | Union | TupleType;
@@ -241,7 +243,8 @@ namespace vir
     FieldRef | ArrayRef | ArrayRefConst | Load | Store | Lookup | Arg | Call |
     CallDyn | TryCallDyn | FFI | When | WhenDyn | GetRaise | SetRaise |
     wfBinop | wfUnop | wfNulop | Typetest | MakeCallback | CodePtrCallback |
-    FreeCallback | MemoSlot | ArrayCopy | ArrayFill | ArrayCompare;
+    RetainCallback | ReleaseCallback | MemoSlot | ArrayCopy | ArrayFill |
+    ArrayCompare;
 
   inline const auto wfTerminator =
     Tailcall | TailcallDyn | Return | Raise | Cond | Jump;
@@ -389,7 +392,8 @@ namespace vir
     | (RemoveExternal <<= wfDst)
     | (MakeCallback <<= wfDst * wfSrc)
     | (CodePtrCallback <<= wfDst * wfSrc)
-    | (FreeCallback <<= wfDst * wfSrc)
+    | (RetainCallback <<= wfDst * wfSrc)
+    | (ReleaseCallback <<= wfDst * wfSrc)
     | (ArrayCopy <<= wfDst * Args)
     | (ArrayFill <<= wfDst * Args)
     | (ArrayCompare <<= wfDst * Args)

@@ -39,6 +39,7 @@ namespace vbci
   struct Object;
   struct Array;
   struct Cown;
+  struct CallbackClosure;
   struct Function;
   struct Program;
 

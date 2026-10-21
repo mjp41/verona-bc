@@ -873,9 +873,11 @@ namespace vc
         // Other single-arg builtin operations (already a LocalId after earlier
         // rules extract expressions to locals).
         In(Expr, Lhs) *
-              T(MakeCallback,
+              T(
+                MakeCallback,
                 CodePtrCallback,
-                FreeCallback)[Lhs]
+                RetainCallback,
+                ReleaseCallback)[Lhs]
             << (T(Args) << (T(Arg) << (T(ArgCopy) * T(LocalId)[Rhs]))) >>
           [](Match& _) {
             auto id = _.fresh(l_local);

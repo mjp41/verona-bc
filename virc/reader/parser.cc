@@ -54,6 +54,7 @@ namespace virc
         "isize\\b" >> [](auto& m) { m.add(ISize); },
         "usize\\b" >> [](auto& m) { m.add(USize); },
         "ptr\\b" >> [](auto& m) { m.add(Ptr); },
+        "callback\\b" >> [](auto& m) { m.add(Callback); },
         "dyn\\b" >> [](auto& m) { m.add(Dyn); },
         "cown\\b" >> [](auto& m) { m.add(Cown); },
         "tuple\\b" >> [](auto& m) { m.add(TupleType); },
@@ -143,7 +144,8 @@ namespace virc
         "read\\b" >> [](auto& m) { m.add(Read); },
         "makecallback\\b" >> [](auto& m) { m.add(MakeCallback); },
         "codeptrcallback\\b" >> [](auto& m) { m.add(CodePtrCallback); },
-        "freecallback\\b" >> [](auto& m) { m.add(FreeCallback); },
+        "retaincallback\\b" >> [](auto& m) { m.add(RetainCallback); },
+        "releasecallback\\b" >> [](auto& m) { m.add(ReleaseCallback); },
 
         // Constants.
         "e\\b" >> [](auto& m) { m.add(Const_E); },

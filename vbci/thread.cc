@@ -877,8 +877,8 @@ namespace vbc
         return os << "MakeCallback";
       case Op::CodePtrCallback:
         return os << "CodePtrCallback";
-      case Op::FreeCallback:
-        return os << "FreeCallback";
+      case Op::RetainCallback:
+        return os << "RetainCallback";
       case Op::AddExternal:
         return os << "AddExternal";
       case Op::RemoveExternal:
@@ -891,6 +891,8 @@ namespace vbc
         return os << "ArrayFill";
       case Op::ArrayCompare:
         return os << "ArrayCompare";
+      case Op::ReleaseCallback:
+        return os << "ReleaseCallback";
       default:
         return os << "Unknown";
     }
@@ -1657,7 +1659,8 @@ namespace vbci
           if (!func)
             Value::error(Error::MethodNotFound);
 
-          auto cc = make_callback(src, func);
+          auto callable = copy_graph(src.borrow());
+          auto cc = make_callback(callable.release().extract(), func);
           dst = ValueTransfer(Value(cc));
         });
         break;
@@ -1666,25 +1669,31 @@ namespace vbci
       case Op::CodePtrCallback:
       {
         process([](Register& dst, const Register& src) INLINE {
-          auto* cc = static_cast<CallbackClosure*>(src->get_ptr());
-
-          if (!cc)
+          if (src->type() == ValueType::None)
             Value::error(Error::BadOperand);
+
+          auto* cc = src->get_callback();
 
           dst = ValueTransfer(Value(cc->code_ptr));
         });
         break;
       }
 
-      case Op::FreeCallback:
+      case Op::RetainCallback:
       {
         process([](Register& dst, const Register& src) INLINE {
-          auto* cc = static_cast<CallbackClosure*>(src->get_ptr());
-
-          if (!cc)
+          if (src->type() == ValueType::None)
             Value::error(Error::BadOperand);
 
-          cc->free();
+          dst = ValueTransfer(Value(retain_callback(src->get_callback())));
+        });
+        break;
+      }
+
+      case Op::ReleaseCallback:
+      {
+        process([](Register& dst, const Register& src) INLINE {
+          release_callback(src->get_ptr());
           dst = ValueImmortal(Value::none());
         });
         break;

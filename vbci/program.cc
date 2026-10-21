@@ -244,6 +244,8 @@ namespace vbci
             sizeof(size_t) == 4 ? &ffi_type_uint32 : &ffi_type_uint64};
         case PrimitiveType::Ptr:
           return {ValueType::Ptr, &ffi_type_pointer};
+        case PrimitiveType::Callback:
+          return {ValueType::Callback, &ffi_type_pointer};
         default:
           break;
       }

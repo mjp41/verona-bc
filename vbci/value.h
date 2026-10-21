@@ -61,6 +61,7 @@ namespace vbci
       Object* obj;
       Array* arr;
       Cown* cown;
+      CallbackClosure* callback;
       Err err;
       Function* func;
     };
@@ -93,6 +94,7 @@ namespace vbci
     explicit Value(Object* obj, bool ro);
     explicit Value(Array* arr);
     explicit Value(Cown* cown);
+    explicit Value(CallbackClosure* callback);
     explicit Value(uint64_t idx, FrameId frame);
     explicit Value(Object* obj, size_t f, bool ro);
     explicit Value(Array* arr, size_t idx, bool ro);
@@ -149,6 +151,7 @@ namespace vbci
     Value remap_reference(Header* base) const;
     Object* get_object() const;
     Cown* get_cown() const;
+    CallbackClosure* get_callback() const;
     Array* get_array() const;
     Function* function() const;
     Function* error_function() const;
@@ -321,6 +324,9 @@ namespace vbci
 
         case ValueType::Cown:
           return Value(cown == v.cown);
+
+        case ValueType::Callback:
+          return Value(callback == v.callback);
 
         case ValueType::RegisterRef:
           return Value(u64 == v.u64);
@@ -792,6 +798,9 @@ namespace vbci
         case ValueType::Cown:
           return reinterpret_cast<size_t>(cown);
 
+        case ValueType::Callback:
+          return reinterpret_cast<size_t>(callback);
+
         case ValueType::RegisterRef:
           return u64;
 
@@ -930,6 +939,8 @@ namespace vbci
         return os << "Array";
       case ValueType::Cown:
         return os << "Cown";
+      case ValueType::Callback:
+        return os << "Callback";
       case ValueType::RegisterRef:
         return os << "RegisterRef";
       case ValueType::FieldRef:

@@ -37,6 +37,7 @@ namespace virc::vbc_backend
   static_assert(+PrimitiveKind::F32 == +PrimitiveType::F32);
   static_assert(+PrimitiveKind::F64 == +PrimitiveType::F64);
   static_assert(+PrimitiveKind::Ptr == +PrimitiveType::Ptr);
+  static_assert(+PrimitiveKind::Callback == +PrimitiveType::Callback);
 
   void encode_type_table(ByteBuffer& output, const std::vector<TypeInfo>& types)
   {

@@ -28,6 +28,7 @@ namespace vbci
     F32,
     F64,
     Ptr,
+    Callback,
     Object,
     Array,
     Cown,
@@ -68,4 +69,5 @@ namespace vbci
   static_assert(+ValueType::F32 == +PrimitiveType::F32);
   static_assert(+ValueType::F64 == +PrimitiveType::F64);
   static_assert(+ValueType::Ptr == +PrimitiveType::Ptr);
+  static_assert(+ValueType::Callback == +PrimitiveType::Callback);
 }

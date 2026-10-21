@@ -14,6 +14,7 @@
 #include "collect.h"
 
 #include "array.h"
+#include "callback.h"
 #include "cown.h"
 #include "header.h"
 #include "header_queue.h"
@@ -30,7 +31,16 @@ namespace vbci
     std::queue<Header*> immutable_work;
     HeaderQueue headers_to_finalize;
     HeaderQueue headers_to_delete;
-    HeaderQueue cowns_to_finalize;
+    HeaderQueue identities_to_finalize;
+
+    bool is_immutable_root(Header* header)
+    {
+      auto type_id = header->get_type_id();
+      if (type_id == +ValueType::Callback)
+        return false;
+
+      return !Program::get().is_cown(type_id);
+    }
 
     void enqueue_mutable(Header* header)
     {
@@ -47,14 +57,13 @@ namespace vbci
     {
       assert(header->state().is_shared());
 
-      if (!Program::get().is_cown(header->get_type_id()))
+      if (is_immutable_root(header))
       {
         immutable_work.push(header);
         return;
       }
 
-      auto* cown = static_cast<Cown*>(header);
-      cowns_to_finalize.push_front(cown);
+      identities_to_finalize.push_front(header);
     }
 
     void drain_batch()
@@ -85,9 +94,7 @@ namespace vbci
 
     HeaderQueue claim_immutable_scc(Header* root)
     {
-      assert(
-        root->state().is_shared() &&
-        !Program::get().is_cown(root->get_type_id()));
+      assert(root->state().is_shared() && is_immutable_root(root));
       root->set_state(HeaderState::finalizing());
       HeaderQueue finalizing;
 
@@ -136,9 +143,24 @@ namespace vbci
           continue;
         }
 
-        if (!cowns_to_finalize.empty())
+        if (!identities_to_finalize.empty())
         {
-          auto* cown = static_cast<Cown*>(cowns_to_finalize.pop());
+          auto* header = identities_to_finalize.pop();
+          if (header->get_type_id() == +ValueType::Callback)
+          {
+            auto* callback = static_cast<CallbackClosure*>(header);
+            LOG(Trace) << "Finalizing callback: "
+                       << static_cast<void*>(callback);
+            callback->finalize();
+            drain_batch();
+            LOG(Trace) << "Deleting work item: "
+                       << static_cast<void*>(callback);
+            callback->destroy();
+            continue;
+          }
+
+          assert(Program::get().is_cown(header->get_type_id()));
+          auto* cown = static_cast<Cown*>(header);
           LOG(Trace) << "Finalizing cown: " << static_cast<void*>(cown);
           cown->finalize();
           drain_batch();

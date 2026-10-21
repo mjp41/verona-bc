@@ -428,7 +428,8 @@ namespace virc
                 USize,
                 F32,
                 F64,
-                Ptr}))
+                Ptr,
+                Callback}))
     {
       return +val(type);
     }

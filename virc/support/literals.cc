@@ -41,6 +41,8 @@ namespace virc
       return PrimitiveKind::USize;
     if (ptype == Ptr)
       return PrimitiveKind::Ptr;
+    if (ptype == Callback)
+      return PrimitiveKind::Callback;
 
     assert(false);
     return PrimitiveKind::None;

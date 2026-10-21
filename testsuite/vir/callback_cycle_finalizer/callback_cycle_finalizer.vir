@@ -1,0 +1,58 @@
+// Releasing a callback collects and finalizes its copied cyclic callable.
+// The source cycle is independent and must not report as the copied graph.
+// Expected exit code: 0.
+
+lib
+  @set_exit_code = "set_exit_code"(i32): none
+
+type @Next = @Callable | none
+
+class @Callable
+  @next: @Next
+  @copied: bool
+  @callback @callable_apply
+  @post_copy @mark_copied
+  @final @callable_final
+
+func @callable_apply($self: @Callable): none
+  $_none = const none
+  ret $_none
+
+func @mark_copied($self: @Callable): none
+  $copied_ref = ref $self @copied
+  $true = const bool true
+  $_old = store $copied_ref $true
+  $_none = const none
+  ret $_none
+
+func @callable_final($self: @Callable): none
+  $copied_ref = ref $self @copied
+  $copied = load $copied_ref
+  cond $copied ^copied_graph ^done
+
+^copied_graph
+  $success = const i32 0
+  $_set = ffi @set_exit_code($success)
+  jump ^done
+
+^done
+  $_none = const none
+  ret $_none
+
+func @main(): none
+  $not_finalized = const i32 99
+  $_initial = ffi @set_exit_code($not_finalized)
+
+  $none = const none
+  $false = const bool false
+  $callable = new @Callable($none, $false)
+  $next_ref = ref $callable @next
+  $callable_for_store = copy $callable
+  $_old = store $next_ref $callable_for_store
+  drop $next_ref
+
+  $callback = makecallback $callable
+  drop $callback
+
+  $_none = const none
+  ret $_none

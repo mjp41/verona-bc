@@ -1,0 +1,44 @@
+// MakeCallback owns a deep copy of its callable.
+// Expected exit code: 0.
+
+lib
+  @call_fn_ptr_ret_u64 = "call_fn_ptr_ret_u64"(ptr, u64): u64
+  @set_exit_code = "set_exit_code"(i32): none
+
+class @Callable
+  @offset: u64
+  @callback @callable_apply
+
+func @callable_apply($self: @Callable, $value: u64): u64
+  $offset_ref = ref $self @offset
+  $offset = load $offset_ref
+  $result = add $value $offset
+  ret $result
+
+func @main(): none
+  $ten = const u64 10
+  $callable = new @Callable($ten)
+  $callback = makecallback $callable
+
+  $offset_ref = ref $callable @offset
+  $twenty = const u64 20
+  $_old = store $offset_ref $twenty
+
+  $code = codeptrcallback $callback
+  $thirty_two = const u64 32
+  $actual = ffi @call_fn_ptr_ret_u64($code, $thirty_two)
+  drop $callback
+
+  $expected = const u64 42
+  $ok = eq $actual $expected
+  cond $ok ^success ^failure
+
+^success
+  $_none = const none
+  ret $_none
+
+^failure
+  $one = const i32 1
+  $_exit = ffi @set_exit_code($one)
+  $_none = const none
+  ret $_none

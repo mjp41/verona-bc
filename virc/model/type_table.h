@@ -25,6 +25,7 @@ namespace virc
     F32,
     F64,
     Ptr,
+    Callback,
   };
 
   inline constexpr size_t operator+(PrimitiveKind value)
@@ -32,7 +33,7 @@ namespace virc
     return static_cast<size_t>(value);
   }
 
-  inline constexpr auto PrimitiveTypeCount = +PrimitiveKind::Ptr + 1;
+  inline constexpr auto PrimitiveTypeCount = +PrimitiveKind::Callback + 1;
 
   enum class TypeKind
   {

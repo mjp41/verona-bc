@@ -281,9 +281,9 @@ namespace vc
 
   inline const auto wfExprDot =
     (wfExprSugar | CallDyn | TryCallDyn | Convert | Binop | Nulop | FFI |
-     NewArray | ArrayRef | MakeCallback | CodePtrCallback | FreeCallback |
-     Freeze | FFIStruct | FFILoad | FFIStore | ArrayCopy | ArrayFill |
-     ArrayCompare) -
+     NewArray | ArrayRef | MakeCallback | CodePtrCallback | RetainCallback |
+     ReleaseCallback | Freeze | FFIStruct | FFILoad | FFIStore | ArrayCopy |
+     ArrayFill | ArrayCompare) -
     Dot - TripleColon;
 
   // clang-format off
@@ -297,7 +297,8 @@ namespace vc
     | (Nulop <<= (MethodId >>= wfNulop) * Args)
     | (MakeCallback <<= Args)
     | (CodePtrCallback <<= Args)
-    | (FreeCallback <<= Args)
+    | (RetainCallback <<= Args)
+    | (ReleaseCallback <<= Args)
     | (Freeze <<= Args)
     | (FFIStruct <<= Type * Args)
     | (FFILoad <<= Type * Args)
@@ -328,8 +329,8 @@ namespace vc
     NewArray | NewArrayConst | Load | Store | Lookup | Call | CallDyn |
     TryCallDyn | Var | When | wfBinop | wfUnop | wfNulop | FFI | Typetest |
     TypeAssertion | GetRaise | SetRaise | SplatOp | ArrayRefFromEnd |
-    MakeCallback | CodePtrCallback | FreeCallback | Freeze | FFIStruct |
-    FFILoad | FFIStore | ArrayCopy | ArrayFill | ArrayCompare;
+    MakeCallback | CodePtrCallback | RetainCallback | ReleaseCallback | Freeze |
+    FFIStruct | FFILoad | FFIStore | ArrayCopy | ArrayFill | ArrayCompare;
 
   // clang-format off
   inline const auto wfPassANF =
@@ -435,7 +436,8 @@ namespace vc
     | (ArrayCompare <<= wfDst * Args)
     | (MakeCallback <<= wfDst * wfSrc)
     | (CodePtrCallback <<= wfDst * wfSrc)
-    | (FreeCallback <<= wfDst * wfSrc)
+    | (RetainCallback <<= wfDst * wfSrc)
+    | (ReleaseCallback <<= wfDst * wfSrc)
     | (Freeze <<= wfDst * wfSrc)
     | (FFIStruct <<= wfDst * (Type >>= wfType))
     | (FFILoad <<= wfDst * wfLhs * wfRhs * wfKind * (Type >>= wfType))

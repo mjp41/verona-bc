@@ -225,6 +225,7 @@ namespace vbci
         case ValueType::FieldRef:
         case ValueType::ArrayRef:
         case ValueType::Cown:
+        case ValueType::Callback:
         case ValueType::Dyn:
         {
           for (size_t i = 0; i < size; i++)
@@ -256,6 +257,7 @@ namespace vbci
         case ValueType::FieldRef:
         case ValueType::ArrayRef:
         case ValueType::Cown:
+        case ValueType::Callback:
         case ValueType::Dyn:
         {
           for (size_t i = 0; i < size; i++)
@@ -277,6 +279,7 @@ namespace vbci
         case ValueType::FieldRef:
         case ValueType::ArrayRef:
         case ValueType::Cown:
+        case ValueType::Callback:
         case ValueType::Dyn:
         {
           for (size_t i = 0; i < size; i++)

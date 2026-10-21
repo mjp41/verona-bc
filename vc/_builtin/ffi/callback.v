@@ -1,22 +1,22 @@
+callback_handle
+{}
+
 callback[T]
 {
-  _callable: T | none;
-  _cb: ptr;
+  _cb: callback_handle | none;
 
   create(): callback[T]
   {
-    new { _callable = none, _cb = ptr }
+    new { _cb = none }
   }
 
   create(callable: T): callback[T]
   {
-    new { _callable = callable, _cb = :::make_callback(callable) }
+    new { _cb = :::make_callback(callable) }
   }
 
   bind(self: callback[T], callable: T): callback[T]
   {
-    if self._cb != ptr { :::free_callback(self._cb) }
-    self._callable = callable;
     self._cb = :::make_callback(callable);
     self
   }
@@ -26,8 +26,13 @@ callback[T]
     :::codeptr_callback(self._cb)
   }
 
-  final(self: callback[T]): none
+  retain(self: callback[T]): ptr
   {
-    if self._cb != ptr { :::free_callback(self._cb) }
+    :::retain_callback(self._cb)
+  }
+
+  release(self: callback[T], handle: ptr): none
+  {
+    :::release_callback(handle)
   }
 }

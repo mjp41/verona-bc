@@ -153,6 +153,22 @@ namespace virc
     return t == Cown;
   }
 
+  static bool is_optional_callback_type(const Node& t)
+  {
+    // callback.v stores an unbound callback as `callback_handle | none`.
+    // Pattern matching there would narrow the handle, but currently introduces
+    // builtin callable shapes that make shape resolution pathological. Accept
+    // the optional type here for now; VBCI still rejects None at runtime.
+    if (t == Union)
+    {
+      for (auto& child : *t)
+        if (!is_optional_callback_type(child))
+          return false;
+      return t->size() > 0;
+    }
+    return t->type().in({Callback, None});
+  }
+
   static bool is_ref_type(const Node& t)
   {
     if (t == Dyn)
@@ -1772,7 +1788,6 @@ namespace virc
         else if (node->type().in({
                    AddExternal,
                    RemoveExternal,
-                   FreeCallback,
                    FFIStore,
                  }))
         {
@@ -1789,10 +1804,37 @@ namespace virc
           // ArrayCompare produces I64.
           set_type(env, node / LocalId, I64);
         }
-        else if (node->type().in({MakeCallback, CodePtrCallback}))
+        else if (node == MakeCallback)
         {
-          // MakeCallback and CodePtrCallback produce Ptr.
+          set_type(env, node / LocalId, Callback);
+        }
+        else if (node->in({CodePtrCallback, RetainCallback}))
+        {
+          auto src_type = typed(node / Rhs);
+          if (src_type && !is_optional_callback_type(src_type))
+          {
+            type_err(
+              node,
+              std::format(
+                "{} requires Callback | None, got {}",
+                node == CodePtrCallback ? "codeptrcallback" : "retaincallback",
+                type_name(src_type)));
+          }
+
           set_type(env, node / LocalId, Ptr);
+        }
+        else if (node == ReleaseCallback)
+        {
+          auto src_type = typed(node / Rhs);
+          if (src_type && !IRSubtype(top, src_type, Ptr))
+          {
+            type_err(
+              node,
+              std::format(
+                "releasecallback requires Ptr, got {}", type_name(src_type)));
+          }
+
+          set_type(env, node / LocalId, None);
         }
         else if (node == GetRaise)
         {

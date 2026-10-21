@@ -18,7 +18,7 @@ namespace vbci
     Thread::handle_callback(cc, ret, args);
   }
 
-  CallbackClosure* make_callback(const Register& lambda, Function* func)
+  CallbackClosure* make_callback(ValueTransfer lambda, Function* func)
   {
     // Build the ffi_cif from the apply function's signature.
     // func->param_types[0] is self (the lambda), skip it.
@@ -81,7 +81,21 @@ namespace vbci
       Value::error(Error::BadArgs);
 
     cc->func = func;
-    cc->lambda = lambda.borrow();
+    cc->lambda = lambda;
     return cc.release();
+  }
+
+  void* retain_callback(CallbackClosure* callback)
+  {
+    callback->inc();
+    return callback;
+  }
+
+  void release_callback(void* handle)
+  {
+    if (!handle)
+      Value::error(Error::BadOperand);
+
+    static_cast<CallbackClosure*>(handle)->dec();
   }
 }

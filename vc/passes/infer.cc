@@ -88,15 +88,16 @@ namespace vc
     {IsInf, Bool},     {IsNaN, Bool},       {Not, Bool},
     {Bits, U64},       {Len, USize},        {Const_E, F64},
     {Const_Pi, F64},   {Const_Inf, F64},    {Const_NaN, F64},
-    {GetRaise, U64},   {SetRaise, U64},     {FreeCallback, None},
+    {GetRaise, U64},   {SetRaise, U64},     {ReleaseCallback, None},
     {FFIStore, None},  {AddExternal, None}, {RemoveExternal, None},
     {ArrayCopy, None}, {ArrayFill, None},   {ArrayCompare, I64},
   };
 
   const std::map<Token, Token> fixed_ffi_result_type = {
     {MakePtr, Ptr},
-    {MakeCallback, Ptr},
+    {MakeCallback, Callback},
     {CodePtrCallback, Ptr},
+    {RetainCallback, Ptr},
   };
 
   // ===== Type constructors =====
@@ -116,8 +117,19 @@ namespace vc
                    << (NameElement << (Ident ^ tok.str()) << TypeArgs));
   }
 
+  Node callback_type()
+  {
+    return Type
+      << (TypeName << (NameElement << (Ident ^ "_builtin") << TypeArgs)
+                   << (NameElement << (Ident ^ "ffi") << TypeArgs)
+                   << (NameElement << (Ident ^ "callback_handle") << TypeArgs));
+  }
+
   Node primitive_or_ffi_type(const Token& tok)
   {
+    if (tok == Callback)
+      return callback_type();
+
     if (tok == Ptr)
       return ffi_primitive_type(tok);
 

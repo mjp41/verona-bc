@@ -1,6 +1,8 @@
 #pragma once
 
+#include "collect.h"
 #include "function.h"
+#include "header.h"
 #include "register.h"
 
 #include <ffi.h>
@@ -8,8 +10,9 @@
 
 namespace vbci
 {
-  struct CallbackClosure
+  struct CallbackClosure : public Header
   {
+  public:
     ffi_closure* closure = nullptr;
     void* code_ptr = nullptr;
     ffi_cif cif;
@@ -18,25 +21,48 @@ namespace vbci
     ffi_type* return_ffi_type;
     ValueType return_value_type;
     Function* func;
-    // Borrowed self value. The enclosing Verona _builtin::ffi::callback object
-    // owns the callable and is responsible for freeing this closure before the
-    // callable goes away.
+    // Owned callable graph.
     Value lambda;
+
+    CallbackClosure() : Header(+ValueType::Callback) {}
 
     ~CallbackClosure()
     {
-      if (closure)
-        ffi_closure_free(closure);
+      finalize();
     }
 
-    // Free a callback closure. The borrowed lambda is owned by the enclosing
-    // Verona callback object.
-    void free()
+    void finalize()
+    {
+      auto previous_lambda = lambda;
+      lambda = Value();
+      previous_lambda.dec();
+      collect_mutable_cycles();
+
+      if (closure)
+      {
+        ffi_closure_free(closure);
+        closure = nullptr;
+        code_ptr = nullptr;
+      }
+    }
+
+    void destroy()
     {
       delete this;
+    }
+
+    void immortalize() noexcept
+    {
+      if (state().is_immortal())
+        return;
+
+      mark_immortal();
     }
   };
 
   // Create a callback closure from a lambda and its apply function.
-  CallbackClosure* make_callback(const Register& lambda, Function* func);
+  CallbackClosure* make_callback(ValueTransfer lambda, Function* func);
+
+  void* retain_callback(CallbackClosure* callback);
+  void release_callback(void* handle);
 }

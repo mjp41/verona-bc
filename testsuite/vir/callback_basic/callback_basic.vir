@@ -1,5 +1,5 @@
-// Textual VIR exposes native callback construction, code-pointer extraction,
-// and release. The callback records that it ran and adds 10 to 32.
+// Textual VIR exposes native callback construction and borrowed code-pointer
+// extraction. The callback records that it ran and adds 10 to 32.
 // Expected exit code: 0.
 
 lib
@@ -27,7 +27,7 @@ func @main(): none
   $code = codeptrcallback $callback
   $thirty_two = const u64 32
   $actual = ffi @call_fn_ptr_ret_u64($code, $thirty_two)
-  $_freed = freecallback $callback
+  drop $callback
 
   $expected = const u64 42
   $ok = eq $actual $expected

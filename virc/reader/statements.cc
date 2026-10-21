@@ -6,9 +6,9 @@ namespace virc
     T(I8, I16, I32, I64, U8, U16, U32, U64, ILong, ULong, ISize, USize);
   const auto FloatType = T(F32, F64);
   const auto PrimitiveType = T(None, Bool) / IntType / FloatType;
-  const auto BuiltinType = PrimitiveType / T(Ptr) /
+  const auto BuiltinType = PrimitiveType / T(Ptr, Callback) /
     (T(Array, Ref, Cown) << Any) / (T(TupleType) << Any);
-  const auto TypeNoUnion = PrimitiveType / T(Ptr, Dyn, GlobalId) /
+  const auto TypeNoUnion = PrimitiveType / T(Ptr, Callback, Dyn, GlobalId) /
     (T(Array, Ref, Cown) << Any) / (T(TupleType) << Any);
   const auto TypePat = (TypeNoUnion / (T(Union) << Any)) * --(T(Union) << End);
 
@@ -511,8 +511,11 @@ namespace virc
         Dst * T(CodePtrCallback) * T(LocalId)[Rhs] >>
           [](Match& _) { return CodePtrCallback << _(LocalId) << _(Rhs); },
 
-        Dst * T(FreeCallback) * T(LocalId)[Rhs] >>
-          [](Match& _) { return FreeCallback << _(LocalId) << _(Rhs); },
+        Dst * T(RetainCallback) * T(LocalId)[Rhs] >>
+          [](Match& _) { return RetainCallback << _(LocalId) << _(Rhs); },
+
+        Dst * T(ReleaseCallback) * T(LocalId)[Rhs] >>
+          [](Match& _) { return ReleaseCallback << _(LocalId) << _(Rhs); },
 
         // Terminators.
         (T(Tailcall) << End) * T(GlobalId)[GlobalId] * CallArgs[Args] >>

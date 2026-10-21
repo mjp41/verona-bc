@@ -79,6 +79,7 @@ namespace virc
       F32 >> IRAxiomEq(IRSubtype),
       F64 >> IRAxiomEq(IRSubtype),
       Ptr >> IRAxiomEq(IRSubtype),
+      Callback >> IRAxiomEq(IRSubtype),
       ClassId >> IRAxiomEq(IRSubtype),
       Array >> IRAxiomInvariant(IRSubtype),
       Ref >> IRAxiomInvariant(IRSubtype),

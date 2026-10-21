@@ -97,7 +97,8 @@ namespace virc
                   USize,
                   F32,
                   F64,
-                  Ptr)[Type] *
+                  Ptr,
+                  Callback)[Type] *
                 T(Methods)) >>
           [state](Match& _) -> Node {
           auto& slot = state->primitives.at(+val(_(Type)));

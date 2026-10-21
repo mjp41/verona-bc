@@ -192,7 +192,8 @@ namespace virc
                       Typetest,
                       MakeCallback,
                       CodePtrCallback,
-                      FreeCallback}))
+                      RetainCallback,
+                      ReleaseCallback}))
           {
             use(node / Rhs);
             def(node / LocalId);

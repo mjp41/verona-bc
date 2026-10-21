@@ -331,10 +331,10 @@ namespace vbc
     // Arg1 = src (callback handle, ptr).
     CodePtrCallback,
 
-    // Frees a callback closure.
-    // Arg0 = dst (none).
-    // Arg1 = src (callback handle, ptr).
-    FreeCallback,
+    // Retains a callback closure for use by native code.
+    // Arg0 = dst (opaque release handle, ptr).
+    // Arg1 = src (callback handle).
+    RetainCallback,
 
     // Adds an external event source to keep the scheduler alive.
     // Arg0 = dst (none).
@@ -374,6 +374,11 @@ namespace vbc
     // Arg4 = b offset.
     // Arg5 = length.
     ArrayCompare,
+
+    // Releases a callback closure retained for use by native code.
+    // Arg0 = dst (none).
+    // Arg1 = src (opaque release handle, ptr).
+    ReleaseCallback,
   };
 
   std::ostream& operator<<(std::ostream& output, Op op);
@@ -399,6 +404,7 @@ namespace vbc
     F32,
     F64,
     Ptr,
+    Callback,
   };
 
   enum class TypeTag : uint8_t
@@ -438,5 +444,5 @@ namespace vbc
     return static_cast<size_t>(c);
   }
 
-  inline const auto NumPrimitiveClasses = +PrimitiveType::Ptr + 1;
+  inline const auto NumPrimitiveClasses = +PrimitiveType::Callback + 1;
 }

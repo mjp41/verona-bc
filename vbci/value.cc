@@ -1,6 +1,7 @@
 #include "value.h"
 
 #include "array.h"
+#include "callback.h"
 #include "cown.h"
 #include "object.h"
 #include "platform.h"
@@ -60,6 +61,9 @@ namespace vbci
 
   Value::Value(Array* arr) : arr(arr), tag(ValueType::Array), readonly(0) {}
   Value::Value(Cown* cown) : cown(cown), tag(ValueType::Cown) {}
+  Value::Value(CallbackClosure* callback)
+  : callback(callback), tag(ValueType::Callback)
+  {}
 
   Value::Value(uint64_t val, FrameId frame)
   : u64(val), idx(frame.raw()), tag(ValueType::RegisterRef), readonly(0)
@@ -226,6 +230,12 @@ namespace vbci
           value.tag = ValueType::Invalid;
         break;
 
+      case ValueType::Callback:
+        value.callback = *reinterpret_cast<CallbackClosure**>(v);
+        if (value.callback == nullptr)
+          value.tag = ValueType::Invalid;
+        break;
+
       default:
         std::memcpy(static_cast<void*>(&value), v, sizeof(Value));
         break;
@@ -321,6 +331,10 @@ namespace vbci
         *reinterpret_cast<Cown**>(v) = cown;
         break;
 
+      case ValueType::Callback:
+        *reinterpret_cast<CallbackClosure**>(v) = callback;
+        break;
+
       default:
         std::memcpy(v, this, sizeof(Value));
         break;
@@ -339,6 +353,9 @@ namespace vbci
 
       case ValueType::Cown:
         return cown->get_type_id();
+
+      case ValueType::Callback:
+        return +ValueType::Callback;
 
       case ValueType::RegisterRef:
         return Program::get().ref(
@@ -526,6 +543,14 @@ namespace vbci
     return cown;
   }
 
+  CallbackClosure* Value::get_callback() const
+  {
+    if (tag != ValueType::Callback)
+      Value::error(Error::BadConversion);
+
+    return callback;
+  }
+
   Register& Value::get_register() const
   {
     if (tag != ValueType::RegisterRef)
@@ -626,6 +651,9 @@ namespace vbci
 
       case ValueType::Cown:
         return &cown;
+
+      case ValueType::Callback:
+        return &callback;
 
       default:
         return this;
@@ -745,6 +773,10 @@ namespace vbci
         cown->inc();
         break;
 
+      case ValueType::Callback:
+        callback->inc();
+        break;
+
       default:
         break;
     }
@@ -776,6 +808,10 @@ namespace vbci
         cown->dec();
         break;
 
+      case ValueType::Callback:
+        callback->dec();
+        break;
+
       default:
         break;
     }
@@ -796,6 +832,9 @@ namespace vbci
       case ValueType::Cown:
       case ValueType::CownRef:
         return cown->state();
+
+      case ValueType::Callback:
+        return callback->state();
 
       default:
         return HeaderState::immortal();
@@ -822,6 +861,11 @@ namespace vbci
       case ValueType::Cown:
         ignore_process_lifetime_allocation(cown);
         cown->immortalize();
+        break;
+
+      case ValueType::Callback:
+        ignore_process_lifetime_allocation(callback);
+        callback->immortalize();
         break;
 
       default:
@@ -997,6 +1041,9 @@ namespace vbci
 
       case ValueType::Cown:
         return cown->to_string();
+
+      case ValueType::Callback:
+        return std::format("callback: {}", static_cast<void*>(callback));
 
       case ValueType::RegisterRef:
         return std::format(

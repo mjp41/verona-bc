@@ -33,6 +33,7 @@ namespace vc
   // Primitive types nested under _builtin::ffi.
   const std::map<std::string_view, Node> ffi_primitive_types = {
     {"ptr", Ptr},
+    {"callback_handle", Callback},
   };
 
   struct Reifier
@@ -2497,8 +2498,8 @@ namespace vc
           }
           else if (n == MakeCallback)
           {
-            reify_primitive(Ptr);
-            local_types[(n / LocalId)->location()] = Ptr;
+            reify_primitive(Callback);
+            local_types[(n / LocalId)->location()] = Callback;
 
             // Find the lambda's type and register its @callback method.
             // First check local_types (works when source was from New or from a
@@ -2622,8 +2623,13 @@ namespace vc
             reify_primitive(Ptr);
             local_types[(n / LocalId)->location()] = Ptr;
           }
+          else if (n == RetainCallback)
+          {
+            reify_primitive(Ptr);
+            local_types[(n / LocalId)->location()] = Ptr;
+          }
           else if (n->in({
-                     FreeCallback,
+                     ReleaseCallback,
                      AddExternal,
                      RemoveExternal,
                    }))
@@ -3360,7 +3366,8 @@ namespace vc
              USize,
              F32,
              F64,
-             Ptr}))
+             Ptr,
+             Callback}))
       {
         return clone(type);
       }

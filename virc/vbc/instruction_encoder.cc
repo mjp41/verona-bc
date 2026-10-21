@@ -441,8 +441,10 @@ namespace virc::vbc_backend
           unary(statement, Op::MakeCallback);
         else if (statement == CodePtrCallback)
           unary(statement, Op::CodePtrCallback);
-        else if (statement == FreeCallback)
-          unary(statement, Op::FreeCallback);
+        else if (statement == RetainCallback)
+          unary(statement, Op::RetainCallback);
+        else if (statement == ReleaseCallback)
+          unary(statement, Op::ReleaseCallback);
         else if (statement == AddExternal)
           output << uleb(+Op::AddExternal) << dst(statement);
         else if (statement == RemoveExternal)
