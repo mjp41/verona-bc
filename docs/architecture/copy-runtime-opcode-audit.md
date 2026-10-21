@@ -97,17 +97,27 @@ and attachment from this sequence without weakening its lifetime effects.
 The generic `pin` and `unpin` operations have been removed. They kept an
 allocation group alive through `stack_rc`, which mixed foreign retention with
 register accounting and exposed arbitrary managed graphs to native code.
-Foreign-retained byte buffers, callbacks, and native resources will instead
-use explicit owner objects or tokens designed for those individual lifetimes.
-Until those APIs exist, retaining Verona-managed pointers after an FFI call is
-unsupported.
+Foreign-retained byte buffers, callbacks, and native resources instead use
+explicit owners designed for those individual lifetimes. Retaining arbitrary
+Verona-managed pointers without such an owner remains unsupported.
 
-`makecallback`, `codeptrcallback`, and `freecallback` also remain. A callback
-closure currently borrows its callable; the enclosing Verona callback object
-owns that callable and must keep it alive. Separately, `freecallback` releases
-the native `CallbackClosure` and its libffi closure. The migration must
-preserve both lifetime relationships without relying on the callable's region
-or stack placement.
+`makecallback`, `codeptrcallback`, `retaincallback`, and `releasecallback`
+provide callback ownership.
+`makecallback` deep-copies the callable graph into a reference-counted native
+closure. Copies of the callback handle retain the same closure identity.
+`codeptrcallback` returns a borrowed executable address. `retaincallback`
+retains the closure and returns an opaque release handle for native code.
+`releasecallback` consumes that opaque retention. The last release frees the
+libffi closure and the copied callable graph.
+
+`native T`, `newnative`, and `nativewith` provide explicit foreign-owned
+synchronous state. `newnative` consumes and deep-copies its source. Copies of
+the native handle retain the same state identity, and graph copying treats the
+handle as an atomic identity. `nativewith` borrows the handle, consumes and
+copies a handler in, invokes it synchronously with the contained `T`, and
+consumes and copies its result out. It does not expose a replaceable root
+reference. Serialization and retained-interior-pointer invariants remain
+wrapper contracts.
 
 ### External scheduler resources
 

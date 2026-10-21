@@ -35,10 +35,32 @@ It is not an additional semantic IR. The parser must produce a tree accepted by
 
 The textual reader accepts the callback statements defined by `vir::wfIR`:
 
-- `makecallback` creates a native callback handle from an object whose class
-  provides `@callback`;
-- `codeptrcallback` extracts its callable native code pointer;
-- `freecallback` releases the native callback handle.
+- `makecallback` deep-copies an object whose class provides `@callback` and
+  creates a reference-counted native callback handle owning that copy;
+- `codeptrcallback` borrows a callback handle and extracts its callable native
+  code pointer;
+- `retaincallback` borrows a callback handle, retains its closure, and returns
+  an opaque `ptr` representing that retention;
+- `releasecallback` releases one retention represented by such an opaque
+  pointer.
+
+The code pointer remains valid only while a callback handle or explicit
+retention keeps the closure alive. Each opaque retention must be released
+exactly once.
+
+It also accepts the native-state forms:
+
+- `native T` is a reference-counted synchronous state handle containing `T`;
+- `newnative value : T` consumes and deep-copies `value` into a new `native T`;
+- `nativewith context handler method : R` borrows `context`, consumes and
+  deep-copies `handler`, invokes `method(handler, state)` synchronously, and
+  consumes and deep-copies the result as `R`.
+
+Copying a native-state handle shares the cell identity. Graph copying stops at
+native-state and callback handles and retains them rather than traversing their
+owned state. `nativewith` exposes the contained `T`, not a replaceable
+`ref T`; use an explicit mutable wrapper inside `T` when whole-root replacement
+is required.
 
 ## Reserved Methods
 
