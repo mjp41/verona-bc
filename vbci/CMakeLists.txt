@@ -14,6 +14,7 @@ add_executable(vbci
   thread.cc
   value.cc
   ffi/ffi.cc
+  ffi/test.cc
 )
 
 target_include_directories(vbci SYSTEM PRIVATE

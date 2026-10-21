@@ -1,0 +1,91 @@
+// Separately created callbacks retain copied callables that share native state.
+// Expected exit code: 0.
+
+lib
+  @call_fn_ptr_ret_u64 = "call_fn_ptr_ret_u64"(ptr, u64): u64
+  @set_exit_code = "set_exit_code"(i32): none
+
+class @State
+  @value: u64
+
+class @StateAddHandler
+  @amount: u64
+  @callback @state_add_handler_apply
+
+class @StateGetHandler
+  @callback @state_get_handler_apply
+
+class @StateAdd
+  @context: native @State
+  @callback @state_add_apply
+
+class @StateGet
+  @context: native @State
+  @callback @state_get_apply
+
+func @state_add_handler_apply($self: @StateAddHandler, $state: @State): u64
+  $amount_ref = ref $self @amount
+  $amount = load $amount_ref
+  $value_ref = ref $state @value
+  $value = load $value_ref
+  $next = add $value $amount
+  $_old = store $value_ref $next
+  ret $next
+
+func @state_get_handler_apply($_self: @StateGetHandler, $state: @State): u64
+  $value_ref = ref $state @value
+  $value = load $value_ref
+  ret $value
+
+func @state_add_apply($self: @StateAdd, $amount: u64): u64
+  $context_ref = ref $self @context
+  $context = load $context_ref
+  $handler = new @StateAddHandler($amount)
+  $next = nativewith $context $handler @callback : u64
+  ret $next
+
+func @state_get_apply($self: @StateGet, $_ignored: u64): u64
+  $context_ref = ref $self @context
+  $context = load $context_ref
+  $handler = new @StateGetHandler()
+  $value = nativewith $context $handler @callback : u64
+  ret $value
+
+func @main(): none
+  // Native-state handle copies share one state identity.
+  $ten = const u64 10
+  $initial = new @State($ten)
+  $context = newnative $initial : @State
+
+  // Each callback receives its own callable copy containing the shared handle.
+  $state_add_callable = new @StateAdd($context)
+  $state_add_callback = makecallback $state_add_callable
+  $state_add_code = codeptrcallback $state_add_callback
+
+  $state_get_callable = new @StateGet($context)
+  $state_get_callback = makecallback $state_get_callable
+  $state_get_code = codeptrcallback $state_get_callback
+
+  // Updating through one callback must be visible through the other callback.
+  $five = const u64 5
+  $_incremented = ffi @call_fn_ptr_ret_u64($state_add_code, $five)
+  drop $state_add_callback
+
+  $zero = const u64 0
+  $actual = ffi @call_fn_ptr_ret_u64($state_get_code, $zero)
+
+  drop $state_get_callback
+
+  $fifteen = const u64 15
+  $ok = eq $actual $fifteen
+  cond $ok ^success ^failure
+
+^success
+  $_none = const none
+  ret $_none
+
+^failure
+  $one = const i32 1
+  $_exit = ffi @set_exit_code($one)
+  $_none = const none
+  ret $_none
