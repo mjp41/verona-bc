@@ -8,6 +8,7 @@ namespace vc
   const std::map<std::string_view, Token> wrapper_types = {
     {"array", Array},
     {"cown", Cown},
+    {"native_state", Native},
     {"ref", Ref},
   };
 
@@ -508,6 +509,14 @@ namespace vc
                   local_types[(stmt / LocalId)->location()] =
                     clone(src_it->second->front());
               }
+              else if (stmt == NativeWith)
+              {
+                auto handler = local_types.find((stmt / Rhs)->location());
+                if (handler != local_types.end())
+                  native_with_receiver_types[stmt] = clone(handler->second);
+
+                local_types[(stmt / LocalId)->location()] = clone(stmt / Type);
+              }
               else if (stmt == WhenDyn)
               {
                 auto cown_type = stmt / Cown;
@@ -677,8 +686,52 @@ namespace vc
             }
           }
         }
-
       } while (changed);
+
+      for (auto& pending : pending_native_with)
+      {
+        auto receiver = native_with_receiver_types.find(pending.site);
+        if (receiver == native_with_receiver_types.end())
+        {
+          pending.site->parent()->replace(
+            pending.site,
+            err(pending.site, "nativewith: cannot determine handler type"));
+          continue;
+        }
+
+        auto method_id =
+          std::string((pending.site / MethodId)->location().view());
+        method_invocations.push_back(
+          {pending.caller_id,
+           pending.site,
+           clone(receiver->second),
+           method_id,
+           "apply",
+           2,
+           Rhs,
+           TypeArgs,
+           {},
+           extract_receivers(receiver->second)});
+
+        auto& invocation = method_invocations.back();
+        auto map_order_size = map_order.size();
+
+        for (size_t i = 0; i < map_order_size; i++)
+        {
+          if (map_order[i] != ClassDef)
+            continue;
+
+          for (auto& class_reification : map[map_order[i]])
+          {
+            if (
+              class_reification.reification &&
+              mi_targets(invocation, class_reification.id))
+              register_method(invocation, class_reification);
+          }
+        }
+      }
+
+      drain_worklist(deferred_typevar);
 
       for (auto r : reified_functions)
       {
@@ -791,7 +844,7 @@ namespace vc
 
             auto ptype = r.reification / Type;
 
-            if (ptype->in({Array, Ref, Cown}))
+            if (ptype->in({Array, Ref, Cown, Native}))
             {
               auto wrapper = ptype->type();
               auto inner = ptype->front();
@@ -907,6 +960,12 @@ namespace vc
       Node registration_site;
     };
 
+    struct PendingNativeWith
+    {
+      Node site;
+      Location caller_id;
+    };
+
     struct EmptyClassMemo
     {
       Node type;
@@ -925,6 +984,8 @@ namespace vc
     std::vector<MethodInvocation> method_invocations;
     std::map<std::string, std::vector<DynamicCallTarget>> dynamic_call_targets;
     std::vector<PendingCallback> pending_callbacks;
+    std::vector<PendingNativeWith> pending_native_with;
+    NodeMap<Node> native_with_receiver_types;
     std::map<std::string, std::vector<std::vector<Node>>> method_index;
     CallGraph call_graph;
     OnceFunctions once_funcs;
@@ -1246,7 +1307,7 @@ namespace vc
         return result;
       }
 
-      if (type->in({Ref, Array, Cown}))
+      if (type->in({Ref, Array, Cown, Native}))
         return type->type() << resolve_reified_typeids(type->front());
 
       return clone(type);
@@ -1312,7 +1373,7 @@ namespace vc
           return explicit_result;
         }
 
-        if (type->in({Ref, Array, Cown}))
+        if (type->in({Ref, Array, Cown, Native}))
         {
           auto inner_set = collect(type->front());
 
@@ -2047,6 +2108,7 @@ namespace vc
         return false;
 
       auto params = target.reification / Params;
+      auto def_params = target.def / Params;
 
       if (params->size() != args->size())
         return false;
@@ -2056,6 +2118,12 @@ namespace vc
         auto actual = actual_arg_type(args->at(i), behavior_args);
 
         if (!actual)
+          continue;
+
+        auto def_type = def_params->at(i) / Type;
+        if (
+          contains_typeparam_ref(def_type) ||
+          has_unresolved_type(def_type, target.subst))
           continue;
 
         auto param = params->at(i) / Type;
@@ -2644,6 +2712,31 @@ namespace vc
 
             if (src_it != local_types.end())
               local_types[(n / LocalId)->location()] = clone(src_it->second);
+          }
+          else if (n == NewNative)
+          {
+            auto inner = reify_emitted_type(
+              n / Type, r.subst, n / Type, "native state type");
+            auto native_type = Native << inner;
+            n / Type = native_type;
+            local_types[(n / LocalId)->location()] = clone(native_type);
+          }
+          else if (n == NativeWith)
+          {
+            auto result_type = reify_emitted_type(
+              n / Type, r.subst, n / Type, "native with result type");
+            n / Type = result_type;
+            local_types[(n / LocalId)->location()] = clone(result_type);
+
+            auto base_id = std::string("apply::2");
+            auto method_index =
+              find_method_index(base_id, TypeArgs, r.subst);
+            n << (MethodId ^ std::format("{}::{}", base_id, method_index));
+            pending_native_with.push_back({n, r.id->location()});
+
+            auto handler = local_types.find((n / Rhs)->location());
+            if (handler != local_types.end())
+              native_with_receiver_types[n] = clone(handler->second);
           }
           else if (n->in({ArrayCopy, ArrayFill}))
           {
@@ -3380,6 +3473,9 @@ namespace vc
 
       if (type == Cown)
         return Cown << reify_type(type->front(), subst);
+
+      if (type == Native)
+        return Native << reify_type(type->front(), subst);
 
       // TypeVar that wasn't resolved during inference (e.g., in a generic
       // context). Return Dyn as a fallback — the caller should handle this

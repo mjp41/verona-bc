@@ -870,6 +870,40 @@ namespace vc
               << (LocalId ^ frozen_id);
           },
 
+        // Native state construction preserves its source-level argument. The
+        // low-level operation consumes an explicit copy.
+        In(Expr, Lhs) * T(NewNative)[Lhs]
+            << (T(Type)[Type] *
+                (T(Args) << (T(Arg) << (T(ArgCopy) * T(LocalId)[Rhs])))) >>
+          [](Match& _) {
+            auto copy_id = _.fresh(l_local);
+            auto native_id = _.fresh(l_local);
+            return Seq
+              << (Lift << Body << (Copy << (LocalId ^ copy_id) << _(Rhs)))
+              << (Lift << Body
+                       << (NewNative << (LocalId ^ native_id)
+                                     << (LocalId ^ copy_id) << _(Type)))
+              << (LocalId ^ native_id);
+          },
+
+        // Native state access preserves its source-level handler. The low-level
+        // operation consumes an explicit copy and copies its result out.
+        In(Expr, Lhs) * T(NativeWith)[Lhs]
+            << (T(Type)[Type] *
+                (T(Args)
+                 << ((T(Arg) << (T(ArgCopy) * T(LocalId)[Lhs])) *
+                     (T(Arg) << (T(ArgCopy) * T(LocalId)[Rhs]))))) >>
+          [](Match& _) {
+            auto copy_id = _.fresh(l_local);
+            auto result_id = _.fresh(l_local);
+            return Seq
+              << (Lift << Body << (Copy << (LocalId ^ copy_id) << _(Rhs)))
+              << (Lift << Body
+                       << (NativeWith << (LocalId ^ result_id) << _(Lhs)
+                                      << (LocalId ^ copy_id) << _(Type)))
+              << (LocalId ^ result_id);
+          },
+
         // Other single-arg builtin operations (already a LocalId after earlier
         // rules extract expressions to locals).
         In(Expr, Lhs) *

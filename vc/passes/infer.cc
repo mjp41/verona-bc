@@ -3941,6 +3941,11 @@ namespace vc
         InferStmtScope stmt_scope(InferStmtFamily::ConstLike);
         merge((stmt / LocalId)->location(), clone(stmt / Type));
       }
+      else if (stmt == NativeWith)
+      {
+        InferStmtScope stmt_scope(InferStmtFamily::CallOps);
+        merge((stmt / LocalId)->location(), clone(stmt / Type));
+      }
       else if (stmt == FFIStore)
       {
         InferStmtScope stmt_scope(InferStmtFamily::CallOps);

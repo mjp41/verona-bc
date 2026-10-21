@@ -86,6 +86,8 @@ namespace vc
     {"retain_callback", {0, 1, RetainCallback}},
     {"release_callback", {0, 1, ReleaseCallback}},
     {"freeze", {0, 1, Freeze}},
+    {"newnative", {1, 1, NewNative}},
+    {"nativewith", {1, 2, NativeWith}},
     {"ffistruct", {1, 0, FFIStruct}},
     {"ffiload", {1, 3, FFILoad}},
     {"ffistore", {1, 4, FFIStore}},

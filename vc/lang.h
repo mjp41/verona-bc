@@ -282,8 +282,8 @@ namespace vc
   inline const auto wfExprDot =
     (wfExprSugar | CallDyn | TryCallDyn | Convert | Binop | Nulop | FFI |
      NewArray | ArrayRef | MakeCallback | CodePtrCallback | RetainCallback |
-     ReleaseCallback | Freeze | FFIStruct | FFILoad | FFIStore | ArrayCopy |
-     ArrayFill | ArrayCompare) -
+     ReleaseCallback | Freeze | NewNative | NativeWith | FFIStruct | FFILoad |
+     FFIStore | ArrayCopy | ArrayFill | ArrayCompare) -
     Dot - TripleColon;
 
   // clang-format off
@@ -300,6 +300,8 @@ namespace vc
     | (RetainCallback <<= Args)
     | (ReleaseCallback <<= Args)
     | (Freeze <<= Args)
+    | (NewNative <<= Type * Args)
+    | (NativeWith <<= Type * Args)
     | (FFIStruct <<= Type * Args)
     | (FFILoad <<= Type * Args)
     | (FFIStore <<= Type * Args)
@@ -330,7 +332,8 @@ namespace vc
     TryCallDyn | Var | When | wfBinop | wfUnop | wfNulop | FFI | Typetest |
     TypeAssertion | GetRaise | SetRaise | SplatOp | ArrayRefFromEnd |
     MakeCallback | CodePtrCallback | RetainCallback | ReleaseCallback | Freeze |
-    FFIStruct | FFILoad | FFIStore | ArrayCopy | ArrayFill | ArrayCompare;
+    NewNative | NativeWith | FFIStruct | FFILoad | FFIStore | ArrayCopy |
+    ArrayFill | ArrayCompare;
 
   // clang-format off
   inline const auto wfPassANF =
@@ -439,6 +442,8 @@ namespace vc
     | (RetainCallback <<= wfDst * wfSrc)
     | (ReleaseCallback <<= wfDst * wfSrc)
     | (Freeze <<= wfDst * wfSrc)
+    | (NewNative <<= wfDst * wfSrc * Type)
+    | (NativeWith <<= wfDst * wfLhs * wfRhs * Type)
     | (FFIStruct <<= wfDst * (Type >>= wfType))
     | (FFILoad <<= wfDst * wfLhs * wfRhs * wfKind * (Type >>= wfType))
     | (FFIStore <<=
